@@ -765,6 +765,7 @@ class TestPromptBuilderConstants:
     def test_platform_hints_known_platforms(self):
         assert "whatsapp" in PLATFORM_HINTS
         assert "telegram" in PLATFORM_HINTS
+        assert "line" in PLATFORM_HINTS
         assert "discord" in PLATFORM_HINTS
         assert "cron" in PLATFORM_HINTS
         assert "cli" in PLATFORM_HINTS

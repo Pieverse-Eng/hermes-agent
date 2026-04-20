@@ -227,6 +227,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "discord": Platform.DISCORD,
         "slack": Platform.SLACK,
         "whatsapp": Platform.WHATSAPP,
+        "line": Platform.LINE,
         "signal": Platform.SIGNAL,
         "matrix": Platform.MATRIX,
         "mattermost": Platform.MATTERMOST,

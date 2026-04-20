@@ -150,6 +150,7 @@ def _handle_send(args):
         "discord": Platform.DISCORD,
         "slack": Platform.SLACK,
         "whatsapp": Platform.WHATSAPP,
+        "line": Platform.LINE,
         "signal": Platform.SIGNAL,
         "bluebubbles": Platform.BLUEBUBBLES,
         "matrix": Platform.MATRIX,
@@ -325,6 +326,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.platforms.telegram import TelegramAdapter
     from gateway.platforms.discord import DiscordAdapter
     from gateway.platforms.slack import SlackAdapter
+    from gateway.platforms.line import LineAdapter
 
     # Feishu adapter import is optional (requires lark-oapi)
     try:
@@ -347,6 +349,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
         Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
+        Platform.LINE: LineAdapter.MAX_MESSAGE_LENGTH,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
@@ -403,6 +406,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.LINE:
+            result = await _send_line(pconfig, chat_id, chunk)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:
@@ -644,6 +649,38 @@ async def _send_whatsapp(extra, chat_id, message):
                 return _error(f"WhatsApp bridge error ({resp.status}): {body}")
     except Exception as e:
         return _error(f"WhatsApp send failed: {e}")
+
+
+async def _send_line(pconfig, chat_id, message):
+    """Send a LINE push message."""
+    try:
+        import httpx
+    except ImportError:
+        return {"error": "httpx not installed"}
+
+    token = pconfig.token or pconfig.extra.get("channel_access_token") or os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+    api_base_url = (pconfig.extra.get("api_base_url") or os.getenv("LINE_API_BASE_URL", "https://api.line.me")).rstrip("/")
+    if not token:
+        return {"error": "LINE not configured (LINE_CHANNEL_ACCESS_TOKEN required)"}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{api_base_url}/v2/bot/message/push",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={"to": chat_id, "messages": [{"type": "text", "text": message}]},
+            )
+            if response.status_code >= 400:
+                return _error(f"LINE API error ({response.status_code}): {response.text}")
+            data = response.json() if response.content else {}
+        sent_messages = data.get("sentMessages") or []
+        message_id = sent_messages[0].get("id") if sent_messages else None
+        return {"success": True, "platform": "line", "chat_id": chat_id, "message_id": message_id}
+    except Exception as e:
+        return _error(f"LINE send failed: {e}")
 
 
 async def _send_signal(extra, chat_id, message):

@@ -125,6 +125,7 @@ PLATFORMS = {
     "discord":  {"label": "💬 Discord",    "default_toolset": "hermes-discord"},
     "slack":    {"label": "💼 Slack",      "default_toolset": "hermes-slack"},
     "whatsapp": {"label": "📱 WhatsApp",   "default_toolset": "hermes-whatsapp"},
+    "line":     {"label": "LINE",          "default_toolset": "hermes-line"},
     "signal":   {"label": "📡 Signal",     "default_toolset": "hermes-signal"},
     "bluebubbles": {"label": "💙 BlueBubbles", "default_toolset": "hermes-bluebubbles"},
     "homeassistant": {"label": "🏠 Home Assistant", "default_toolset": "hermes-homeassistant"},
