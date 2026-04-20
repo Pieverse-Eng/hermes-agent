@@ -310,6 +310,11 @@ PLATFORM_HINTS = {
         "bubbles, and videos (.mp4) play inline. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as native photos."
     ),
+    "line": (
+        "You are on a text messaging communication platform, LINE. "
+        "Prefer concise plain text. LINE does not render markdown reliably, "
+        "so avoid markdown-specific formatting unless the user asks for it."
+    ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
