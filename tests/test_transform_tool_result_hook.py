@@ -165,6 +165,10 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
     plugins_dir = hermes_home / "plugins"
     plugin_dir = plugins_dir / "transform_result_canon"
     plugin_dir.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - transform_result_canon\n",
+        encoding="utf-8",
+    )
     (plugin_dir / "plugin.yaml").write_text("name: transform_result_canon\n", encoding="utf-8")
     (plugin_dir / "__init__.py").write_text(
         "def register(ctx):\n"

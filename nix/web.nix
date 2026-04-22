@@ -4,7 +4,7 @@ let
   src = ../web;
   npmDeps = pkgs.fetchNpmDeps {
     inherit src;
-    hash = "sha256-Y0pOzdFG8BLjfvCLmsvqYpjxFjAQabXp1i7X9W/cCU4=";
+    hash = "sha256-Kh7lX3iWMM25E2kotpJFouZxtAx0n0fOsHeyPllqDDg=";
   };
 
   npmLockHash = builtins.hashString "sha256" (builtins.readFile ../web/package-lock.json);
