@@ -166,6 +166,7 @@ def curses_radiolist(
     selected: int = 0,
     *,
     cancel_returns: int | None = None,
+    description: str | None = None,
 ) -> int:
     """Curses single-select radio list. Returns the selected index.
 
@@ -174,12 +175,19 @@ def curses_radiolist(
         items: Display labels for each row.
         selected: Index that starts selected (pre-selected).
         cancel_returns: Returned on ESC/q. Defaults to the original *selected*.
+        description: Optional multi-line text shown between the title and
+            the item list.  Useful for context that should survive the
+            curses screen clear.
     """
     if cancel_returns is None:
         cancel_returns = selected
 
     if not sys.stdin.isatty():
         return cancel_returns
+
+    desc_lines: list[str] = []
+    if description:
+        desc_lines = description.splitlines()
 
     try:
         import curses
@@ -199,22 +207,35 @@ def curses_radiolist(
                 stdscr.clear()
                 max_y, max_x = stdscr.getmaxyx()
 
+                row = 0
+
                 # Header
                 try:
                     hattr = curses.A_BOLD
                     if curses.has_colors():
                         hattr |= curses.color_pair(2)
-                    stdscr.addnstr(0, 0, title, max_x - 1, hattr)
+                    stdscr.addnstr(row, 0, title, max_x - 1, hattr)
+                    row += 1
+
+                    # Description lines
+                    for dline in desc_lines:
+                        if row >= max_y - 1:
+                            break
+                        stdscr.addnstr(row, 0, dline, max_x - 1, curses.A_NORMAL)
+                        row += 1
+
                     stdscr.addnstr(
-                        1, 0,
+                        row, 0,
                         "  \u2191\u2193 navigate  ENTER/SPACE select  ESC cancel",
                         max_x - 1, curses.A_DIM,
                     )
+                    row += 1
                 except curses.error:
                     pass
 
                 # Scrollable item list
-                visible_rows = max_y - 4
+                items_start = row + 1
+                visible_rows = max_y - items_start - 1
                 if cursor < scroll_offset:
                     scroll_offset = cursor
                 elif cursor >= scroll_offset + visible_rows:
@@ -223,7 +244,7 @@ def curses_radiolist(
                 for draw_i, i in enumerate(
                     range(scroll_offset, min(len(items), scroll_offset + visible_rows))
                 ):
-                    y = draw_i + 3
+                    y = draw_i + items_start
                     if y >= max_y - 1:
                         break
                     radio = "\u25cf" if i == selected else "\u25cb"
@@ -285,6 +306,129 @@ def _radio_numbered_fallback(
         return selected
     except (ValueError, KeyboardInterrupt, EOFError):
         return cancel_returns
+
+
+def curses_single_select(
+    title: str,
+    items: List[str],
+    default_index: int = 0,
+    *,
+    cancel_label: str = "Cancel",
+) -> int | None:
+    """Curses single-select menu. Returns selected index or None on cancel.
+
+    Works inside prompt_toolkit because curses.wrapper() restores the terminal
+    safely, unlike simple_term_menu which conflicts with /dev/tty.
+    """
+    if not sys.stdin.isatty():
+        return None
+
+    try:
+        import curses
+        result_holder: list = [None]
+
+        all_items = list(items) + [cancel_label]
+        cancel_idx = len(items)
+
+        def _draw(stdscr):
+            curses.curs_set(0)
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_GREEN, -1)
+                curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            cursor = min(default_index, len(all_items) - 1)
+            scroll_offset = 0
+
+            while True:
+                stdscr.clear()
+                max_y, max_x = stdscr.getmaxyx()
+
+                try:
+                    hattr = curses.A_BOLD
+                    if curses.has_colors():
+                        hattr |= curses.color_pair(2)
+                    stdscr.addnstr(0, 0, title, max_x - 1, hattr)
+                    stdscr.addnstr(
+                        1, 0,
+                        "  ↑↓ navigate  ENTER confirm  ESC/q cancel",
+                        max_x - 1, curses.A_DIM,
+                    )
+                except curses.error:
+                    pass
+
+                visible_rows = max_y - 3
+                if cursor < scroll_offset:
+                    scroll_offset = cursor
+                elif cursor >= scroll_offset + visible_rows:
+                    scroll_offset = cursor - visible_rows + 1
+
+                for draw_i, i in enumerate(
+                    range(scroll_offset, min(len(all_items), scroll_offset + visible_rows))
+                ):
+                    y = draw_i + 3
+                    if y >= max_y - 1:
+                        break
+                    arrow = "→" if i == cursor else " "
+                    line = f" {arrow} {all_items[i]}"
+                    attr = curses.A_NORMAL
+                    if i == cursor:
+                        attr = curses.A_BOLD
+                        if curses.has_colors():
+                            attr |= curses.color_pair(1)
+                    try:
+                        stdscr.addnstr(y, 0, line, max_x - 1, attr)
+                    except curses.error:
+                        pass
+
+                stdscr.refresh()
+                key = stdscr.getch()
+
+                if key in (curses.KEY_UP, ord("k")):
+                    cursor = (cursor - 1) % len(all_items)
+                elif key in (curses.KEY_DOWN, ord("j")):
+                    cursor = (cursor + 1) % len(all_items)
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    result_holder[0] = cursor
+                    return
+                elif key in (27, ord("q")):
+                    result_holder[0] = None
+                    return
+
+        curses.wrapper(_draw)
+        flush_stdin()
+        if result_holder[0] is not None and result_holder[0] >= cancel_idx:
+            return None
+        return result_holder[0]
+
+    except Exception:
+        all_items = list(items) + [cancel_label]
+        cancel_idx = len(items)
+        return _numbered_single_fallback(title, all_items, cancel_idx)
+
+
+def _numbered_single_fallback(
+    title: str,
+    items: List[str],
+    cancel_idx: int,
+) -> int | None:
+    """Text-based numbered fallback for single-select."""
+    print(f"\n  {title}\n")
+    for i, label in enumerate(items, 1):
+        print(f"  {i}. {label}")
+    print()
+    try:
+        val = input(f"  Choice [1-{len(items)}]: ").strip()
+        if not val:
+            return None
+        idx = int(val) - 1
+        if 0 <= idx < len(items) and idx < cancel_idx:
+            return idx
+        if idx == cancel_idx:
+            return None
+    except (ValueError, KeyboardInterrupt, EOFError):
+        pass
+    return None
 
 
 def _numbered_fallback(

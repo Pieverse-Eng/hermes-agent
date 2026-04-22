@@ -20,10 +20,7 @@ import copy
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from hermes_cli.nous_subscription import (
-    apply_nous_provider_defaults,
-    get_nous_subscription_features,
-)
+from hermes_cli.nous_subscription import get_nous_subscription_features
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 from hermes_constants import get_optional_skills_dir
 
@@ -41,14 +38,6 @@ def _model_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(current_model, str) and current_model.strip():
         return {"default": current_model.strip()}
     return {}
-
-
-def _set_default_model(config: Dict[str, Any], model_name: str) -> None:
-    if not model_name:
-        return
-    model_cfg = _model_config_dict(config)
-    model_cfg["default"] = model_name
-    config["model"] = model_cfg
 
 
 def _get_credential_pool_strategies(config: Dict[str, Any]) -> Dict[str, str]:
@@ -100,18 +89,19 @@ _DEFAULT_PROVIDER_MODELS = {
         "grok-code-fast-1",
     ],
     "gemini": [
-        "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview",
-        "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
-        "gemma-4-31b-it", "gemma-4-26b-it",
+        "gemini-3.1-pro-preview", "gemini-3-pro-preview",
+        "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview",
     ],
-    "zai": ["glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
+    "zai": ["glm-5.1", "glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
     "kimi-coding": ["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
+    "kimi-coding-cn": ["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
+    "arcee": ["trinity-large-thinking", "trinity-large-preview", "trinity-mini"],
     "minimax": ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"],
     "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"],
     "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
     "kilocode": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
     "opencode-zen": ["gpt-5.4", "gpt-5.3-codex", "claude-sonnet-4-6", "gemini-3-flash", "glm-5", "kimi-k2.5", "minimax-m2.7"],
-    "opencode-go": ["glm-5", "kimi-k2.5", "mimo-v2-pro", "mimo-v2-omni", "minimax-m2.5", "minimax-m2.7"],
+    "opencode-go": ["glm-5.1", "glm-5", "kimi-k2.5", "mimo-v2-pro", "mimo-v2-omni", "minimax-m2.5", "minimax-m2.7"],
     "huggingface": [
         "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3-235B-A22B-Thinking-2507",
         "Qwen/Qwen3-Coder-480B-A35B-Instruct", "deepseek-ai/DeepSeek-R1-0528",
@@ -134,43 +124,6 @@ def _set_reasoning_effort(config: Dict[str, Any], effort: str) -> None:
         config["agent"] = agent_cfg
     agent_cfg["reasoning_effort"] = effort
 
-
-def _setup_copilot_reasoning_selection(
-    config: Dict[str, Any],
-    model_id: str,
-    prompt_choice,
-    *,
-    catalog: Optional[list[dict[str, Any]]] = None,
-    api_key: str = "",
-) -> None:
-    from hermes_cli.models import github_model_reasoning_efforts, normalize_copilot_model_id
-
-    normalized_model = normalize_copilot_model_id(
-        model_id,
-        catalog=catalog,
-        api_key=api_key,
-    ) or model_id
-    efforts = github_model_reasoning_efforts(normalized_model, catalog=catalog, api_key=api_key)
-    if not efforts:
-        return
-
-    current_effort = _current_reasoning_effort(config)
-    choices = list(efforts) + ["Disable reasoning", f"Keep current ({current_effort or 'default'})"]
-
-    if current_effort == "none":
-        default_idx = len(efforts)
-    elif current_effort in efforts:
-        default_idx = efforts.index(current_effort)
-    elif "medium" in efforts:
-        default_idx = efforts.index("medium")
-    else:
-        default_idx = len(choices) - 1
-
-    effort_idx = prompt_choice("Select reasoning effort:", choices, default_idx)
-    if effort_idx < len(efforts):
-        _set_reasoning_effort(config, efforts[effort_idx])
-    elif effort_idx == len(efforts):
-        _set_reasoning_effort(config, "none")
 
 
 
@@ -197,24 +150,12 @@ def print_header(title: str):
     print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
 
 
-def print_info(text: str):
-    """Print info text."""
-    print(color(f"  {text}", Colors.DIM))
-
-
-def print_success(text: str):
-    """Print success message."""
-    print(color(f"✓ {text}", Colors.GREEN))
-
-
-def print_warning(text: str):
-    """Print warning message."""
-    print(color(f"⚠ {text}", Colors.YELLOW))
-
-
-def print_error(text: str):
-    """Print error message."""
-    print(color(f"✗ {text}", Colors.RED))
+from hermes_cli.cli_output import (  # noqa: E402
+    print_error,
+    print_info,
+    print_success,
+    print_warning,
+)
 
 
 def is_interactive_stdin() -> bool:
@@ -268,91 +209,20 @@ def prompt(question: str, default: str = None, password: bool = False) -> str:
         sys.exit(1)
 
 
-def _curses_prompt_choice(question: str, choices: list, default: int = 0) -> int:
-    """Single-select menu using curses to avoid simple_term_menu rendering bugs."""
-    try:
-        import curses
-        result_holder = [default]
-
-        def _curses_menu(stdscr):
-            curses.curs_set(0)
-            if curses.has_colors():
-                curses.start_color()
-                curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_GREEN, -1)
-                curses.init_pair(2, curses.COLOR_YELLOW, -1)
-            cursor = default
-            scroll_offset = 0
-
-            while True:
-                stdscr.clear()
-                max_y, max_x = stdscr.getmaxyx()
-
-                # Rows available for list items: rows 2..(max_y-2) inclusive.
-                visible = max(1, max_y - 3)
-
-                # Scroll the viewport so the cursor is always visible.
-                if cursor < scroll_offset:
-                    scroll_offset = cursor
-                elif cursor >= scroll_offset + visible:
-                    scroll_offset = cursor - visible + 1
-                scroll_offset = max(0, min(scroll_offset, max(0, len(choices) - visible)))
-
-                try:
-                    stdscr.addnstr(
-                        0,
-                        0,
-                        question,
-                        max_x - 1,
-                        curses.A_BOLD | (curses.color_pair(2) if curses.has_colors() else 0),
-                    )
-                except curses.error:
-                    pass
-
-                for row, i in enumerate(range(scroll_offset, min(scroll_offset + visible, len(choices)))):
-                    y = row + 2
-                    if y >= max_y - 1:
-                        break
-                    arrow = "→" if i == cursor else " "
-                    line = f" {arrow}  {choices[i]}"
-                    attr = curses.A_NORMAL
-                    if i == cursor:
-                        attr = curses.A_BOLD
-                        if curses.has_colors():
-                            attr |= curses.color_pair(1)
-                    try:
-                        stdscr.addnstr(y, 0, line, max_x - 1, attr)
-                    except curses.error:
-                        pass
-
-                stdscr.refresh()
-                key = stdscr.getch()
-                if key in (curses.KEY_UP, ord("k")):
-                    cursor = (cursor - 1) % len(choices)
-                elif key in (curses.KEY_DOWN, ord("j")):
-                    cursor = (cursor + 1) % len(choices)
-                elif key in (curses.KEY_ENTER, 10, 13):
-                    result_holder[0] = cursor
-                    return
-                elif key in (27, ord("q")):
-                    return
-
-        curses.wrapper(_curses_menu)
-        from hermes_cli.curses_ui import flush_stdin
-        flush_stdin()
-        return result_holder[0]
-    except Exception:
-        return -1
+def _curses_prompt_choice(question: str, choices: list, default: int = 0, description: str | None = None) -> int:
+    """Single-select menu using curses. Delegates to curses_radiolist."""
+    from hermes_cli.curses_ui import curses_radiolist
+    return curses_radiolist(question, choices, selected=default, cancel_returns=-1, description=description)
 
 
 
-def prompt_choice(question: str, choices: list, default: int = 0) -> int:
+def prompt_choice(question: str, choices: list, default: int = 0, description: str | None = None) -> int:
     """Prompt for a choice from a list with arrow key navigation.
 
     Escape keeps the current default (skips the question).
     Ctrl+C exits the wizard.
     """
-    idx = _curses_prompt_choice(question, choices, default)
+    idx = _curses_prompt_choice(question, choices, default, description=description)
     if idx >= 0:
         if idx == default:
             print_info("  Skipped (keeping current)")
@@ -559,6 +429,8 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Text-to-Speech (MiniMax)", True, None))
     elif tts_provider == "mistral" and get_env_value("MISTRAL_API_KEY"):
         tool_status.append(("Text-to-Speech (Mistral Voxtral)", True, None))
+    elif tts_provider == "gemini" and (get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY")):
+        tool_status.append(("Text-to-Speech (Google Gemini)", True, None))
     elif tts_provider == "neutts":
         try:
             import importlib.util
@@ -898,10 +770,11 @@ def setup_model_provider(config: dict, *, quick: bool = False):
             "copilot-acp": "GitHub Copilot ACP",
             "zai": "Z.AI / GLM",
             "kimi-coding": "Kimi / Moonshot",
+            "kimi-coding-cn": "Kimi / Moonshot (China)",
             "minimax": "MiniMax",
             "minimax-cn": "MiniMax CN",
             "anthropic": "Anthropic",
-            "ai-gateway": "AI Gateway",
+            "ai-gateway": "Vercel AI Gateway",
             "custom": "your custom endpoint",
         }
         _prov_display = _prov_names.get(selected_provider, selected_provider or "your provider")
@@ -960,14 +833,7 @@ def setup_model_provider(config: dict, *, quick: bool = False):
             print_info("Skipped — add later with 'hermes setup' or configure AUXILIARY_VISION_* settings")
 
 
-    if selected_provider == "nous" and nous_subscription_selected:
-        changed_defaults = apply_nous_provider_defaults(config)
-        current_tts = str(config.get("tts", {}).get("provider") or "edge")
-        if "tts" in changed_defaults:
-            print_success("TTS provider set to: OpenAI TTS via your Nous subscription")
-        else:
-            print_info(f"Keeping your existing TTS provider: {current_tts}")
-
+    # Tool Gateway prompt is already shown by _model_flow_nous() above.
     save_config(config)
 
     if not quick and selected_provider != "nous":
@@ -1045,8 +911,10 @@ def _setup_tts_provider(config: dict):
         "edge": "Edge TTS",
         "elevenlabs": "ElevenLabs",
         "openai": "OpenAI TTS",
+        "xai": "xAI TTS",
         "minimax": "MiniMax TTS",
         "mistral": "Mistral Voxtral TTS",
+        "gemini": "Google Gemini TTS",
         "neutts": "NeuTTS",
     }
     current_label = provider_labels.get(current_provider, current_provider)
@@ -1066,12 +934,14 @@ def _setup_tts_provider(config: dict):
             "Edge TTS (free, cloud-based, no setup needed)",
             "ElevenLabs (premium quality, needs API key)",
             "OpenAI TTS (good quality, needs API key)",
+            "xAI TTS (Grok voices, needs API key)",
             "MiniMax TTS (high quality with voice cloning, needs API key)",
             "Mistral Voxtral TTS (multilingual, native Opus, needs API key)",
+            "Google Gemini TTS (30 prebuilt voices, prompt-controllable, needs API key)",
             "NeuTTS (local on-device, free, ~300MB model download)",
         ]
     )
-    providers.extend(["edge", "elevenlabs", "openai", "minimax", "mistral", "neutts"])
+    providers.extend(["edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts"])
     choices.append(f"Keep current ({current_label})")
     keep_current_idx = len(choices) - 1
     idx = prompt_choice("Select TTS provider:", choices, keep_current_idx)
@@ -1137,6 +1007,23 @@ def _setup_tts_provider(config: dict):
                 print_warning("No API key provided. Falling back to Edge TTS.")
                 selected = "edge"
 
+    elif selected == "xai":
+        existing = get_env_value("XAI_API_KEY")
+        if not existing:
+            print()
+            api_key = prompt("xAI API key for TTS", password=True)
+            if api_key:
+                save_env_value("XAI_API_KEY", api_key)
+                print_success("xAI TTS API key saved")
+            else:
+                from hermes_constants import display_hermes_home as _dhh
+                print_warning(
+                    "No xAI API key provided for TTS. Configure XAI_API_KEY via "
+                    f"hermes setup model or {_dhh()}/.env to use xAI TTS. "
+                    "Falling back to Edge TTS."
+                )
+                selected = "edge"
+
     elif selected == "minimax":
         existing = get_env_value("MINIMAX_API_KEY")
         if not existing:
@@ -1157,6 +1044,19 @@ def _setup_tts_provider(config: dict):
             if api_key:
                 save_env_value("MISTRAL_API_KEY", api_key)
                 print_success("Mistral TTS API key saved")
+            else:
+                print_warning("No API key provided. Falling back to Edge TTS.")
+                selected = "edge"
+
+    elif selected == "gemini":
+        existing = get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY")
+        if not existing:
+            print()
+            print_info("Get a free API key at https://aistudio.google.com/app/apikey")
+            api_key = prompt("Gemini API key for TTS", password=True)
+            if api_key:
+                save_env_value("GEMINI_API_KEY", api_key)
+                print_success("Gemini TTS API key saved")
             else:
                 print_warning("No API key provided. Falling back to Edge TTS.")
                 selected = "edge"
@@ -1560,7 +1460,9 @@ def setup_agent_settings(config: dict):
     )
     print_info("Maximum tool-calling iterations per conversation.")
     print_info("Higher = more complex tasks, but costs more tokens.")
-    print_info("Default is 90, which works for most tasks. Use 150+ for open exploration.")
+    print_info(
+        f"Press Enter to keep {current_max}. Use 90 for most tasks or 150+ for open exploration."
+    )
 
     max_iter_str = prompt("Max iterations", current_max)
     try:
@@ -1736,9 +1638,19 @@ def _setup_telegram():
             return
 
     print_info("Create a bot via @BotFather on Telegram")
-    token = prompt("Telegram bot token", password=True)
-    if not token:
-        return
+    import re
+
+    while True:
+        token = prompt("Telegram bot token", password=True)
+        if not token:
+            return
+        if not re.match(r"^\d+:[A-Za-z0-9_-]{30,}$", token):
+            print_error(
+                "Invalid token format. Expected: <numeric_id>:<alphanumeric_hash> "
+                "(e.g., 123456789:ABCdefGHI-jklMNOpqrSTUvwxYZ)"
+            )
+            continue
+        break
     save_env_value("TELEGRAM_BOT_TOKEN", token)
     print_success("Telegram token saved")
 
@@ -1862,7 +1774,7 @@ def _setup_slack():
     print_info("   3. Add Bot Token Scopes: Features → OAuth & Permissions")
     print_info("      Required scopes: chat:write, app_mentions:read,")
     print_info("      channels:history, channels:read, im:history,")
-    print_info("      im:read, im:write, users:read, files:write")
+    print_info("      im:read, im:write, users:read, files:read, files:write")
     print_info("      Optional for private channels: groups:history")
     print_info("   4. Subscribe to Events: Features → Event Subscriptions → Enable")
     print_info("      Required events: message.im, message.channels, app_mention")
@@ -2052,6 +1964,50 @@ def _setup_weixin():
     _gateway_setup_weixin()
 
 
+def _setup_signal():
+    """Configure Signal via gateway setup."""
+    from hermes_cli.gateway import _setup_signal as _gateway_setup_signal
+    _gateway_setup_signal()
+
+
+def _setup_email():
+    """Configure Email via gateway setup."""
+    from hermes_cli.gateway import _setup_email as _gateway_setup_email
+    _gateway_setup_email()
+
+
+def _setup_sms():
+    """Configure SMS (Twilio) via gateway setup."""
+    from hermes_cli.gateway import _setup_sms as _gateway_setup_sms
+    _gateway_setup_sms()
+
+
+def _setup_dingtalk():
+    """Configure DingTalk via gateway setup."""
+    from hermes_cli.gateway import _setup_dingtalk as _gateway_setup_dingtalk
+    _gateway_setup_dingtalk()
+
+
+def _setup_feishu():
+    """Configure Feishu / Lark via gateway setup."""
+    from hermes_cli.gateway import _setup_feishu as _gateway_setup_feishu
+    _gateway_setup_feishu()
+
+
+def _setup_wecom():
+    """Configure WeCom (Enterprise WeChat) via gateway setup."""
+    from hermes_cli.gateway import _setup_wecom as _gateway_setup_wecom
+    _gateway_setup_wecom()
+
+
+def _setup_wecom_callback():
+    """Configure WeCom Callback (self-built app) via gateway setup."""
+    from hermes_cli.gateway import _setup_wecom_callback as _gw_setup
+    _gw_setup()
+
+
+
+
 def _setup_bluebubbles():
     """Configure BlueBubbles iMessage gateway."""
     print_header("BlueBubbles (iMessage)")
@@ -2117,6 +2073,12 @@ def _setup_bluebubbles():
     print_info("   Install: https://docs.bluebubbles.app/helper-bundle/installation")
 
 
+def _setup_qqbot():
+    """Configure QQ Bot (Official API v2) via gateway setup."""
+    from hermes_cli.gateway import _setup_qqbot as _gateway_setup_qqbot
+    _gateway_setup_qqbot()
+
+
 def _setup_webhooks():
     """Configure webhook integration."""
     print_header("Webhooks")
@@ -2168,11 +2130,19 @@ _GATEWAY_PLATFORMS = [
     ("Telegram", "TELEGRAM_BOT_TOKEN", _setup_telegram),
     ("Discord", "DISCORD_BOT_TOKEN", _setup_discord),
     ("Slack", "SLACK_BOT_TOKEN", _setup_slack),
+    ("Signal", "SIGNAL_HTTP_URL", _setup_signal),
+    ("Email", "EMAIL_ADDRESS", _setup_email),
+    ("SMS (Twilio)", "TWILIO_ACCOUNT_SID", _setup_sms),
     ("Matrix", "MATRIX_ACCESS_TOKEN", _setup_matrix),
     ("Mattermost", "MATTERMOST_TOKEN", _setup_mattermost),
     ("WhatsApp", "WHATSAPP_ENABLED", _setup_whatsapp),
+    ("DingTalk", "DINGTALK_CLIENT_ID", _setup_dingtalk),
+    ("Feishu / Lark", "FEISHU_APP_ID", _setup_feishu),
+    ("WeCom (Enterprise WeChat)", "WECOM_BOT_ID", _setup_wecom),
+    ("WeCom Callback (Self-Built App)", "WECOM_CALLBACK_CORP_ID", _setup_wecom_callback),
     ("Weixin (WeChat)", "WEIXIN_ACCOUNT_ID", _setup_weixin),
     ("BlueBubbles (iMessage)", "BLUEBUBBLES_SERVER_URL", _setup_bluebubbles),
+    ("QQ Bot", "QQ_APP_ID", _setup_qqbot),
     ("Webhooks (GitHub, GitLab, etc.)", "WEBHOOK_ENABLED", _setup_webhooks),
 ]
 
@@ -2212,11 +2182,19 @@ def setup_gateway(config: dict):
         get_env_value("TELEGRAM_BOT_TOKEN")
         or get_env_value("DISCORD_BOT_TOKEN")
         or get_env_value("SLACK_BOT_TOKEN")
+        or get_env_value("SIGNAL_HTTP_URL")
+        or get_env_value("EMAIL_ADDRESS")
+        or get_env_value("TWILIO_ACCOUNT_SID")
         or get_env_value("MATTERMOST_TOKEN")
         or get_env_value("MATRIX_ACCESS_TOKEN")
         or get_env_value("MATRIX_PASSWORD")
         or get_env_value("WHATSAPP_ENABLED")
+        or get_env_value("DINGTALK_CLIENT_ID")
+        or get_env_value("FEISHU_APP_ID")
+        or get_env_value("WECOM_BOT_ID")
+        or get_env_value("WEIXIN_ACCOUNT_ID")
         or get_env_value("BLUEBUBBLES_SERVER_URL")
+        or get_env_value("QQ_APP_ID")
         or get_env_value("WEBHOOK_ENABLED")
     )
     if any_messaging:
@@ -2238,6 +2216,10 @@ def setup_gateway(config: dict):
             missing_home.append("Slack")
         if get_env_value("BLUEBUBBLES_SERVER_URL") and not get_env_value("BLUEBUBBLES_HOME_CHANNEL"):
             missing_home.append("BlueBubbles")
+        if get_env_value("QQ_APP_ID") and not (
+            get_env_value("QQBOT_HOME_CHANNEL") or get_env_value("QQ_HOME_CHANNEL")
+        ):
+            missing_home.append("QQBot")
 
         if missing_home:
             print()
@@ -2259,9 +2241,12 @@ def setup_gateway(config: dict):
         from hermes_cli.gateway import (
             _is_service_installed,
             _is_service_running,
+            supports_systemd_services,
             has_conflicting_systemd_units,
+            has_legacy_hermes_units,
             install_linux_gateway_from_setup,
             print_systemd_scope_conflict_warning,
+            print_legacy_unit_warning,
             systemd_start,
             systemd_restart,
             launchd_install,
@@ -2271,16 +2256,22 @@ def setup_gateway(config: dict):
 
         service_installed = _is_service_installed()
         service_running = _is_service_running()
+        supports_systemd = supports_systemd_services()
+        supports_service_manager = supports_systemd or _is_macos
 
         print()
-        if _is_linux and has_conflicting_systemd_units():
+        if supports_systemd and has_conflicting_systemd_units():
             print_systemd_scope_conflict_warning()
+            print()
+
+        if supports_systemd and has_legacy_hermes_units():
+            print_legacy_unit_warning()
             print()
 
         if service_running:
             if prompt_yes_no("  Restart the gateway to pick up changes?", True):
                 try:
-                    if _is_linux:
+                    if supports_systemd:
                         systemd_restart()
                     elif _is_macos:
                         launchd_restart()
@@ -2289,14 +2280,14 @@ def setup_gateway(config: dict):
         elif service_installed:
             if prompt_yes_no("  Start the gateway service?", True):
                 try:
-                    if _is_linux:
+                    if supports_systemd:
                         systemd_start()
                     elif _is_macos:
                         launchd_start()
                 except Exception as e:
                     print_error(f"  Start failed: {e}")
-        elif _is_linux or _is_macos:
-            svc_name = "systemd" if _is_linux else "launchd"
+        elif supports_service_manager:
+            svc_name = "systemd" if supports_systemd else "launchd"
             if prompt_yes_no(
                 f"  Install the gateway as a {svc_name} service? (runs in background, starts on boot)",
                 True,
@@ -2304,7 +2295,7 @@ def setup_gateway(config: dict):
                 try:
                     installed_scope = None
                     did_install = False
-                    if _is_linux:
+                    if supports_systemd:
                         installed_scope, did_install = install_linux_gateway_from_setup(force=False)
                     else:
                         launchd_install(force=False)
@@ -2312,7 +2303,7 @@ def setup_gateway(config: dict):
                     print()
                     if did_install and prompt_yes_no("  Start the service now?", True):
                         try:
-                            if _is_linux:
+                            if supports_systemd:
                                 systemd_start(system=installed_scope == "system")
                             elif _is_macos:
                                 launchd_start()
@@ -2323,12 +2314,21 @@ def setup_gateway(config: dict):
                     print_info("  You can try manually: hermes gateway install")
             else:
                 print_info("  You can install later: hermes gateway install")
-                if _is_linux:
+                if supports_systemd:
                     print_info("  Or as a boot-time service: sudo hermes gateway install --system")
                 print_info("  Or run in foreground:  hermes gateway")
         else:
-            print_info("Start the gateway to bring your bots online:")
-            print_info("   hermes gateway              # Run in foreground")
+            from hermes_constants import is_container
+            if is_container():
+                print_info("Start the gateway to bring your bots online:")
+                print_info("   hermes gateway run          # Run as container main process")
+                print_info("")
+                print_info("For automatic restarts, use a Docker restart policy:")
+                print_info("   docker run --restart unless-stopped ...")
+                print_info("   docker restart <container>  # Manual restart")
+            else:
+                print_info("Start the gateway to bring your bots online:")
+                print_info("   hermes gateway              # Run in foreground")
 
         print_info("━" * 50)
 
@@ -2404,12 +2404,30 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
             platforms.append("Discord")
         if get_env_value("SLACK_BOT_TOKEN"):
             platforms.append("Slack")
-        if get_env_value("WHATSAPP_PHONE_NUMBER_ID"):
-            platforms.append("WhatsApp")
         if get_env_value("SIGNAL_ACCOUNT"):
             platforms.append("Signal")
+        if get_env_value("EMAIL_ADDRESS"):
+            platforms.append("Email")
+        if get_env_value("TWILIO_ACCOUNT_SID"):
+            platforms.append("SMS")
+        if get_env_value("MATRIX_ACCESS_TOKEN") or get_env_value("MATRIX_PASSWORD"):
+            platforms.append("Matrix")
+        if get_env_value("MATTERMOST_TOKEN"):
+            platforms.append("Mattermost")
+        if get_env_value("WHATSAPP_PHONE_NUMBER_ID"):
+            platforms.append("WhatsApp")
+        if get_env_value("DINGTALK_CLIENT_ID"):
+            platforms.append("DingTalk")
+        if get_env_value("FEISHU_APP_ID"):
+            platforms.append("Feishu")
+        if get_env_value("WECOM_BOT_ID"):
+            platforms.append("WeCom")
+        if get_env_value("WEIXIN_ACCOUNT_ID"):
+            platforms.append("Weixin")
         if get_env_value("BLUEBUBBLES_SERVER_URL"):
             platforms.append("BlueBubbles")
+        if get_env_value("WEBHOOK_ENABLED"):
+            platforms.append("Webhooks")
         if platforms:
             return ", ".join(platforms)
         return None  # No platforms configured — section must run

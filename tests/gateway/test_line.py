@@ -139,7 +139,13 @@ class TestLineAuthorization:
         gw.pairing_store = MagicMock()
         gw.pairing_store.is_approved.return_value = False
 
-        source = SimpleNamespace(platform=Platform.LINE, user_id="U123", user_name="U123")
+        source = SimpleNamespace(
+            platform=Platform.LINE,
+            user_id="U123",
+            user_name="U123",
+            chat_id="U123",
+            chat_type="dm",
+        )
 
         with patch.dict(os.environ, {"LINE_ALLOWED_USERS": "U123"}, clear=True):
             assert gw._is_user_authorized(source) is True

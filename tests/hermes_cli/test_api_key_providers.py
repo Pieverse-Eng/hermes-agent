@@ -1,16 +1,8 @@
 """Tests for API-key provider support (z.ai/GLM, Kimi, MiniMax, AI Gateway)."""
 
 import os
-import sys
-import types
 
 import pytest
-
-# Ensure dotenv doesn't interfere
-if "dotenv" not in sys.modules:
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    sys.modules["dotenv"] = fake_dotenv
 
 from hermes_cli.auth import (
     PROVIDER_REGISTRY,
@@ -23,9 +15,9 @@ from hermes_cli.auth import (
     get_auth_status,
     AuthError,
     KIMI_CODE_BASE_URL,
-    _try_gh_cli_token,
     _resolve_kimi_base_url,
 )
+from hermes_cli.copilot_auth import _try_gh_cli_token
 
 
 # =============================================================================
@@ -41,10 +33,11 @@ class TestProviderRegistry:
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
         ("xai", "xAI", "api_key"),
+        ("nvidia", "NVIDIA NIM", "api_key"),
         ("kimi-coding", "Kimi / Moonshot", "api_key"),
         ("minimax", "MiniMax", "api_key"),
         ("minimax-cn", "MiniMax (China)", "api_key"),
-        ("ai-gateway", "AI Gateway", "api_key"),
+        ("ai-gateway", "Vercel AI Gateway", "api_key"),
         ("kilocode", "Kilo Code", "api_key"),
     ])
     def test_provider_registered(self, provider_id, name, auth_type):
@@ -65,10 +58,16 @@ class TestProviderRegistry:
         assert pconfig.base_url_env_var == "XAI_BASE_URL"
         assert pconfig.inference_base_url == "https://api.x.ai/v1"
 
+    def test_nvidia_env_vars(self):
+        pconfig = PROVIDER_REGISTRY["nvidia"]
+        assert pconfig.api_key_env_vars == ("NVIDIA_API_KEY",)
+        assert pconfig.base_url_env_var == "NVIDIA_BASE_URL"
+        assert pconfig.inference_base_url == "https://integrate.api.nvidia.com/v1"
+
     def test_copilot_env_vars(self):
         pconfig = PROVIDER_REGISTRY["copilot"]
         assert pconfig.api_key_env_vars == ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
-        assert pconfig.base_url_env_var == ""
+        assert pconfig.base_url_env_var == "COPILOT_API_BASE_URL"
 
     def test_kimi_env_vars(self):
         pconfig = PROVIDER_REGISTRY["kimi-coding"]
@@ -381,13 +380,13 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["source"] == "gh auth token"
 
     def test_try_gh_cli_token_uses_homebrew_path_when_not_on_path(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: None)
+        monkeypatch.setattr("hermes_cli.copilot_auth.shutil.which", lambda command: None)
         monkeypatch.setattr(
-            "hermes_cli.auth.os.path.isfile",
+            "hermes_cli.copilot_auth.os.path.isfile",
             lambda path: path == "/opt/homebrew/bin/gh",
         )
         monkeypatch.setattr(
-            "hermes_cli.auth.os.access",
+            "hermes_cli.copilot_auth.os.access",
             lambda path, mode: path == "/opt/homebrew/bin/gh" and mode == os.X_OK,
         )
 
@@ -397,11 +396,11 @@ class TestResolveApiKeyProviderCredentials:
             returncode = 0
             stdout = "gh-cli-secret\n"
 
-        def _fake_run(cmd, capture_output, text, timeout):
+        def _fake_run(cmd, **kwargs):
             calls.append(cmd)
             return _Result()
 
-        monkeypatch.setattr("hermes_cli.auth.subprocess.run", _fake_run)
+        monkeypatch.setattr("hermes_cli.copilot_auth.subprocess.run", _fake_run)
 
         assert _try_gh_cli_token() == "gh-cli-secret"
         assert calls == [["/opt/homebrew/bin/gh", "auth", "token"]]

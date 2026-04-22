@@ -16,14 +16,14 @@ This adapter is for **personal WeChat accounts** (微信). If you need enterpris
 
 - A personal WeChat account
 - Python packages: `aiohttp` and `cryptography`
-- The `qrcode` package is optional (for terminal QR rendering during setup)
+- Terminal QR rendering is included when Hermes is installed with the `messaging` extra
 
 Install the required dependencies:
 
 ```bash
 pip install aiohttp cryptography
 # Optional: for terminal QR code display
-pip install qrcode
+pip install hermes-agent[messaging]
 ```
 
 ## Setup
@@ -66,6 +66,9 @@ WEIXIN_ACCOUNT_ID=your-account-id
 WEIXIN_DM_POLICY=open
 WEIXIN_ALLOWED_USERS=user_id_1,user_id_2
 
+# Optional: restore legacy multiline splitting behavior
+# WEIXIN_SPLIT_MULTILINE_MESSAGES=true
+
 # Optional: home channel for cron/notifications
 WEIXIN_HOME_CHANNEL=chat_id
 WEIXIN_HOME_CHANNEL_NAME=Home
@@ -87,8 +90,8 @@ The adapter will restore saved credentials, connect to the iLink API, and begin 
 - **Media support** — images, video, files, and voice messages
 - **AES-128-ECB encrypted CDN** — automatic encryption/decryption for all media transfers
 - **Context token persistence** — disk-backed reply continuity across restarts
-- **Markdown formatting** — headers, tables, and code blocks are reformatted for WeChat readability
-- **Smart message chunking** — long messages are split at logical boundaries (paragraphs, code fences)
+- **Markdown formatting** — preserves Markdown, including headers, tables, and code blocks, so WeChat clients that support Markdown can render it natively
+- **Smart message chunking** — messages stay as a single bubble when under the limit; only oversized payloads split at logical boundaries
 - **Typing indicators** — shows "typing…" status in the WeChat client while the agent processes
 - **SSRF protection** — outbound media URLs are validated before download
 - **Message deduplication** — 5-minute sliding window prevents double-processing
@@ -108,6 +111,7 @@ Set these in `config.yaml` under `platforms.weixin.extra`:
 | `group_policy` | `disabled` | Group access: `open`, `allowlist`, `disabled` |
 | `allow_from` | `[]` | User IDs allowed for DMs (when dm_policy=allowlist) |
 | `group_allow_from` | `[]` | Group IDs allowed (when group_policy=allowlist) |
+| `split_multiline_messages` | `false` | When `true`, split multi-line replies into multiple chat messages (legacy behavior). When `false`, keep multi-line replies as one message unless they exceed the length limit. |
 
 ## Access Policies
 
@@ -202,22 +206,23 @@ This ensures reply continuity even after gateway restarts.
 
 ## Markdown Formatting
 
-WeChat's personal chat does not natively render full Markdown. The adapter reformats content for better readability:
+WeChat clients connected through the iLink Bot API can render Markdown directly, so the adapter preserves Markdown instead of rewriting it:
 
-- **Headers** (`# Title`) → converted to `【Title】` (level 1) or `**Title**` (level 2+)
-- **Tables** → reformatted as labeled key-value lists (e.g., `- Column: Value`)
-- **Code fences** → preserved as-is (WeChat renders these adequately)
-- **Excessive blank lines** → collapsed to double newlines
+- **Headers** stay as Markdown headings (`#`, `##`, ...)
+- **Tables** stay as Markdown tables
+- **Code fences** stay as fenced code blocks
+- **Excessive blank lines** are collapsed to double newlines outside fenced code blocks
 
 ## Message Chunking
 
-Long messages are split intelligently for chat delivery:
+Messages are delivered as a single chat message whenever they fit within the platform limit. Only oversized payloads are split for delivery:
 
 - Maximum message length: **4000 characters**
-- Split points prefer paragraph boundaries and blank lines
-- Code fences are kept intact (never split mid-block)
-- Indented continuation lines (sub-items in reformatted tables/lists) stay with their parent
+- Messages under the limit stay intact even when they contain multiple paragraphs or line breaks
+- Oversized messages split at logical boundaries (paragraphs, blank lines, code fences)
+- Code fences are kept intact whenever possible (never split mid-block unless the fence itself exceeds the limit)
 - Oversized individual blocks fall back to the base adapter's truncation logic
+- A 0.3 s inter-chunk delay prevents WeChat rate-limit drops when multiple chunks are sent
 
 ## Typing Indicators
 
@@ -291,4 +296,4 @@ Only one Weixin gateway instance can use a given token at a time. The adapter ac
 | Voice messages show as text | If WeChat provides a transcription, the adapter uses the text. This is expected behavior |
 | Messages appear duplicated | The adapter deduplicates by message ID. If you see duplicates, check if multiple gateway instances are running |
 | `iLink POST ... HTTP 4xx/5xx` | API error from the iLink service. Check your token validity and network connectivity |
-| Terminal QR code doesn't render | Install `qrcode`: `pip install qrcode`. Alternatively, open the URL printed above the QR |
+| Terminal QR code doesn't render | Reinstall with the messaging extra: `pip install hermes-agent[messaging]`. Alternatively, open the URL printed above the QR |

@@ -300,19 +300,10 @@ def _read_config_model(profile_dir: Path) -> tuple:
 
 def _check_gateway_running(profile_dir: Path) -> bool:
     """Check if a gateway is running for a given profile directory."""
-    pid_file = profile_dir / "gateway.pid"
-    if not pid_file.exists():
-        return False
     try:
-        raw = pid_file.read_text().strip()
-        if not raw:
-            return False
-        data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
-        pid = int(data["pid"])
-        os.kill(pid, 0)  # existence check
-        return True
-    except (json.JSONDecodeError, KeyError, ValueError, TypeError,
-            ProcessLookupError, PermissionError, OSError):
+        from gateway.status import get_running_pid
+        return get_running_pid(profile_dir / "gateway.pid", cleanup_stale=False) is not None
+    except Exception:
         return False
 
 
@@ -458,6 +449,16 @@ def create_profile(
                     dst = profile_dir / relpath
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
+
+    # Seed a default SOUL.md so the user has a file to customize immediately.
+    # Skipped when the profile already has one (from --clone / --clone-all).
+    soul_path = profile_dir / "SOUL.md"
+    if not soul_path.exists():
+        try:
+            from hermes_cli.default_soul import DEFAULT_SOUL_MD
+            soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
+        except Exception:
+            pass  # best-effort — don't fail profile creation over this
 
     return profile_dir
 

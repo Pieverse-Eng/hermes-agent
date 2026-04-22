@@ -18,6 +18,7 @@ from agent.prompt_builder import (
     build_skills_system_prompt,
     build_nous_subscription_prompt,
     build_context_files_prompt,
+    build_environment_hints,
     CONTEXT_FILE_MAX_CHARS,
     DEFAULT_AGENT_IDENTITY,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
@@ -26,6 +27,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
+    WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -352,6 +354,24 @@ class TestBuildSkillsSystemPrompt:
         assert "web-search" in result
         assert "old-tool" not in result
 
+    def test_rebuilds_prompt_when_disabled_skills_change(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "cached-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: cached-skill\ndescription: Cached skill\n---\n"
+        )
+
+        first = build_skills_system_prompt()
+        assert "cached-skill" in first
+
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  disabled: [cached-skill]\n"
+        )
+
+        second = build_skills_system_prompt()
+        assert "cached-skill" not in second
+
     def test_includes_setup_needed_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("MISSING_API_KEY_XYZ", raising=False)
@@ -411,7 +431,7 @@ class TestBuildSkillsSystemPrompt:
 
 class TestBuildNousSubscriptionPrompt:
     def test_includes_active_subscription_features(self, monkeypatch):
-        monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
+        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",
             lambda config=None: NousSubscriptionFeatures(
@@ -435,7 +455,7 @@ class TestBuildNousSubscriptionPrompt:
         assert "do not ask the user for Firecrawl, FAL, OpenAI TTS, or Browser-Use API keys" in prompt
 
     def test_non_subscriber_prompt_includes_relevant_upgrade_guidance(self, monkeypatch):
-        monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
+        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",
             lambda config=None: NousSubscriptionFeatures(
@@ -458,7 +478,7 @@ class TestBuildNousSubscriptionPrompt:
         assert "Do not mention subscription unless" in prompt
 
     def test_feature_flag_off_returns_empty_prompt(self, monkeypatch):
-        monkeypatch.delenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", raising=False)
+        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: False)
 
         prompt = build_nous_subscription_prompt({"web_search"})
 
@@ -772,6 +792,29 @@ class TestPromptBuilderConstants:
 
 
 # =========================================================================
+# Environment hints
+# =========================================================================
+
+class TestEnvironmentHints:
+    def test_wsl_hint_constant_mentions_mnt(self):
+        assert "/mnt/c/" in WSL_ENVIRONMENT_HINT
+        assert "WSL" in WSL_ENVIRONMENT_HINT
+
+    def test_build_environment_hints_on_wsl(self, monkeypatch):
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: True)
+        result = _pb.build_environment_hints()
+        assert "/mnt/" in result
+        assert "WSL" in result
+
+    def test_build_environment_hints_not_wsl(self, monkeypatch):
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        result = _pb.build_environment_hints()
+        assert result == ""
+
+
+# =========================================================================
 # Conditional skill activation
 # =========================================================================
 
@@ -1010,65 +1053,4 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 
 
-class TestStripBudgetWarningsFromHistory:
-    def test_strips_json_budget_warning_key(self):
-        import json
-        from run_agent import _strip_budget_warnings_from_history
 
-        messages = [
-            {"role": "tool", "tool_call_id": "c1", "content": json.dumps({
-                "output": "hello",
-                "exit_code": 0,
-                "_budget_warning": "[BUDGET: Iteration 55/60. 5 iterations left. Start consolidating your work.]",
-            })},
-        ]
-        _strip_budget_warnings_from_history(messages)
-        parsed = json.loads(messages[0]["content"])
-        assert "_budget_warning" not in parsed
-        assert parsed["output"] == "hello"
-        assert parsed["exit_code"] == 0
-
-    def test_strips_text_budget_warning(self):
-        from run_agent import _strip_budget_warnings_from_history
-
-        messages = [
-            {"role": "tool", "tool_call_id": "c1",
-             "content": "some result\n\n[BUDGET WARNING: Iteration 58/60. Only 2 iteration(s) left. Provide your final response NOW. No more tool calls unless absolutely critical.]"},
-        ]
-        _strip_budget_warnings_from_history(messages)
-        assert messages[0]["content"] == "some result"
-
-    def test_leaves_non_tool_messages_unchanged(self):
-        from run_agent import _strip_budget_warnings_from_history
-
-        messages = [
-            {"role": "assistant", "content": "[BUDGET WARNING: Iteration 58/60. Only 2 iteration(s) left. Provide your final response NOW. No more tool calls unless absolutely critical.]"},
-            {"role": "user", "content": "hello"},
-        ]
-        original_contents = [m["content"] for m in messages]
-        _strip_budget_warnings_from_history(messages)
-        assert [m["content"] for m in messages] == original_contents
-
-    def test_handles_empty_and_missing_content(self):
-        from run_agent import _strip_budget_warnings_from_history
-
-        messages = [
-            {"role": "tool", "tool_call_id": "c1", "content": ""},
-            {"role": "tool", "tool_call_id": "c2"},
-        ]
-        _strip_budget_warnings_from_history(messages)
-        assert messages[0]["content"] == ""
-
-    def test_strips_caution_variant(self):
-        import json
-        from run_agent import _strip_budget_warnings_from_history
-
-        messages = [
-            {"role": "tool", "tool_call_id": "c1", "content": json.dumps({
-                "output": "ok",
-                "_budget_warning": "[BUDGET: Iteration 42/60. 18 iterations left. Start consolidating your work.]",
-            })},
-        ]
-        _strip_budget_warnings_from_history(messages)
-        parsed = json.loads(messages[0]["content"])
-        assert "_budget_warning" not in parsed

@@ -37,7 +37,6 @@ import logging
 import mimetypes
 import os
 import re
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +58,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -92,7 +92,6 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
-DEDUP_WINDOW_SECONDS = 300
 DEDUP_MAX_SIZE = 1000
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
@@ -172,7 +171,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._listen_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._pending_responses: Dict[str, asyncio.Future] = {}
-        self._seen_messages: Dict[str, float] = {}
+        self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
 
         # Text batching: merge rapid successive messages (Telegram-style).
@@ -181,6 +180,8 @@ class WeComAdapter(BasePlatformAdapter):
         self._text_batch_split_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._device_id = uuid.uuid4().hex
+        self._last_chat_req_ids: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -250,7 +251,7 @@ class WeComAdapter(BasePlatformAdapter):
             await self._http_client.aclose()
             self._http_client = None
 
-        self._seen_messages.clear()
+        self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _cleanup_ws(self) -> None:
@@ -266,7 +267,7 @@ class WeComAdapter(BasePlatformAdapter):
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
         await self._cleanup_ws()
-        self._session = aiohttp.ClientSession()
+        self._session = aiohttp.ClientSession(trust_env=True)
         self._ws = await self._session.ws_connect(
             self._ws_url,
             heartbeat=HEARTBEAT_INTERVAL_SECONDS * 2,
@@ -278,7 +279,11 @@ class WeComAdapter(BasePlatformAdapter):
             {
                 "cmd": APP_CMD_SUBSCRIBE,
                 "headers": {"req_id": req_id},
-                "body": {"bot_id": self._bot_id, "secret": self._secret},
+                "body": {
+                    "bot_id": self._bot_id,
+                    "secret": self._secret,
+                    "device_id": self._device_id,
+                },
             }
         )
 
@@ -476,7 +481,7 @@ class WeComAdapter(BasePlatformAdapter):
             return
 
         msg_id = str(body.get("msgid") or self._payload_req_id(payload) or uuid.uuid4().hex)
-        if self._is_duplicate(msg_id):
+        if self._dedup.is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
             return
         self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
@@ -496,6 +501,11 @@ class WeComAdapter(BasePlatformAdapter):
         elif not self._is_dm_allowed(sender_id):
             logger.debug("[%s] DM sender %s blocked by policy", self.name, sender_id)
             return
+
+        # Cache the inbound req_id after policy checks so proactive sends to
+        # this chat can fall back to APP_CMD_RESPONSE (required for groups —
+        # WeCom AI Bots cannot initiate APP_CMD_SEND in group chats).
+        self._remember_chat_req_id(chat_id, self._payload_req_id(payload))
 
         text, reply_text = self._extract_text(body)
         media_urls, media_types = await self._extract_media(body)
@@ -636,6 +646,13 @@ class WeComAdapter(BasePlatformAdapter):
                 if voice_text:
                     text_parts.append(voice_text)
 
+            # Extract appmsg title (filename) for WeCom AI Bot attachments
+            if msgtype == "appmsg":
+                appmsg = body.get("appmsg") if isinstance(body.get("appmsg"), dict) else {}
+                title = str(appmsg.get("title") or "").strip()
+                if title:
+                    text_parts.append(title)
+
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
         if quote_type == "text":
@@ -668,6 +685,13 @@ class WeComAdapter(BasePlatformAdapter):
                 refs.append(("image", body["image"]))
             if msgtype == "file" and isinstance(body.get("file"), dict):
                 refs.append(("file", body["file"]))
+            # Handle appmsg (WeCom AI Bot attachments with PDF/Word/Excel)
+            if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
+                appmsg = body["appmsg"]
+                if isinstance(appmsg.get("file"), dict):
+                    refs.append(("file", appmsg["file"]))
+                elif isinstance(appmsg.get("image"), dict):
+                    refs.append(("image", appmsg["image"]))
 
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
@@ -825,24 +849,6 @@ class WeComAdapter(BasePlatformAdapter):
         wildcard = self._groups.get("*")
         return wildcard if isinstance(wildcard, dict) else {}
 
-    def _is_duplicate(self, msg_id: str) -> bool:
-        now = time.time()
-        if len(self._seen_messages) > DEDUP_MAX_SIZE:
-            cutoff = now - DEDUP_WINDOW_SECONDS
-            self._seen_messages = {
-                key: ts for key, ts in self._seen_messages.items() if ts > cutoff
-            }
-            if self._reply_req_ids:
-                self._reply_req_ids = {
-                    key: value for key, value in self._reply_req_ids.items() if key in self._seen_messages
-                }
-
-        if msg_id in self._seen_messages:
-            return True
-
-        self._seen_messages[msg_id] = now
-        return False
-
     def _remember_reply_req_id(self, message_id: str, req_id: str) -> None:
         normalized_message_id = str(message_id or "").strip()
         normalized_req_id = str(req_id or "").strip()
@@ -851,6 +857,23 @@ class WeComAdapter(BasePlatformAdapter):
         self._reply_req_ids[normalized_message_id] = normalized_req_id
         while len(self._reply_req_ids) > DEDUP_MAX_SIZE:
             self._reply_req_ids.pop(next(iter(self._reply_req_ids)))
+
+    def _remember_chat_req_id(self, chat_id: str, req_id: str) -> None:
+        """Cache the most recent inbound req_id per chat.
+
+        Used as a fallback reply target when we need to send into a group
+        without an explicit ``reply_to`` — WeCom AI Bots are blocked from
+        APP_CMD_SEND in groups and must use APP_CMD_RESPONSE bound to some
+        prior req_id. Bounded like _reply_req_ids so long-running gateways
+        don't leak memory across many chats.
+        """
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_req_id = str(req_id or "").strip()
+        if not normalized_chat_id or not normalized_req_id:
+            return
+        self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
+        while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
+            self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
 
     def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
         normalized = str(reply_to or "").strip()
@@ -1168,19 +1191,15 @@ class WeComAdapter(BasePlatformAdapter):
         self._raise_for_wecom_error(response, "send media message")
         return response
 
-    async def _send_reply_stream(self, reply_req_id: str, content: str) -> Dict[str, Any]:
+    async def _send_reply_markdown(self, reply_req_id: str, content: str) -> Dict[str, Any]:
         response = await self._send_reply_request(
             reply_req_id,
             {
-                "msgtype": "stream",
-                "stream": {
-                    "id": self._new_req_id("stream"),
-                    "finish": True,
-                    "content": content[:self.MAX_MESSAGE_LENGTH],
-                },
+                "msgtype": "markdown",
+                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
             },
         )
-        self._raise_for_wecom_error(response, "send reply stream")
+        self._raise_for_wecom_error(response, "send reply markdown")
         return response
 
     async def _send_reply_media_message(
@@ -1240,6 +1259,9 @@ class WeComAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=prepared["reject_reason"])
 
         reply_req_id = self._reply_req_id_for_message(reply_to)
+        if not reply_req_id and chat_id in self._last_chat_req_ids:
+            reply_req_id = self._last_chat_req_ids[chat_id]
+
         try:
             upload_result = await self._upload_media_bytes(
                 prepared["data"],
@@ -1307,8 +1329,12 @@ class WeComAdapter(BasePlatformAdapter):
 
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
+
+            if not reply_req_id and chat_id in self._last_chat_req_ids:
+                reply_req_id = self._last_chat_req_ids[chat_id]
+
             if reply_req_id:
-                response = await self._send_reply_stream(reply_req_id, content)
+                response = await self._send_reply_markdown(reply_req_id, content)
             else:
                 response = await self._send_request(
                     APP_CMD_SEND,
