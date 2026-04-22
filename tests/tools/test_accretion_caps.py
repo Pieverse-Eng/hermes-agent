@@ -129,6 +129,21 @@ class TestReadTrackerCaps:
             assert len(td["dedup"]) <= 3
             assert len(td["read_timestamps"]) <= 3
 
+    def test_live_read_initializes_timestamp_bucket_even_when_stat_fails(self, tmp_path, monkeypatch):
+        """Tracker shape stays consistent even if mtime capture fails."""
+        from tools import file_tools as ft
+
+        p = tmp_path / "file.txt"
+        p.write_text("content\n")
+        monkeypatch.setattr(ft.os.path, "getmtime", lambda _path: (_ for _ in ()).throw(OSError("boom")))
+
+        ft.read_file_tool(path=str(p), task_id="stat-fail-session")
+
+        with ft._read_tracker_lock:
+            td = ft._read_tracker["stat-fail-session"]
+            assert "read_timestamps" in td
+            assert td["read_timestamps"] == {}
+
 
 class TestCompletionConsumedPrune:
     def test_prune_drops_completion_entry_with_expired_session(self):
