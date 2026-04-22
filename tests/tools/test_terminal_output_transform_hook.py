@@ -177,6 +177,10 @@ def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp
     plugins_dir = hermes_home / "plugins"
     plugin_dir = plugins_dir / "terminal_transform"
     plugin_dir.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - terminal_transform\n",
+        encoding="utf-8",
+    )
     (plugin_dir / "plugin.yaml").write_text("name: terminal_transform\n", encoding="utf-8")
     (plugin_dir / "__init__.py").write_text(
         "def register(ctx):\n"
