@@ -202,15 +202,19 @@ class LineAdapter(BasePlatformAdapter):
             return None
 
         source = event.get("source") or {}
+        source_type = source.get("type", "user")
         user_id = source.get("userId")
         chat_id = self._chat_id_from_source(source)
+        if source_type != "user":
+            logger.info("[%s] Ignoring LINE %s message without direct user context", self.name, source_type)
+            return None
         if not user_id or not chat_id:
+            logger.info("[%s] Ignoring LINE message with incomplete user context", self.name)
             return None
 
         line_message = event.get("message") or {}
         message_type = line_message.get("type", "")
         text = line_message.get("text") if message_type == "text" else f"[LINE {message_type} message]"
-        source_type = source.get("type", "user")
 
         return MessageEvent(
             text=text,
