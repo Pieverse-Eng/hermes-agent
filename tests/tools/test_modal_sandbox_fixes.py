@@ -33,8 +33,9 @@ except ImportError:
 class TestToolResolution:
     """Verify get_tool_definitions returns all expected tools for eval."""
 
-    def test_terminal_and_file_toolsets_resolve_all_tools(self):
+    def test_terminal_and_file_toolsets_resolve_all_tools(self, monkeypatch):
         """enabled_toolsets=['terminal', 'file'] should produce 6 tools."""
+        monkeypatch.setattr(_tt_mod, "_get_env_config", lambda: {"env_type": "local"})
         from model_tools import get_tool_definitions
         tools = get_tool_definitions(
             enabled_toolsets=["terminal", "file"],
@@ -44,8 +45,9 @@ class TestToolResolution:
         expected = {"terminal", "process", "read_file", "write_file", "search_files", "patch"}
         assert expected == names, f"Expected {expected}, got {names}"
 
-    def test_terminal_tool_present(self):
+    def test_terminal_tool_present(self, monkeypatch):
         """The terminal tool must be present (not silently dropped)."""
+        monkeypatch.setattr(_tt_mod, "_get_env_config", lambda: {"env_type": "local"})
         from model_tools import get_tool_definitions
         tools = get_tool_definitions(
             enabled_toolsets=["terminal", "file"],

@@ -4,7 +4,7 @@ let
   src = ../ui-tui;
   npmDeps = pkgs.fetchNpmDeps {
     inherit src;
-    hash = "sha256-kHq5IKNi8jNPjToZGF/QCFf+IZf86PPe3lt2yjGWD5g=";
+    hash = "sha256-RU4qSHgJPMyfRSEJDzkG4+MReDZDc6QbTD2wisa5QE0=";
   };
 
   packageJson = builtins.fromJSON (builtins.readFile (src + "/package.json"));
