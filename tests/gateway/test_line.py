@@ -19,6 +19,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
 from gateway.platforms.line import LineAdapter
 from gateway.platforms.base import MessageType
+from gateway.session import SessionSource
 
 
 def _signature(secret: str, body: bytes) -> str:
@@ -260,7 +261,13 @@ class TestLineAuthorization:
         gw.pairing_store = MagicMock()
         gw.pairing_store.is_approved.return_value = False
 
-        source = SimpleNamespace(platform=Platform.LINE, user_id="U123", user_name="U123")
+        source = SessionSource(
+            platform=Platform.LINE,
+            chat_id="U123",
+            chat_type="dm",
+            user_id="U123",
+            user_name="U123",
+        )
 
         with patch.dict(os.environ, {"LINE_ALLOWED_USERS": "U123"}, clear=True):
             assert gw._is_user_authorized(source) is True
