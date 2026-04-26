@@ -66,6 +66,7 @@ class Platform(Enum):
     WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
+    LINE = "line"
     QQBOT = "qqbot"
 
 
@@ -274,6 +275,11 @@ class GatewayConfig:
             # Weixin requires both a token and an account_id
             if platform == Platform.WEIXIN:
                 if config.extra.get("account_id") and (config.token or config.extra.get("token")):
+                    connected.append(platform)
+                continue
+            # LINE requires both the channel access token and channel secret.
+            if platform == Platform.LINE:
+                if (config.token or config.extra.get("channel_access_token")) and config.extra.get("channel_secret"):
                     connected.append(platform)
                 continue
             # Platforms that use token/api_key auth
@@ -783,6 +789,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.LINE: "LINE_CHANNEL_ACCESS_TOKEN",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
@@ -854,6 +861,42 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.TELEGRAM,
             chat_id=telegram_home,
             name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
+        )
+
+    # LINE Messaging API
+    line_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+    line_secret = os.getenv("LINE_CHANNEL_SECRET")
+    line_api_base_url = os.getenv("LINE_API_BASE_URL")
+    line_webhook_host = os.getenv("LINE_WEBHOOK_HOST")
+    line_webhook_port = os.getenv("LINE_WEBHOOK_PORT")
+    line_webhook_path = os.getenv("LINE_WEBHOOK_PATH")
+    if any([line_token, line_secret, line_api_base_url, line_webhook_host, line_webhook_port, line_webhook_path]):
+        if Platform.LINE not in config.platforms:
+            config.platforms[Platform.LINE] = PlatformConfig()
+        line_config = config.platforms[Platform.LINE]
+        line_config.enabled = True
+        if line_token:
+            line_config.token = line_token
+        if line_secret:
+            line_config.extra["channel_secret"] = line_secret
+        if line_api_base_url:
+            line_config.extra["api_base_url"] = line_api_base_url
+        if line_webhook_host:
+            line_config.extra["webhook_host"] = line_webhook_host
+        if line_webhook_path:
+            line_config.extra["webhook_path"] = line_webhook_path
+        if line_webhook_port:
+            try:
+                line_config.extra["webhook_port"] = int(line_webhook_port)
+            except ValueError:
+                pass
+
+    line_home = os.getenv("LINE_HOME_CHANNEL")
+    if line_home and Platform.LINE in config.platforms:
+        config.platforms[Platform.LINE].home_channel = HomeChannel(
+            platform=Platform.LINE,
+            chat_id=line_home,
+            name=os.getenv("LINE_HOME_CHANNEL_NAME", "Home"),
         )
     
     # Discord

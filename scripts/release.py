@@ -158,6 +158,7 @@ AUTHOR_MAP = {
     "openclaw@sparklab.ai": "openclaw",
     "semihcvlk53@gmail.com": "Himess",
     "erenkar950@gmail.com": "erenkarakus",
+    "0xde@pieverse.io": "plkpie",
     "adavyasharma@gmail.com": "adavyas",
     "acaayush1111@gmail.com": "aayushchaudhary",
     "jason@outland.art": "jasonoutland",
