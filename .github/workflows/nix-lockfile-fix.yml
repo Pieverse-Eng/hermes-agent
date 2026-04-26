@@ -1,0 +1,40 @@
+name: Nix Lockfile Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nix-lockfile-fix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+
+      - name: Apply lockfile hashes
+        id: apply
+        run: nix run .#fix-lockfiles -- --apply
+
+      - name: Commit & push
+        if: steps.apply.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add nix/tui.nix nix/web.nix
+          git commit -m "fix(nix): refresh npm lockfile hashes"
+          git push
+
+      - name: Report no changes
+        if: steps.apply.outputs.changed == 'false'
+        run: echo "Lockfile hashes already current."

@@ -262,10 +262,10 @@ class TestLineAuthorization:
 
         source = SimpleNamespace(
             platform=Platform.LINE,
-            user_id="U123",
-            user_name="U123",
             chat_id="U123",
             chat_type="dm",
+            user_id="U123",
+            user_name="U123",
         )
 
         with patch.dict(os.environ, {"LINE_ALLOWED_USERS": "U123"}, clear=True):
