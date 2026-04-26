@@ -52,8 +52,7 @@ jobs:
 
             #### Apply the fix
 
-            - [ ] **Apply lockfile fix** — tick to push a commit with the correct hashes to this PR branch
-            - Or [run the Nix Lockfile Fix workflow](${{ github.server_url }}/${{ github.repository }}/actions/workflows/nix-lockfile-fix.yml) manually (pass PR `#${{ github.event.pull_request.number }}`)
+            - [Run the Nix Lockfile Fix workflow](${{ github.server_url }}/${{ github.repository }}/actions/workflows/nix-lockfile-fix.yml) manually on this PR branch
             - Or locally: `nix run .#fix-lockfiles -- --apply` and commit the diff
 
       - name: Clear sticky PR comment (resolved)
