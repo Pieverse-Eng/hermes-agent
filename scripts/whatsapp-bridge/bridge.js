@@ -23,7 +23,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, realpathSync } from 'fs';
 import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
@@ -60,6 +60,38 @@ function formatOutgoingMessage(message) {
   // self-chat mode where bot and user share the same number.
   if (WHATSAPP_MODE !== 'self-chat') return message;
   return REPLY_PREFIX ? `${REPLY_PREFIX}${message}` : message;
+}
+
+const MEDIA_CACHE_ROOTS = [IMAGE_CACHE_DIR, DOCUMENT_CACHE_DIR, AUDIO_CACHE_DIR]
+  .map((dir) => path.resolve(dir));
+const SEND_MEDIA_RATE_LIMIT_WINDOW_MS = 60_000;
+const SEND_MEDIA_RATE_LIMIT_MAX = 30;
+const sendMediaRateLimitBuckets = new Map();
+
+function isPathInside(candidate, root) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isAllowedMediaPath(candidate) {
+  return MEDIA_CACHE_ROOTS.some((root) => isPathInside(candidate, root));
+}
+
+function sendMediaRateLimit(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || req.socket?.remoteAddress || 'local';
+  const bucket = sendMediaRateLimitBuckets.get(key);
+
+  if (!bucket || now - bucket.startedAt >= SEND_MEDIA_RATE_LIMIT_WINDOW_MS) {
+    sendMediaRateLimitBuckets.set(key, { startedAt: now, count: 1 });
+    return next();
+  }
+
+  bucket.count += 1;
+  if (bucket.count > SEND_MEDIA_RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: 'Too many media send requests' });
+  }
+  return next();
 }
 
 function normalizeWhatsAppId(value) {
@@ -477,7 +509,9 @@ function inferMediaType(ext) {
 }
 
 // Send media (image, video, document) natively
-app.post('/send-media', async (req, res) => {
+// /send-media uses a local middleware limiter that CodeQL does not model.
+// lgtm[js/missing-rate-limiting]
+app.post('/send-media', sendMediaRateLimit, async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -488,12 +522,22 @@ app.post('/send-media', async (req, res) => {
   }
 
   try {
-    if (!existsSync(filePath)) {
+    const resolvedFilePath = path.resolve(filePath);
+    if (!isAllowedMediaPath(resolvedFilePath)) {
+      return res.status(400).json({ error: 'filePath must be inside a Hermes media cache directory' });
+    }
+
+    if (!existsSync(resolvedFilePath)) {
       return res.status(404).json({ error: `File not found: ${filePath}` });
     }
 
-    const buffer = readFileSync(filePath);
-    const ext = filePath.toLowerCase().split('.').pop();
+    const realFilePath = realpathSync(resolvedFilePath);
+    if (!isAllowedMediaPath(realFilePath)) {
+      return res.status(400).json({ error: 'filePath must resolve inside a Hermes media cache directory' });
+    }
+
+    const buffer = readFileSync(realFilePath);
+    const ext = path.extname(realFilePath).slice(1).toLowerCase();
     const type = mediaType || inferMediaType(ext);
     let msgPayload;
 
@@ -513,7 +557,7 @@ app.post('/send-media', async (req, res) => {
       default:
         msgPayload = {
           document: buffer,
-          fileName: fileName || path.basename(filePath),
+          fileName: fileName || path.basename(realFilePath),
           caption: caption || undefined,
           mimetype: MIME_MAP[ext] || 'application/octet-stream',
         };
