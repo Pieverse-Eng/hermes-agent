@@ -361,6 +361,10 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.WEIXIN: lambda cfg: bool(
         cfg.extra.get("account_id") and (cfg.token or cfg.extra.get("token"))
     ),
+    Platform.LINE: lambda cfg: bool(
+        (cfg.token or cfg.extra.get("channel_access_token"))
+        and cfg.extra.get("channel_secret")
+    ),
     Platform.WHATSAPP: lambda cfg: True,  # bridge handles auth
     Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
     Platform.EMAIL: lambda cfg: bool(cfg.extra.get("address")),
