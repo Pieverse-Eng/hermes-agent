@@ -4947,6 +4947,19 @@ class GatewayRunner:
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
+            if _evt_cmd and _cmd_def_inner is None:
+                try:
+                    from hermes_cli.plugins import get_plugin_command_handler
+
+                    _plugin_handler = get_plugin_command_handler(_evt_cmd.replace("_", "-"))
+                    if _plugin_handler:
+                        _plugin_result = _plugin_handler(event.get_command_args().strip())
+                        if asyncio.iscoroutine(_plugin_result):
+                            _plugin_result = await _plugin_result
+                        return str(_plugin_result) if _plugin_result else None
+                except Exception as e:
+                    logger.debug("Plugin command dispatch failed during active run: %s", e)
+
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
 
