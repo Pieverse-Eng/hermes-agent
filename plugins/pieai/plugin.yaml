@@ -1,6 +1,6 @@
-name: pieai
+name: pieverse-byok
 version: 0.1.0
-description: "Pieverse AI Gateway BYOK command for hosted Hermes tenants."
+description: "Pieverse BYOK command for hosted Hermes tenants."
 author: "Pieverse"
 kind: backend
 hooks:

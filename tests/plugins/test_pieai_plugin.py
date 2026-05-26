@@ -22,10 +22,10 @@ class _Response:
         return self._body
 
 
-def test_plain_key_message_rewrites_to_pieai_command():
+def test_plain_key_message_rewrites_to_pieverse_byok_command():
     assert pieai._pre_gateway_dispatch(event=type("Event", (), {"text": VALID_KEY})()) == {
         "action": "rewrite",
-        "text": f"/pieai {VALID_KEY}",
+        "text": f"/pieverse-byok {VALID_KEY}",
     }
 
 
@@ -44,7 +44,9 @@ def test_invalid_key_returns_usage_without_network(monkeypatch):
 
     monkeypatch.setattr(pieai, "_save_key", fake_save_key)
 
-    assert pieai._handle_pieai_sync("sk_abcd0123").startswith("Usage: /pieai")
+    assert pieai._handle_pieverse_byok_sync("sk_abcd0123").startswith(
+        "Usage: /pieverse-byok"
+    )
     assert called is False
 
 
@@ -63,7 +65,7 @@ def test_command_calls_platform_api(monkeypatch):
 
     monkeypatch.setattr(pieai.urllib.request, "urlopen", fake_urlopen)
 
-    message = pieai._handle_pieai_sync(VALID_KEY)
+    message = pieai._handle_pieverse_byok_sync(VALID_KEY)
 
     assert "Saved your Pieverse AI Gateway key (sk-pv-aaaa...aaaa)" in message
     assert captured["url"] == (
@@ -84,7 +86,7 @@ def test_success_schedules_restart_when_platform_requires_it(monkeypatch):
     )
     monkeypatch.setattr(pieai, "_schedule_gateway_restart", lambda: scheduled.append(True))
 
-    message = pieai._handle_pieai_sync(VALID_KEY)
+    message = pieai._handle_pieverse_byok_sync(VALID_KEY)
 
     assert scheduled == [True]
     assert "refreshing now" in message
@@ -102,7 +104,7 @@ def test_runtime_sync_pending_does_not_schedule_restart(monkeypatch):
     )
     monkeypatch.setattr(pieai, "_schedule_gateway_restart", lambda: scheduled.append(True))
 
-    message = pieai._handle_pieai_sync(VALID_KEY)
+    message = pieai._handle_pieverse_byok_sync(VALID_KEY)
 
     assert scheduled == []
     assert "after the next runtime refresh" in message
@@ -144,6 +146,6 @@ def test_restart_gateway_from_pid_file(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_async_handler_runs_sync_path(monkeypatch):
-    monkeypatch.setattr(pieai, "_handle_pieai_sync", lambda raw: f"ok:{raw}")
+    monkeypatch.setattr(pieai, "_handle_pieverse_byok_sync", lambda raw: f"ok:{raw}")
 
-    assert await pieai._handle_pieai("abc") == "ok:abc"
+    assert await pieai._handle_pieverse_byok("abc") == "ok:abc"

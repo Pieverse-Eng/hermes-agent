@@ -503,9 +503,9 @@ class TestBypassWithBotnameSuffix:
             _plugins_mod,
             "get_plugin_commands",
             lambda: {
-                "pieai": {
+                "pieverse-byok": {
                     "handler": lambda _a: "ok",
-                    "description": "Pie AI",
+                    "description": "Pieverse BYOK",
                     "args_hint": "<key>",
                     "plugin": "pieai",
                 }
@@ -515,7 +515,7 @@ class TestBypassWithBotnameSuffix:
         sk = _session_key()
         adapter._active_sessions[sk] = asyncio.Event()
 
-        await adapter.handle_message(_make_event(f"/pieai sk-pv-{'a' * 48}"))
+        await adapter.handle_message(_make_event(f"/pieverse_byok sk-pv-{'a' * 48}"))
 
         assert sk not in adapter._pending_messages
-        assert any("handled:pieai" in r for r in adapter.sent_responses)
+        assert any("handled:pieverse_byok" in r for r in adapter.sent_responses)
