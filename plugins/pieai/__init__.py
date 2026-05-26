@@ -1,7 +1,8 @@
 """Pieverse AI Gateway BYOK command.
 
 This plugin intentionally runs outside the agent path: users can replace the
-tenant AI Gateway key with /pieai even when their current model has no credit.
+tenant AI Gateway key with /pieverse-byok even when their current model has no
+credit.
 """
 
 from __future__ import annotations
@@ -19,9 +20,13 @@ from pathlib import Path
 from typing import Any
 
 PIEVERSE_KEY_RE = re.compile(r"\bsk-pv-[0-9a-f]{48}\b")
+COMMAND_NAME = "pieverse-byok"
 INTENT_CUES = (
     "pieai",
     "pie ai",
+    "pieverse",
+    "pieverse byok",
+    "pieverse-byok",
     "ai gateway",
     "api key",
     "apikey",
@@ -140,10 +145,10 @@ def _schedule_gateway_restart(delay_seconds: float = 5.0) -> None:
     timer.start()
 
 
-def _handle_pieai_sync(raw_args: str) -> str:
+def _handle_pieverse_byok_sync(raw_args: str) -> str:
     api_key = _extract_single_key(raw_args.strip())
     if not api_key:
-        return "Usage: /pieai sk-pv-<48 lowercase hex characters>"
+        return f"Usage: /{COMMAND_NAME} sk-pv-<48 lowercase hex characters>"
 
     try:
         result = _save_key(api_key)
@@ -171,8 +176,8 @@ def _handle_pieai_sync(raw_args: str) -> str:
     return f"Saved your Pieverse AI Gateway key ({masked}). Hermes will use your key next."
 
 
-async def _handle_pieai(raw_args: str) -> str:
-    return await asyncio.to_thread(_handle_pieai_sync, raw_args)
+async def _handle_pieverse_byok(raw_args: str) -> str:
+    return await asyncio.to_thread(_handle_pieverse_byok_sync, raw_args)
 
 
 def _pre_gateway_dispatch(**kwargs: Any) -> dict[str, str] | None:
@@ -181,14 +186,14 @@ def _pre_gateway_dispatch(**kwargs: Any) -> dict[str, str] | None:
     key = _should_rewrite_to_command(text)
     if not key:
         return None
-    return {"action": "rewrite", "text": f"/pieai {key}"}
+    return {"action": "rewrite", "text": f"/{COMMAND_NAME} {key}"}
 
 
 def register(ctx) -> None:
     ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)
     ctx.register_command(
-        "pieai",
-        handler=_handle_pieai,
+        COMMAND_NAME,
+        handler=_handle_pieverse_byok,
         description="Set the Pieverse AI Gateway key for this Hermes tenant.",
         args_hint="[sk-pv-key]",
         platforms=("telegram", "line", "slack"),
