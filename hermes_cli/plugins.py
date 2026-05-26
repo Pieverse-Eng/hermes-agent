@@ -45,7 +45,7 @@ import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled
@@ -329,6 +329,7 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        platforms: Iterable[str] | str | None = None,
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -345,6 +346,10 @@ class PluginContext:
         command picker. Plugin commands without ``args_hint`` register as
         parameterless in Discord and still accept trailing text when invoked
         as free-form chat.
+
+        ``platforms`` optionally limits which gateway-native menus should
+        surface the command (e.g. ``("telegram", "line")``). Dispatch remains
+        platform-agnostic; this only affects native command registration.
 
         Names conflicting with built-in commands are rejected with a warning.
         """
@@ -369,11 +374,26 @@ class PluginContext:
         except Exception:
             pass  # If commands module isn't available, skip the check
 
+        if platforms is None:
+            normalized_platforms = None
+        else:
+            raw_platforms = [platforms] if isinstance(platforms, str) else platforms
+            normalized_platforms = tuple(
+                sorted(
+                    {
+                        str(platform).strip().lower()
+                        for platform in raw_platforms
+                        if str(platform).strip()
+                    }
+                )
+            )
+
         self._manager._plugin_commands[clean] = {
             "handler": handler,
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "platforms": normalized_platforms,
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
