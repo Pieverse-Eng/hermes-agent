@@ -44,7 +44,7 @@ import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled
@@ -418,6 +418,7 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        platforms: Iterable[str] | None = None,
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -463,6 +464,7 @@ class PluginContext:
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "platforms": tuple(platforms) if platforms is not None else None,
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 

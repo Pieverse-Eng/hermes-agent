@@ -925,6 +925,11 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
+def _is_hosted_platform_runtime() -> bool:
+    """Return True inside Pieverse-hosted tenant pods."""
+    return bool(os.getenv("INSTANCE_ID") and os.getenv("HERMES_HOME") == "/opt/data")
+
+
 def _restart_notification_pending() -> bool:
     """Return True when a /restart completion marker is waiting to be delivered."""
     return (_hermes_home / ".restart_notify.json").exists()
@@ -6129,6 +6134,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(self.config, "thread_sessions_per_user", False),
             )
 
+        # LINE is a Pieverse-hosted built-in adapter. Upstream latest also
+        # ships a bundled "line" platform plugin, but that plugin listens on
+        # its own default port and bypasses our channel-gateway contract.
+        if platform == Platform.LINE:
+            from gateway.platforms.line import LineAdapter, check_line_requirements
+            if not check_line_requirements():
+                logger.warning("LINE: aiohttp not installed")
+                return None
+            return LineAdapter(config)
+
         # ── Plugin-registered platforms (checked first) ───────────────────
         try:
             from gateway.platform_registry import platform_registry
@@ -6201,7 +6216,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
             return WhatsAppCloudAdapter(config)
-        
+
         elif platform == Platform.SLACK:
             from gateway.platforms.slack import SlackAdapter, check_slack_requirements
             if not check_slack_requirements():
@@ -6323,8 +6338,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return YuanbaoAdapter(config)
 
         return None
-
-
 
 
 
@@ -8467,7 +8480,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and not _is_hosted_platform_runtime()
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
@@ -11040,11 +11059,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Built-in messaging platforms where the ``/update`` command is allowed.
     # ACP, API server, and webhooks are programmatic interfaces that should
     # not trigger system updates.  Plugin-migrated platforms (discord,
-    # mattermost, teams, irc, line, …) are NOT listed here — they declare
+    # mattermost, teams, irc, …) are NOT listed here — they declare
     # ``allow_update_command=True`` on their ``PlatformEntry`` and are
     # honored via the registry fallback at ``_handle_update_command`` below.
     _UPDATE_ALLOWED_PLATFORMS = frozenset({
-        Platform.TELEGRAM, Platform.SLACK, Platform.WHATSAPP,
+        Platform.TELEGRAM, Platform.SLACK, Platform.WHATSAPP, Platform.LINE,
         Platform.SIGNAL, Platform.MATRIX,
         Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
