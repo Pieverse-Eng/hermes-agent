@@ -133,8 +133,9 @@ def _restart_gateway_from_pid_file() -> None:
     try:
         raw = _gateway_pid_file().read_text(encoding="utf-8")
         pid = json.loads(raw).get("pid")
-        if isinstance(pid, int) and pid > 0:
-            os.kill(pid, signal.SIGUSR1)
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if isinstance(pid, int) and pid > 0 and sigusr1 is not None:
+            os.kill(pid, sigusr1)
     except Exception:
         return
 

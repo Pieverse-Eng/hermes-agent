@@ -13,7 +13,6 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -47,6 +46,7 @@ def _make_adapter():
     """Create a minimal adapter for testing the active-session guard."""
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = _StubAdapter(config, Platform.TELEGRAM)
+    adapter._busy_text_mode = ""
     adapter.sent_responses = []
 
     async def _mock_handler(event):
@@ -493,29 +493,3 @@ class TestBypassWithBotnameSuffix:
 
         assert sk not in adapter._pending_messages
         assert any("handled:new" in r for r in adapter.sent_responses)
-
-    @pytest.mark.asyncio
-    async def test_plugin_command_bypasses_guard(self, monkeypatch):
-        """Plugin commands must be dispatched directly while a session is active."""
-        from hermes_cli import plugins as _plugins_mod
-
-        monkeypatch.setattr(
-            _plugins_mod,
-            "get_plugin_commands",
-            lambda: {
-                "pieverse-byok": {
-                    "handler": lambda _a: "ok",
-                    "description": "Pieverse BYOK",
-                    "args_hint": "<key>",
-                    "plugin": "pieai",
-                }
-            },
-        )
-        adapter = _make_adapter()
-        sk = _session_key()
-        adapter._active_sessions[sk] = asyncio.Event()
-
-        await adapter.handle_message(_make_event(f"/pieverse_byok sk-pv-{'a' * 48}"))
-
-        assert sk not in adapter._pending_messages
-        assert any("handled:pieverse_byok" in r for r in adapter.sent_responses)

@@ -78,6 +78,33 @@ class TestLineConfig:
 
 
 class TestLineAdapter:
+    def test_gateway_factory_prefers_pieverse_line_adapter_over_plugin_registry(self, monkeypatch):
+        from gateway.platform_registry import platform_registry
+        from gateway.run import GatewayRunner
+
+        gw = GatewayRunner.__new__(GatewayRunner)
+        gw.config = GatewayConfig()
+
+        monkeypatch.setattr(platform_registry, "is_registered", lambda name: name == "line")
+
+        def _create_plugin_adapter(name, config):
+            raise AssertionError("LINE must use the Pieverse adapter, not the bundled plugin")
+
+        monkeypatch.setattr(platform_registry, "create_adapter", _create_plugin_adapter)
+
+        adapter = GatewayRunner._create_adapter(
+            gw,
+            Platform.LINE,
+            PlatformConfig(
+                enabled=True,
+                token="line-token",
+                extra={"channel_secret": "line-secret", "webhook_port": 18789},
+            ),
+        )
+
+        assert isinstance(adapter, LineAdapter)
+        assert adapter._port == 18789
+
     def test_verify_signature_accepts_valid_line_hmac(self):
         adapter = LineAdapter(
             PlatformConfig(enabled=True, token="line-token", extra={"channel_secret": "line-secret"})
