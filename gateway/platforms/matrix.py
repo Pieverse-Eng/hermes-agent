@@ -155,14 +155,13 @@ def _resolve_matrix_bang_command(name: str) -> str | None:
     """
     if not name:
         return None
-    # Try the raw lowercased token first, then its hyphenated variant, so
-    # forms like ``!reload_skills`` resolve against ``reload-skills``. We emit
-    # whichever candidate resolved (not a forced canonical form) to preserve
-    # alias passthrough — the gateway dispatcher canonicalizes aliases itself.
-    candidates = [name.lower()]
-    hyphenated = name.lower().replace("_", "-")
-    if hyphenated != candidates[0]:
-        candidates.append(hyphenated)
+    # Prefer hyphenated output for underscore spellings: the command matcher
+    # accepts underscores, but the downstream dispatcher expects /set-home.
+    raw = name.lower()
+    hyphenated = raw.replace("_", "-")
+    candidates = [hyphenated]
+    if raw != hyphenated:
+        candidates.append(raw)
 
     try:
         from hermes_cli.commands import is_gateway_known_command
