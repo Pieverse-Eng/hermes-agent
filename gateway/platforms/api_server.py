@@ -19,6 +19,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- POST /internal/platforms/photon/reload — loopback-only Photon hot reload
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -34,6 +35,7 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -782,6 +784,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self.gateway_runner: Optional[Any] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -929,6 +932,21 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    def _request_is_loopback(self, request: "web.Request") -> bool:
+        remote = ""
+        try:
+            peer = request.transport.get_extra_info("peername") if request.transport else None
+            if isinstance(peer, (tuple, list)) and peer:
+                remote = str(peer[0])
+        except Exception:
+            remote = ""
+        if not remote:
+            remote = str(getattr(request, "remote", "") or "")
+        try:
+            return ipaddress.ip_address(remote).is_loopback
+        except ValueError:
+            return remote in {"localhost"}
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -1117,6 +1135,37 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
         })
+
+    async def _handle_internal_photon_reload(self, request: "web.Request") -> "web.Response":
+        """POST /internal/platforms/photon/reload — loopback-only Photon hot reload."""
+        if not self._request_is_loopback(request):
+            logger.warning(
+                "API server rejected non-loopback internal Photon reload: %s",
+                self._request_audit_log_suffix(request),
+            )
+            return web.json_response({"error": "not found"}, status=404)
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        runner = self.gateway_runner
+        if runner is None or not hasattr(runner, "reload_photon_platform"):
+            return web.json_response(
+                {"ok": False, "error": "Gateway runner is not available"},
+                status=503,
+            )
+
+        try:
+            result = await runner.reload_photon_platform()
+        except Exception as exc:
+            logger.exception("[api_server] Photon hot reload failed")
+            return web.json_response(
+                {"ok": False, "error": "Photon hot reload failed", "detail": str(exc)},
+                status=500,
+            )
+
+        return web.json_response({"ok": True, "data": result})
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -4248,6 +4297,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_post(
+                "/internal/platforms/photon/reload",
+                self._handle_internal_photon_reload,
+            )
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
