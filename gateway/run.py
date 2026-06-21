@@ -1264,6 +1264,44 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     _bridge_max_turns_from_config(_hermes_home)
 
 
+_PLATFORM_MANAGED_PHOTON_ENV_KEYS = (
+    "PHOTON_PROJECT_ID",
+    "PHOTON_PROJECT_SECRET",
+    "PHOTON_ALLOWED_USERS",
+    "PHOTON_HOME_CHANNEL",
+    "PHOTON_HOME_CHANNEL_NAME",
+    "PHOTON_DASHBOARD_HOST",
+    "PHOTON_SPECTRUM_HOST",
+    "PHOTON_ALLOW_ALL_USERS",
+    "PHOTON_REQUIRE_MENTION",
+    "PHOTON_MARKDOWN",
+    "PHOTON_REACTIONS",
+    "PHOTON_TELEMETRY",
+    "PHOTON_MENTION_PATTERNS",
+    "PHOTON_MAX_INLINE_ATTACHMENT_BYTES",
+)
+
+
+def _clear_platform_managed_photon_env() -> None:
+    for key in _PLATFORM_MANAGED_PHOTON_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def _drop_absent_platform_managed_photon_env() -> None:
+    env_path = _hermes_home / ".env"
+    if not env_path.exists():
+        _clear_platform_managed_photon_env()
+        return
+    try:
+        from dotenv import dotenv_values
+        present_keys = set((dotenv_values(env_path) or {}).keys())
+    except Exception:
+        return
+    for key in _PLATFORM_MANAGED_PHOTON_ENV_KEYS:
+        if key not in present_keys:
+            os.environ.pop(key, None)
+
+
 def _bridge_max_turns_from_config(home: "Path") -> None:
     """Bridge config.yaml agent.max_turns into HERMES_MAX_ITERATIONS (a global)."""
     config_path = home / 'config.yaml'
@@ -2577,6 +2615,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
+        self._platform_reload_locks: Dict[Platform, asyncio.Lock] = {}
 
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
@@ -3465,6 +3504,116 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "retry in background.",
                 len(self._failed_platforms),
             )
+
+    def _platform_reload_lock(self, platform: Platform) -> asyncio.Lock:
+        locks = getattr(self, "_platform_reload_locks", None)
+        if locks is None:
+            locks = {}
+            self._platform_reload_locks = locks
+        lock = locks.get(platform)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[platform] = lock
+        return lock
+
+    async def reload_photon_platform(self) -> Dict[str, Any]:
+        """Reload the Photon adapter from the current runtime config in-process."""
+        platform = Platform("photon")
+        async with self._platform_reload_lock(platform):
+            logger.info("[photon] hot reload requested")
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="reloading",
+                error_code=None,
+                error_message=None,
+            )
+
+            _clear_platform_managed_photon_env()
+            _reload_runtime_env_preserving_config_authority()
+            _drop_absent_platform_managed_photon_env()
+            fresh_config = load_gateway_config()
+            platform_config = fresh_config.platforms.get(platform)
+            if platform_config is not None and not platform_config.enabled:
+                platform_config = None
+
+            if platform_config is None:
+                self.config.platforms.pop(platform, None)
+            else:
+                self.config.platforms[platform] = platform_config
+            self.delivery_router.config = self.config
+            self._failed_platforms.pop(platform, None)
+
+            existing = self.adapters.pop(platform, None)
+            self.delivery_router.adapters = self.adapters
+            if existing is not None:
+                await self._safe_adapter_disconnect(existing, platform)
+
+            if platform_config is None:
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="disabled",
+                    error_code=None,
+                    error_message=None,
+                )
+                await self._rebuild_channel_directory_after_platform_reload()
+                logger.info("[photon] hot reload disabled platform")
+                return {"platform": platform.value, "state": "disabled", "connected": False}
+
+            adapter = self._create_adapter(platform, platform_config)
+            if adapter is None:
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="fatal",
+                    error_code="adapter_unavailable",
+                    error_message="Photon adapter unavailable",
+                )
+                raise RuntimeError("Photon adapter unavailable")
+
+            adapter.set_message_handler(self._handle_message)
+            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+            adapter.set_session_store(self.session_store)
+            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            adapter._busy_text_mode = self._busy_text_mode
+
+            success = await self._connect_adapter_with_timeout(adapter, platform)
+            if not success:
+                await self._safe_adapter_disconnect(adapter, platform)
+                state = "retrying"
+                error_code = None
+                error_message = "failed to connect"
+                if getattr(adapter, "has_fatal_error", False):
+                    state = "retrying" if adapter.fatal_error_retryable else "fatal"
+                    error_code = adapter.fatal_error_code
+                    error_message = adapter.fatal_error_message
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state=state,
+                    error_code=error_code,
+                    error_message=error_message,
+                )
+                raise RuntimeError(error_message or "Photon adapter failed to connect")
+
+            self.adapters[platform] = adapter
+            self._sync_voice_mode_state_to_adapter(adapter)
+            self.delivery_router.adapters = self.adapters
+            self._failed_platforms.pop(platform, None)
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="connected",
+                error_code=None,
+                error_message=None,
+            )
+            await self._rebuild_channel_directory_after_platform_reload()
+            logger.info("[photon] hot reload connected platform")
+            return {"platform": platform.value, "state": "connected", "connected": True}
+
+    async def _rebuild_channel_directory_after_platform_reload(self) -> None:
+        try:
+            from gateway.channel_directory import build_channel_directory
+            await build_channel_directory(self.adapters)
+        except Exception as e:
+            logger.warning("Channel directory rebuild after platform reload failed: %s", e)
 
     def _request_clean_exit(self, reason: str) -> None:
         self._exit_cleanly = True
@@ -7054,7 +7203,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            return APIServerAdapter(config)
+            adapter = APIServerAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
