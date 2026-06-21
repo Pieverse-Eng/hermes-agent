@@ -59,6 +59,23 @@ def _capture_kills(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[int, int]]:
     return kills
 
 
+def test_sidecar_ready_timeout_defaults_to_production_cold_start_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PHOTON_SIDECAR_READY_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("PHOTON_SIDECAR_READY_TIMEOUT", raising=False)
+
+    assert photon_adapter._sidecar_ready_timeout_seconds() == 60.0
+
+
+def test_sidecar_ready_timeout_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHOTON_SIDECAR_READY_TIMEOUT_SECONDS", "75")
+
+    assert photon_adapter._sidecar_ready_timeout_seconds() == 75.0
+
+
 @pytest.mark.asyncio
 async def test_reap_noop_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _make_adapter(monkeypatch)

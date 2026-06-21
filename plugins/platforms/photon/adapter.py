@@ -72,6 +72,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SIDECAR_PORT = 8789
 _DEFAULT_SIDECAR_BIND = "127.0.0.1"
+_DEFAULT_SIDECAR_READY_TIMEOUT_SECONDS = 60.0
 
 # Photon iMessage messages from the SDK side have no documented hard
 # limit, but the underlying iMessage protocol limits practical message
@@ -103,6 +104,22 @@ def _coerce_port(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _sidecar_ready_timeout_seconds() -> float:
+    return _coerce_positive_float(
+        os.getenv("PHOTON_SIDECAR_READY_TIMEOUT_SECONDS")
+        or os.getenv("PHOTON_SIDECAR_READY_TIMEOUT"),
+        _DEFAULT_SIDECAR_READY_TIMEOUT_SECONDS,
+    )
 
 
 def check_requirements() -> bool:
@@ -801,8 +818,10 @@ class PhotonAdapter(BasePlatformAdapter):
             self._supervise_sidecar(self._sidecar_proc)
         )
 
-        # Wait for /healthz to come up — give it up to 15s on cold start.
-        deadline = time.time() + 15.0
+        # Wait for /healthz to come up. Production cold starts can spend
+        # longer than a few seconds inside spectrum-ts before the sidecar binds.
+        ready_timeout = _sidecar_ready_timeout_seconds()
+        deadline = time.time() + ready_timeout
         last_err: Optional[Exception] = None
         async with httpx.AsyncClient(timeout=2.0) as client:
             while time.time() < deadline:
@@ -822,7 +841,7 @@ class PhotonAdapter(BasePlatformAdapter):
                     last_err = e
                 await asyncio.sleep(0.2)
         raise RuntimeError(
-            f"Photon sidecar did not become ready within 15s: {last_err}"
+            f"Photon sidecar did not become ready within {ready_timeout:g}s: {last_err}"
         )
 
     async def _supervise_sidecar(self, proc: subprocess.Popen) -> None:
