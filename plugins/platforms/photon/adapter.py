@@ -35,6 +35,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -73,6 +74,9 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SIDECAR_PORT = 8789
 _DEFAULT_SIDECAR_BIND = "127.0.0.1"
 _DEFAULT_SIDECAR_READY_TIMEOUT_SECONDS = 60.0
+_SIDECAR_STREAM_FAILURE_MIN_EVENTS = 3
+_SIDECAR_STREAM_FAILURE_RESTART_SECONDS = 90.0
+_SIDECAR_STREAM_FAILURE_RESET_SECONDS = 10 * 60.0
 
 # Photon iMessage messages from the SDK side have no documented hard
 # limit, but the underlying iMessage protocol limits practical message
@@ -120,6 +124,25 @@ def _sidecar_ready_timeout_seconds() -> float:
         or os.getenv("PHOTON_SIDECAR_READY_TIMEOUT"),
         _DEFAULT_SIDECAR_READY_TIMEOUT_SECONDS,
     )
+
+
+def _is_sidecar_stream_failure_line(line: str) -> bool:
+    """Detect spectrum-ts log lines that mean the gRPC event stream is stuck."""
+    text = line.lower()
+    if "spectrum.stream" in text and "stream persistently failing" in text:
+        return True
+    if "catchupevents" in text and (
+        "connection dropped" in text or "unknown server error" in text
+    ):
+        return True
+    return False
+
+
+def _is_sidecar_stream_recovered_line(line: str) -> bool:
+    text = line.lower()
+    return (
+        "spectrum.lifecycle" in text and "spectrum started" in text
+    ) or "photon-sidecar: listening" in text
 
 
 def check_requirements() -> bool:
@@ -237,6 +260,11 @@ class PhotonAdapter(BasePlatformAdapter):
         # Runtime state
         self._sidecar_proc: Optional[subprocess.Popen] = None
         self._sidecar_supervisor_task: Optional[asyncio.Task] = None
+        self._sidecar_restart_task: Optional[asyncio.Task] = None
+        self._sidecar_restart_lock = asyncio.Lock()
+        self._sidecar_stream_failure_first_seen: Optional[float] = None
+        self._sidecar_stream_failure_count = 0
+        self._sidecar_stream_failure_triggered = False
         self._inbound_task: Optional[asyncio.Task] = None
         self._inbound_running = False
         self._http_client: Optional["httpx.AsyncClient"] = None
@@ -390,6 +418,7 @@ class PhotonAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._inbound_task = None
+        await self._cancel_sidecar_restart()
         await self._stop_sidecar()
         if self._http_client is not None:
             try:
@@ -762,12 +791,96 @@ class PhotonAdapter(BasePlatformAdapter):
                 f"PHOTON_SIDECAR_PORT to a different port"
             )
 
+    def _reset_sidecar_stream_failure_watch(self) -> None:
+        self._sidecar_stream_failure_first_seen = None
+        self._sidecar_stream_failure_count = 0
+        self._sidecar_stream_failure_triggered = False
+
+    def _observe_sidecar_log_line(self, line: str) -> None:
+        if _is_sidecar_stream_recovered_line(line):
+            self._reset_sidecar_stream_failure_watch()
+            return
+        if not _is_sidecar_stream_failure_line(line):
+            return
+
+        now = time.time()
+        first_seen = self._sidecar_stream_failure_first_seen
+        if (
+            first_seen is None
+            or now - first_seen > _SIDECAR_STREAM_FAILURE_RESET_SECONDS
+        ):
+            self._sidecar_stream_failure_first_seen = now
+            self._sidecar_stream_failure_count = 0
+            self._sidecar_stream_failure_triggered = False
+            first_seen = now
+
+        self._sidecar_stream_failure_count += 1
+        elapsed = now - first_seen
+        if (
+            self._sidecar_stream_failure_count
+            >= _SIDECAR_STREAM_FAILURE_MIN_EVENTS
+            and elapsed >= _SIDECAR_STREAM_FAILURE_RESTART_SECONDS
+            and not self._sidecar_stream_failure_triggered
+        ):
+            self._sidecar_stream_failure_triggered = True
+            self._request_sidecar_restart(
+                f"Spectrum stream failed {self._sidecar_stream_failure_count} "
+                f"times over {elapsed:.0f}s"
+            )
+
+    def _request_sidecar_restart(self, reason: str) -> None:
+        if not self._inbound_running:
+            return
+        task = self._sidecar_restart_task
+        if task is not None and not task.done():
+            return
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(self._restart_sidecar_after_stream_failure(reason))
+        task.add_done_callback(self._clear_sidecar_restart_task)
+        self._sidecar_restart_task = task
+
+    def _clear_sidecar_restart_task(self, task: asyncio.Task) -> None:
+        if self._sidecar_restart_task is task:
+            self._sidecar_restart_task = None
+
+    async def _cancel_sidecar_restart(self) -> None:
+        task = self._sidecar_restart_task
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+        if self._sidecar_restart_task is task:
+            self._sidecar_restart_task = None
+
+    async def _restart_sidecar_after_stream_failure(self, reason: str) -> None:
+        async with self._sidecar_restart_lock:
+            if not self._inbound_running:
+                return
+            logger.warning(
+                "[photon] restarting sidecar after stalled Spectrum stream: %s",
+                reason,
+            )
+            try:
+                await self._stop_sidecar()
+                if not self._inbound_running:
+                    return
+                await self._start_sidecar()
+                self._reset_sidecar_stream_failure_watch()
+            except Exception:
+                self._sidecar_stream_failure_triggered = False
+                logger.exception(
+                    "[photon] failed to restart sidecar after stalled "
+                    "Spectrum stream"
+                )
+
     async def _start_sidecar(self) -> None:
         if not (_SIDECAR_DIR / "node_modules").exists():
             raise RuntimeError(
                 f"Photon sidecar deps not installed. Run: "
                 f"cd {_SIDECAR_DIR} && npm install   (or `hermes photon setup`)"
             )
+        self._reset_sidecar_stream_failure_watch()
         await self._reap_stale_sidecar()
 
         env = os.environ.copy()
@@ -855,7 +968,9 @@ class PhotonAdapter(BasePlatformAdapter):
                 line = await loop.run_in_executor(None, stdout.readline)
                 if not line:
                     break
-                logger.info("[photon-sidecar] %s", line.decode("utf-8", "replace").rstrip())
+                text = line.decode("utf-8", "replace").rstrip()
+                logger.info("[photon-sidecar] %s", text)
+                self._observe_sidecar_log_line(text)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("[photon-sidecar] supervisor exited: %s", e)
 
