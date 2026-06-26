@@ -35,6 +35,10 @@ def isolated_home(tmp_path, monkeypatch):
     hermes_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.chdir(tmp_path)  # avoid picking up the repo's AGENTS.md
+    monkeypatch.setattr(
+        "agent.prompt_builder._skill_security_allows_prompt_include",
+        lambda _skill_dir: True,
+    )
     return hermes_home
 
 
