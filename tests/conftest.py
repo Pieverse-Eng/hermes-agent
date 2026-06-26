@@ -402,6 +402,27 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
+@pytest.fixture(autouse=True)
+def _allow_skill_view_security_gate_by_default(_hermetic_environment, monkeypatch):
+    """Keep legacy skill_view tests focused unless they opt into gate behavior."""
+    try:
+        from types import SimpleNamespace
+
+        import tools.skills_tool as _skills_tool
+
+        monkeypatch.setattr(
+            _skills_tool,
+            "_skill_security_allows_view",
+            lambda _skill_dir, _name, **kwargs: SimpleNamespace(
+                allowed=True,
+                reason="",
+                archive=kwargs.get("archive"),
+            ),
+        )
+    except Exception:
+        pass
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``

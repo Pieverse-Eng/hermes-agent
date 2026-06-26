@@ -391,8 +391,13 @@ class TestPromptBuilderImports:
 
 class TestBuildSkillsSystemPrompt:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
+    def _clear_skills_cache(self, monkeypatch):
         """Ensure the in-process skills prompt cache doesn't leak between tests."""
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: True,
+        )
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
@@ -624,6 +629,89 @@ class TestBuildSkillsSystemPrompt:
 
         result = build_skills_system_prompt()
         assert "backend-skill" in result
+
+
+class TestBuildSkillsSystemPromptSecurityGate:
+    @pytest.fixture(autouse=True)
+    def _clear_skills_cache(self):
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        yield
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    def test_blocks_skill_from_cold_scan_when_gate_denies(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "security" / "blocked-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: blocked-skill\ndescription: Should not load\n---\n"
+        )
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: False,
+        )
+
+        result = build_skills_system_prompt()
+
+        assert result == ""
+
+    def test_snapshot_path_still_checks_gate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "security" / "snapshot-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: snapshot-skill\ndescription: Snapshot entry\n---\n"
+        )
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: True,
+        )
+        first = build_skills_system_prompt()
+        assert "snapshot-skill" in first
+
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        clear_skills_system_prompt_cache(clear_snapshot=False)
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: False,
+        )
+
+        second = build_skills_system_prompt()
+
+        assert second == ""
+
+    def test_skill_tree_change_misses_in_process_cache(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "security" / "mutable-skill"
+        refs_dir = skill_dir / "references"
+        refs_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: mutable-skill\ndescription: Mutable\n---\n"
+        )
+        calls = []
+
+        def _allow(skill_dir):
+            calls.append(str(skill_dir))
+            return True
+
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "_skill_security_allows_prompt_include",
+            _allow,
+        )
+
+        first = build_skills_system_prompt()
+        assert "mutable-skill" in first
+        assert len(calls) == 1
+
+        (refs_dir / "api.md").write_text("changed supporting content\n")
+        second = build_skills_system_prompt()
+
+        assert "mutable-skill" in second
+        assert len(calls) == 2
 
 
 class TestBuildNousSubscriptionPrompt:
@@ -1318,7 +1406,12 @@ class TestSkillShouldShow:
 
 class TestBuildSkillsSystemPromptConditional:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
+    def _clear_skills_cache(self, monkeypatch):
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: True,
+        )
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
@@ -1546,5 +1639,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
