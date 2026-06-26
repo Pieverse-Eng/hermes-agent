@@ -11,12 +11,23 @@ from tools.skill_security_certik import (
     build_skill_security_archive,
 )
 from tools.skill_security_gate import (
+    drain_skill_security_scan_reports,
     drain_skill_security_warnings,
     ensure_skill_certik_allowed_for_session_load,
+    format_skill_security_scan_report,
     fingerprint_skill_dir,
     SkillFingerprintError,
     security_index_path,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_skill_security_queues():
+    drain_skill_security_warnings()
+    drain_skill_security_scan_reports()
+    yield
+    drain_skill_security_warnings()
+    drain_skill_security_scan_reports()
 
 
 def _write_skill(root, name="demo-skill", extra_files=None):
@@ -65,6 +76,7 @@ def test_allows_existing_certik_allow_stamp(monkeypatch, tmp_path):
 
     assert decision.allowed is True
     assert decision.scan_id == "scan-ok"
+    assert drain_skill_security_scan_reports() == []
 
 
 def test_scans_missing_stamp_and_records_allow(monkeypatch, tmp_path):
@@ -95,6 +107,9 @@ def test_scans_missing_stamp_and_records_allow(monkeypatch, tmp_path):
     assert record["decision"] == "allow"
     assert record["scanId"] == "scan-1"
     assert record["archiveSha256"] == "archive-sha"
+    report = format_skill_security_scan_report(drain_skill_security_scan_reports())
+    assert "1 passed, 0 did not pass" in report
+    assert "Passed: demo-skill." in report
 
 
 def test_blocks_when_scan_blocks(monkeypatch, tmp_path):
@@ -115,6 +130,9 @@ def test_blocks_when_scan_blocks(monkeypatch, tmp_path):
     assert decision.allowed is False
     assert "high severity" in decision.reason
     assert any("demo-skill" in msg for msg in drain_skill_security_warnings())
+    report = format_skill_security_scan_report(drain_skill_security_scan_reports())
+    assert "0 passed, 1 did not pass" in report
+    assert "Blocked: demo-skill (high severity finding)." in report
 
 
 def test_stale_allow_stamp_rescans_after_file_change(monkeypatch, tmp_path):

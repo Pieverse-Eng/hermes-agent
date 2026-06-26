@@ -488,10 +488,14 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     for warning in drain_truncation_warnings():
         agent._emit_status(warning)
     try:
-        from tools.skill_security_gate import drain_skill_security_warnings
+        from tools.skill_security_gate import (
+            drain_skill_security_scan_reports,
+            format_skill_security_scan_report,
+        )
 
-        for warning in drain_skill_security_warnings():
-            agent._emit_status(warning)
+        report = format_skill_security_scan_report(drain_skill_security_scan_reports())
+        if report:
+            agent._emit_status(report)
     except Exception:
         pass
 

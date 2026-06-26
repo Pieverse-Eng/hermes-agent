@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import contextvars
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -30,6 +31,9 @@ _INDEX_VERSION = 2
 _INDEX_LOCK = threading.Lock()
 _WARNINGS_LOCK = threading.Lock()
 _WARNINGS: list[str] = []
+_SCAN_REPORTS: "contextvars.ContextVar[list[SkillSecurityScanReport] | None]" = (
+    contextvars.ContextVar("skill_security_scan_reports", default=None)
+)
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 
 
@@ -50,6 +54,15 @@ class SkillSecurityDecision:
     archive: SkillSecurityArchive | None = None
 
 
+@dataclass(frozen=True)
+class SkillSecurityScanReport:
+    skill_name: str
+    decision: str
+    reason: str
+    fingerprint: str
+    scan_id: str | None = None
+
+
 class SkillFingerprintError(RuntimeError):
     """Raised when a skill directory cannot be fingerprinted safely."""
 
@@ -65,6 +78,82 @@ def _record_warning(message: str) -> None:
     with _WARNINGS_LOCK:
         if message not in _WARNINGS:
             _WARNINGS.append(message)
+
+
+def drain_skill_security_scan_reports() -> list[SkillSecurityScanReport]:
+    reports = _SCAN_REPORTS.get()
+    if not reports:
+        return []
+    _SCAN_REPORTS.set([])
+    return list(reports)
+
+
+def _record_scan_report(
+    skill_dir: Path,
+    *,
+    decision: str,
+    reason: str,
+    fingerprint: str,
+    scan_id: str | None = None,
+) -> None:
+    reports = _SCAN_REPORTS.get()
+    if reports is None:
+        reports = []
+        _SCAN_REPORTS.set(reports)
+    report = SkillSecurityScanReport(
+        skill_name=skill_dir.name,
+        decision=decision,
+        reason=reason,
+        fingerprint=fingerprint,
+        scan_id=scan_id,
+    )
+    for index, existing in enumerate(reports):
+        if existing.skill_name == report.skill_name and existing.fingerprint == report.fingerprint:
+            reports[index] = report
+            return
+    reports.append(report)
+
+
+def _short_reason(reason: str) -> str:
+    text = " ".join(str(reason or "").split())
+    if len(text) <= 180:
+        return text
+    return text[:177].rstrip() + "..."
+
+
+def format_skill_security_scan_report(reports: list[SkillSecurityScanReport]) -> str:
+    if not reports:
+        return ""
+
+    allowed = [r for r in reports if r.decision == "allow"]
+    blocked = [r for r in reports if r.decision == "block"]
+    failed = [r for r in reports if r.decision not in {"allow", "block"}]
+
+    lines = [
+        "CertiK skill scan complete: "
+        f"{len(allowed)} passed, {len(blocked) + len(failed)} did not pass."
+    ]
+    if allowed:
+        lines.append("Passed: " + ", ".join(sorted(r.skill_name for r in allowed)) + ".")
+    if blocked:
+        lines.append(
+            "Blocked: "
+            + "; ".join(
+                f"{r.skill_name} ({_short_reason(r.reason)})"
+                for r in sorted(blocked, key=lambda item: item.skill_name)
+            )
+            + "."
+        )
+    if failed:
+        lines.append(
+            "Failed: "
+            + "; ".join(
+                f"{r.skill_name} ({_short_reason(r.reason)})"
+                for r in sorted(failed, key=lambda item: item.skill_name)
+            )
+            + "."
+        )
+    return "\n".join(lines)
 
 
 def security_index_path() -> Path:
@@ -153,6 +242,12 @@ def ensure_skill_certik_allowed_for_session_load(
     except SkillSecurityScanError as exc:
         reason = str(exc)
         _record_warning(f'Skill "{skill_dir.name}" was not loaded: {reason}')
+        _record_scan_report(
+            skill_dir,
+            decision="error",
+            reason=reason,
+            fingerprint="",
+        )
         return SkillSecurityDecision(False, reason, fingerprint="")
     fp = SkillFingerprint(
         value=scan_archive.fingerprint,
@@ -193,6 +288,12 @@ def ensure_skill_certik_allowed_for_session_load(
             },
         )
         _record_warning(f'Skill "{skill_dir.name}" was not loaded: {reason}')
+        _record_scan_report(
+            skill_dir,
+            decision="retry",
+            reason=reason,
+            fingerprint=fp.value,
+        )
         return SkillSecurityDecision(
             False,
             reason,
@@ -215,6 +316,13 @@ def ensure_skill_certik_allowed_for_session_load(
         "byteCount": fp.byte_count,
     }
     _record_outcome(key, record)
+    _record_scan_report(
+        skill_dir,
+        decision=scan.decision,
+        reason=scan.reason,
+        fingerprint=fp.value,
+        scan_id=scan.scan_id,
+    )
     if allowed:
         return SkillSecurityDecision(
             True,
