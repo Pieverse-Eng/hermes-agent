@@ -108,6 +108,7 @@ def test_scans_missing_stamp_and_records_allow(monkeypatch, tmp_path):
     assert record["scanId"] == "scan-1"
     assert record["archiveSha256"] == "archive-sha"
     report = format_skill_security_scan_report(drain_skill_security_scan_reports())
+    assert report.startswith("🐾 Skill security check\n🛡️ CertiK scanned 1 skill:")
     assert "1 passed, 0 did not pass" in report
     assert "Passed: demo-skill." in report
 

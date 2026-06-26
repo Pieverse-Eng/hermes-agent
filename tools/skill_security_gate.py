@@ -130,8 +130,10 @@ def format_skill_security_scan_report(reports: list[SkillSecurityScanReport]) ->
     failed = [r for r in reports if r.decision not in {"allow", "block"}]
 
     lines = [
-        "CertiK skill scan complete: "
-        f"{len(allowed)} passed, {len(blocked) + len(failed)} did not pass."
+        "🐾 Skill security check",
+        f"🛡️ CertiK scanned {len(reports)} "
+        f"{'skill' if len(reports) == 1 else 'skills'}: "
+        f"{len(allowed)} passed, {len(blocked) + len(failed)} did not pass.",
     ]
     if allowed:
         lines.append("Passed: " + ", ".join(sorted(r.skill_name for r in allowed)) + ".")
