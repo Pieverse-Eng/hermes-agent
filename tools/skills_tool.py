@@ -721,28 +721,26 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
+        created_skills_dir = False
         if not SKILLS_DIR.exists():
             SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-            return json.dumps(
-                {
-                    "success": True,
-                    "skills": [],
-                    "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
-                },
-                ensure_ascii=False,
-            )
+            created_skills_dir = True
 
         # Find all skills
         all_skills = _find_all_skills()
 
         if not all_skills:
+            message = (
+                f"No skills found. Skills directory created at {display_hermes_home()}/skills/"
+                if created_skills_dir
+                else "No skills found in skills/ directory."
+            )
             return json.dumps(
                 {
                     "success": True,
                     "skills": [],
                     "categories": [],
-                    "message": "No skills found in skills/ directory.",
+                    "message": message,
                 },
                 ensure_ascii=False,
             )

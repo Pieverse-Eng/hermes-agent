@@ -165,7 +165,9 @@ def test_skill_config_raw_cache_invalidates_on_config_edit(tmp_path, monkeypatch
 
     config_path.write_text("skills:\n  disabled: [new-skill]\n", encoding="utf-8")
     import os
-    os.utime(config_path, None)
+    stat = config_path.stat()
+    future = stat.st_atime + 10
+    os.utime(config_path, (future, future))
 
     assert get_disabled_skill_names() == {"new-skill"}
 def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):
