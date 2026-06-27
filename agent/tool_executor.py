@@ -58,6 +58,21 @@ def _ra():
     return run_agent
 
 
+def _emit_skill_security_scan_reports(agent) -> None:
+    """Surface CertiK skill-scan reports produced during tool execution."""
+    try:
+        from tools.skill_security_gate import (
+            drain_skill_security_scan_reports,
+            format_skill_security_scan_report,
+        )
+
+        report = format_skill_security_scan_report(drain_skill_security_scan_reports())
+        if report:
+            agent._emit_status(report)
+    except Exception:
+        logger.debug("skill security scan report emit failed", exc_info=True)
+
+
 def _emit_terminal_post_tool_call(
     agent,
     *,
@@ -528,6 +543,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            _emit_skill_security_scan_reports(agent)
             results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
@@ -1365,6 +1381,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
             _log_result = _multimodal_text_summary(function_result)
             logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
+
+        _emit_skill_security_scan_reports(agent)
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:
