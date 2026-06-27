@@ -1,6 +1,7 @@
 import io
 import json
 import tarfile
+from hashlib import sha256
 
 import pytest
 
@@ -53,6 +54,32 @@ def _write_index_record(key, record):
     )
 
 
+def _managed_hash(skill_dir):
+    hasher = sha256()
+    for path in sorted(skill_dir.rglob("*")):
+        if path.is_file():
+            rel = path.relative_to(skill_dir).as_posix()
+            rel_bytes = rel.encode("utf-8")
+            data = path.read_bytes()
+            hasher.update(str(len(rel_bytes)).encode("ascii"))
+            hasher.update(b"\0")
+            hasher.update(rel_bytes)
+            hasher.update(b"\0")
+            hasher.update(str(len(data)).encode("ascii"))
+            hasher.update(b"\0")
+            hasher.update(data)
+            hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+def _write_fake_package_bundled_skill(root, name, content):
+    package_root = root / "package"
+    source_skill = package_root / "skills" / name
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text(content, encoding="utf-8")
+    return package_root
+
+
 def test_allows_existing_certik_allow_stamp(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     skill_dir = _write_skill(tmp_path)
@@ -77,6 +104,248 @@ def test_allows_existing_certik_allow_stamp(monkeypatch, tmp_path):
     assert decision.allowed is True
     assert decision.scan_id == "scan-ok"
     assert drain_skill_security_scan_reports() == []
+
+
+def test_ignores_user_writable_bundled_manifest_for_security_skip(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(tmp_path)
+    (tmp_path / "skills" / ".bundled_manifest").write_text(
+        f"demo-skill:{_managed_hash(skill_dir)}\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def _scan(_skill_dir_arg, *, skill_slug, archive):
+        calls.append((skill_slug, archive.fingerprint))
+        return SkillSecurityScanResult(
+            decision="allow",
+            reason="clean despite forged manifest",
+            scan_id="scan-forged-manifest",
+        )
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.scan_id == "scan-forged-manifest"
+    assert len(calls) == 1
+
+
+def test_skips_matching_hermes_bundled_source_tree(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    skill_dir = _write_skill(home)
+    package_root = _write_fake_package_bundled_skill(
+        tmp_path,
+        "demo-skill",
+        "---\nname: demo-skill\ndescription: Demo skill\n---\n",
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate.__file__",
+        str(package_root / "tools" / "skill_security_gate.py"),
+    )
+
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("scanner should not run for a bundled source match")
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.source == "managed"
+    assert "Hermes bundled skill" in decision.reason
+    assert decision.fingerprint.startswith("managed-sha256:")
+    assert drain_skill_security_scan_reports() == []
+
+
+def test_managed_skip_uses_supplied_archive_snapshot(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    skill_dir = _write_skill(home)
+    archive = build_skill_security_archive(skill_dir)
+
+    package_root = _write_fake_package_bundled_skill(
+        tmp_path,
+        "demo-skill",
+        "---\nname: demo-skill\ndescription: Changed after snapshot\n---\n",
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate.__file__",
+        str(package_root / "tools" / "skill_security_gate.py"),
+    )
+    calls = []
+
+    def _scan(_skill_dir_arg, *, skill_slug, archive):
+        calls.append((skill_slug, archive.fingerprint))
+        return SkillSecurityScanResult(
+            decision="allow",
+            reason="snapshot did not match managed source",
+            scan_id="scan-snapshot",
+        )
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir, archive=archive)
+
+    assert decision.allowed is True
+    assert decision.scan_id == "scan-snapshot"
+    assert len(calls) == 1
+
+
+def test_does_not_treat_live_skills_dir_as_bundled_source(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_BUNDLED_SKILLS", raising=False)
+    skill_dir = _write_skill(tmp_path)
+    monkeypatch.setattr(
+        "tools.skill_security_gate.__file__",
+        str(tmp_path / "tools" / "skill_security_gate.py"),
+    )
+    calls = []
+
+    def _scan(_skill_dir_arg, *, skill_slug, archive):
+        calls.append((skill_slug, archive.fingerprint))
+        return SkillSecurityScanResult(
+            decision="allow",
+            reason="clean live dir fallback",
+            scan_id="scan-live-dir",
+        )
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.scan_id == "scan-live-dir"
+    assert len(calls) == 1
+
+
+def test_ignores_hermes_bundled_skills_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(tmp_path)
+    fake_bundled = tmp_path / "outside-fake-bundled"
+    source_skill = fake_bundled / "demo-skill"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: Demo skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(fake_bundled))
+    calls = []
+
+    def _scan(_skill_dir_arg, *, skill_slug, archive):
+        calls.append((skill_slug, archive.fingerprint))
+        return SkillSecurityScanResult(
+            decision="allow",
+            reason="bundled env override ignored",
+            scan_id="scan-fake-home-bundled",
+        )
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.scan_id == "scan-fake-home-bundled"
+    assert len(calls) == 1
+
+
+def test_does_not_trust_fixed_bundled_source_under_hermes_home(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    skill_dir = _write_skill(home)
+    source_skill = home / "fake-package" / "skills" / "demo-skill"
+    source_skill.mkdir(parents=True, exist_ok=True)
+    (source_skill / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: Demo skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate.__file__",
+        str(home / "fake-package" / "tools" / "skill_security_gate.py"),
+    )
+    calls = []
+
+    def _scan(_skill_dir_arg, *, skill_slug, archive):
+        calls.append((skill_slug, archive.fingerprint))
+        return SkillSecurityScanResult(
+            decision="allow",
+            reason="fixed home bundled dir ignored",
+            scan_id="scan-fixed-home-bundled",
+        )
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.scan_id == "scan-fixed-home-bundled"
+    assert len(calls) == 1
+
+
+def test_skips_matching_platform_managed_source_tree(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(tmp_path, name="okx")
+    platform_source = tmp_path / "platform-source"
+    source_skill = platform_source / "okx"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text(
+        "---\nname: okx\ndescription: Demo skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate._PLATFORM_MANAGED_SKILLS_DIR",
+        platform_source,
+    )
+
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("scanner should not run for a platform-managed skill")
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.source == "managed"
+    assert "Platform-managed skill" in decision.reason
+
+
+def test_changed_platform_managed_skill_scans_external_replacement(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(tmp_path, name="okx")
+    platform_source = tmp_path / "platform-source"
+    source_skill = platform_source / "okx"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text(
+        "---\nname: okx\ndescription: Demo skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate._PLATFORM_MANAGED_SKILLS_DIR",
+        platform_source,
+    )
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: okx\ndescription: Replaced externally\n---\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def _scan(_skill_dir_arg, *, skill_slug, archive):
+        calls.append((skill_slug, archive.fingerprint))
+        return SkillSecurityScanResult(
+            decision="allow",
+            reason="clean replacement",
+            scan_id="scan-replaced",
+        )
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.scan_id == "scan-replaced"
+    assert len(calls) == 1
 
 
 def test_scans_missing_stamp_and_records_allow(monkeypatch, tmp_path):
