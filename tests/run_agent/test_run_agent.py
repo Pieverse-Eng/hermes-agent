@@ -2082,6 +2082,37 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_sequential_tool_emits_skill_security_scan_report(self, agent):
+        from tools.skill_security_gate import (
+            _record_scan_report,
+            drain_skill_security_scan_reports,
+        )
+
+        drain_skill_security_scan_reports()
+        emitted = []
+        agent._emit_status = emitted.append
+
+        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+
+        def fake_handle(*_args, **_kwargs):
+            _record_scan_report(
+                Path("langgraph-multi-agent"),
+                decision="allow",
+                reason="Security scan passed.",
+                fingerprint="archive-sha256:test",
+                scan_id="scan-ok",
+            )
+            return "search result"
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+
+        assert len(emitted) == 1
+        assert "🐾 Skill security check" in emitted[0]
+        assert "🛡️ CertiK scanned 1 skill" in emitted[0]
+        assert "Passed: langgraph-multi-agent." in emitted[0]
+
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
@@ -2251,6 +2282,37 @@ class TestExecuteToolCalls:
 
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
+
+    def test_concurrent_tool_emits_skill_security_scan_report(self, agent):
+        from tools.skill_security_gate import (
+            _record_scan_report,
+            drain_skill_security_scan_reports,
+        )
+
+        drain_skill_security_scan_reports()
+        emitted = []
+        agent._emit_status = emitted.append
+
+        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+
+        def fake_handle(*_args, **_kwargs):
+            _record_scan_report(
+                Path("langgraph-multi-agent"),
+                decision="allow",
+                reason="Security scan passed.",
+                fingerprint="archive-sha256:test",
+                scan_id="scan-ok",
+            )
+            return "search result"
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, [], "task-1")
+
+        assert len(emitted) == 1
+        assert "🐾 Skill security check" in emitted[0]
+        assert "🛡️ CertiK scanned 1 skill" in emitted[0]
+        assert "Passed: langgraph-multi-agent." in emitted[0]
 
     def test_single_tool_uses_sequential_path(self, agent):
         """Single tool call should use sequential path, not concurrent."""
