@@ -190,6 +190,96 @@ def test_no_review_when_memory_disabled():
     assert ctx.should_review_memory is False
 
 
+def test_pre_turn_skill_scan_surfaces_report_without_rebuilding_prompt():
+    agent = _FakeAgent()
+    agent.valid_tool_names = {"skills_list", "skill_view", "web_search"}
+    emitted = []
+    agent._emit_status = emitted.append
+    formatted_reports = []
+
+    def _format_report(reports):
+        formatted_reports.append(list(reports))
+        return (
+            "🐾 Found 1 new or updated skill.\n"
+            "🛡️ CertiK scanned it: 1 passed, 0 did not pass."
+        )
+
+    with patch("agent.prompt_builder.build_skills_system_prompt", return_value="<available_skills>") as build_skills, \
+         patch(
+             "tools.skill_security_gate.drain_skill_security_scan_reports",
+             side_effect=[[], ["scan-report"]],
+         ), \
+         patch(
+             "tools.skill_security_gate.format_skill_security_scan_report",
+             side_effect=_format_report,
+         ), \
+         patch(
+             "model_tools.get_toolset_for_tool",
+             side_effect=lambda name: "skills" if name.startswith("skill") else "web",
+         ), \
+         patch(
+             "agent.coding_context.coding_compact_skill_categories",
+             return_value=frozenset({"research"}),
+         ), \
+         patch("agent.runtime_cwd.resolve_context_cwd", return_value=None):
+        ctx = _build(agent)
+
+    assert ctx.active_system_prompt == "SYSTEM"
+    assert emitted == [
+        "🐾 Found 1 new or updated skill.\n"
+        "🛡️ CertiK scanned it: 1 passed, 0 did not pass."
+    ]
+    assert formatted_reports == [["scan-report"]]
+    build_skills.assert_called_once()
+    kwargs = build_skills.call_args.kwargs
+    assert kwargs["available_tools"] == {"skills_list", "skill_view", "web_search"}
+    assert kwargs["available_toolsets"] == {"skills", "web"}
+    assert kwargs["compact_categories"] == frozenset({"research"})
+
+
+def test_pre_turn_skill_scan_skips_when_skill_tools_unavailable():
+    agent = _FakeAgent()
+    agent.valid_tool_names = {"web_search"}
+
+    with patch("agent.prompt_builder.build_skills_system_prompt") as build_skills:
+        _build(agent)
+
+    build_skills.assert_not_called()
+
+
+def test_pre_turn_skill_scan_preserves_reports_from_fresh_prompt_build():
+    agent = _FakeAgent()
+    agent.valid_tool_names = {"skill_view"}
+    emitted = []
+    agent._emit_status = emitted.append
+    formatted_reports = []
+
+    def _format_report(reports):
+        formatted_reports.append(list(reports))
+        return "🛡️ CertiK scanned 2 skills: 1 passed, 1 did not pass."
+
+    with patch("agent.prompt_builder.build_skills_system_prompt") as build_skills, \
+         patch(
+             "tools.skill_security_gate.drain_skill_security_scan_reports",
+             side_effect=[["fresh-build-report"], ["pre-turn-report"]],
+         ), \
+         patch(
+             "tools.skill_security_gate.format_skill_security_scan_report",
+             side_effect=_format_report,
+         ), \
+         patch("model_tools.get_toolset_for_tool", return_value="skills"), \
+         patch(
+             "agent.coding_context.coding_compact_skill_categories",
+             return_value=frozenset(),
+         ), \
+         patch("agent.runtime_cwd.resolve_context_cwd", return_value=None):
+        _build(agent)
+
+    build_skills.assert_called_once()
+    assert formatted_reports == [["fresh-build-report", "pre-turn-report"]]
+    assert emitted == ["🛡️ CertiK scanned 2 skills: 1 passed, 1 did not pass."]
+
+
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
 #
 # A slow MCP server that connects after the agent's build-time tool snapshot
@@ -258,4 +348,3 @@ def test_between_turns_refresh_no_churn_when_unchanged():
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
-

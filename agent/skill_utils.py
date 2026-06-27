@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import get_config_path, get_skills_dir, is_termux
+from hermes_constants import get_config_path, get_hermes_home, get_skills_dir, is_termux
 
 logger = logging.getLogger(__name__)
 
@@ -398,13 +398,13 @@ def _normalize_string_set(values) -> Set[str]:
 
 # ── External skills directories ──────────────────────────────────────────
 
-# (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
-# mtime_ns so a config.yaml edit mid-run is picked up automatically;
-# otherwise every call would re-read + re-YAML-parse the 15KB config,
-# which becomes the dominant cost of ``hermes`` startup when ~120 skills
-# each trigger a category lookup during banner construction (10+ seconds
-# of pure waste).
-_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
+# (config marker, default-dir marker) -> resolved external dirs list.  Keyed by
+# config.yaml mtime plus the default cross-agent skills directory existence so
+# config edits and late ``npx skills add`` installs are picked up automatically;
+# otherwise every call would re-read + re-YAML-parse the 15KB config, which
+# becomes the dominant cost of ``hermes`` startup when ~120 skills each trigger
+# a category lookup during banner construction (10+ seconds of pure waste).
+_EXTERNAL_DIRS_CACHE: Dict[Tuple[Any, ...], List[Path]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
@@ -413,61 +413,98 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
+def _default_external_skills_candidates(hermes_home: Path | None = None) -> List[Path]:
+    """Return implicit cross-agent skill roots under HERMES_HOME."""
+    home = hermes_home if hermes_home is not None else get_hermes_home()
+    return [home / ".agents" / "skills"]
+
+
+def _default_external_skills_marker(hermes_home: Path) -> Tuple[Tuple[str, int, int], ...]:
+    """Return a cheap marker that changes when default external roots appear."""
+    markers: list[tuple[str, int, int]] = []
+    for candidate in _default_external_skills_candidates(hermes_home):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        try:
+            st = resolved.stat()
+            markers.append((str(resolved), st.st_mtime_ns, 1 if resolved.is_dir() else 0))
+        except OSError:
+            markers.append((str(resolved), 0, 0))
+    return tuple(markers)
+
+
+def _append_existing_external_dir(
+    result: List[Path],
+    seen: Set[Path],
+    candidate: Path,
+    *,
+    local_skills: Path,
+) -> None:
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        resolved = candidate
+    if resolved == local_skills:
+        return
+    if resolved in seen:
+        return
+    if resolved.is_dir():
+        seen.add(resolved)
+        result.append(resolved)
+    else:
+        logger.debug("External skills dir does not exist, skipping: %s", candidate)
+
+
 def get_external_skills_dirs() -> List[Path]:
-    """Read ``skills.external_dirs`` from config.yaml and return validated paths.
+    """Return implicit and configured external skill directories.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
     path.  Only directories that actually exist are returned.  Duplicates and
     paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
+    Hermes also treats ``$HERMES_HOME/.agents/skills`` as an implicit external
+    root so skills installed by cross-agent installers are scanned and gated at
+    load time.
 
     Cached in-process, keyed on ``config.yaml`` mtime — the function is
-    called once per skill during banner / tool-registry scans, and YAML
-    parsing a non-trivial config dominates ``hermes`` cold-start time
-    when the cache is absent.
+    called once per skill during banner / tool-registry scans, and YAML parsing
+    a non-trivial config dominates ``hermes`` cold-start time when the cache is
+    absent.  The implicit default root's existence marker is part of the cache
+    key so installing the first ``.agents`` skill mid-session is observed.
     """
+    hermes_home = get_hermes_home()
     config_path = get_config_path()
-    if not config_path.exists():
-        return []
 
     # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
     # the full YAML parse, so the fast path is nearly free.
     try:
         stat = config_path.stat()
-        cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
+        config_marker: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
     except OSError:
-        cache_key = None  # type: ignore[assignment]
+        config_marker = (str(config_path), 0)
 
-    if cache_key is not None:
-        cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
-        if cached is not None:
-            # Return a copy so callers can't mutate the cached list.
-            return list(cached)
+    cache_key: Tuple[Any, ...] = (
+        config_marker,
+        _default_external_skills_marker(hermes_home),
+    )
+
+    cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
+    if cached is not None:
+        # Return a copy so callers can't mutate the cached list.
+        return list(cached)
+
+    local_skills = get_skills_dir().resolve()
+    seen: Set[Path] = set()
+    result: List[Path] = []
 
     parsed = _load_raw_config()
-    if not parsed:
-        return []
-
-    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
-        return []
-
-    raw_dirs = skills_cfg.get("external_dirs")
-    if not raw_dirs:
-        result: List[Path] = []
-        if cache_key is not None:
-            _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
-        return result
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    raw_dirs = skills_cfg.get("external_dirs") if isinstance(skills_cfg, dict) else []
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
     if not isinstance(raw_dirs, list):
-        return []
-
-    from hermes_constants import get_hermes_home
-
-    hermes_home = get_hermes_home()
-    local_skills = get_skills_dir().resolve()
-    seen: Set[Path] = set()
-    result = []
+        raw_dirs = []
 
     for entry in raw_dirs:
         entry = str(entry).strip()
@@ -478,21 +515,23 @@ def get_external_skills_dirs() -> List[Path]:
         p = Path(expanded)
         # Resolve relative paths against HERMES_HOME, not cwd
         if not p.is_absolute():
-            p = (hermes_home / p).resolve()
-        else:
-            p = p.resolve()
-        if p == local_skills:
-            continue
-        if p in seen:
-            continue
-        if p.is_dir():
-            seen.add(p)
-            result.append(p)
-        else:
-            logger.debug("External skills dir does not exist, skipping: %s", p)
+            p = hermes_home / p
+        _append_existing_external_dir(
+            result,
+            seen,
+            p,
+            local_skills=local_skills,
+        )
 
-    if cache_key is not None:
-        _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+    for candidate in _default_external_skills_candidates(hermes_home):
+        _append_existing_external_dir(
+            result,
+            seen,
+            candidate,
+            local_skills=local_skills,
+        )
+
+    _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
 
 
@@ -500,7 +539,8 @@ def get_all_skills_dirs() -> List[Path]:
     """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
 
     The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order.
+    yet — callers handle that).  External dirs follow in config order, with the
+    implicit ``$HERMES_HOME/.agents/skills`` root last when it exists.
     """
     dirs = [get_skills_dir()]
     dirs.extend(get_external_skills_dirs())
