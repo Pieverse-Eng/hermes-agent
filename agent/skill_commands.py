@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from hermes_constants import display_hermes_home
 from agent.skill_preprocessing import (
@@ -428,6 +428,56 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     ):
         scan_skill_commands()
     return _skill_commands
+
+
+def snapshot_skill_commands() -> Dict[str, Dict[str, Any]]:
+    """Return a shallow copy of the current slash-skill cache without rescanning."""
+    return {cmd: dict(info or {}) for cmd, info in _skill_commands.items()}
+
+
+def unregister_skill_commands_for_security(
+    rejected_identifiers: Iterable[str],
+) -> list[dict[str, str]]:
+    """Remove security-rejected skills from the in-process slash map.
+
+    ``rejected_identifiers`` usually contains skill directory names from the
+    CertiK scan report. Match those against the command slug, frontmatter name,
+    and visible skill directory name so a rejected skill cannot remain
+    invokable just because its frontmatter name differs from the directory.
+    """
+    rejected = {
+        str(item).strip().lower()
+        for item in rejected_identifiers
+        if str(item or "").strip()
+    }
+    if not rejected:
+        return []
+
+    removed: list[dict[str, str]] = []
+    for cmd, info in list(_skill_commands.items()):
+        name = str((info or {}).get("name") or "")
+        description = str((info or {}).get("description") or "")
+        skill_dir = str((info or {}).get("skill_dir") or "")
+        dir_name = Path(skill_dir).name if skill_dir else ""
+        identifiers = {
+            cmd.lstrip("/").lower(),
+            name.lower(),
+            dir_name.lower(),
+        }
+        matched = sorted(identifiers & rejected)
+        if not matched:
+            continue
+        _skill_commands.pop(cmd, None)
+        removed.append(
+            {
+                "name": name or dir_name or cmd.lstrip("/"),
+                "description": description,
+                "skill_dir": skill_dir,
+                "command": cmd,
+                "matched": matched[0],
+            }
+        )
+    return removed
 
 
 def reload_skills() -> Dict[str, Any]:

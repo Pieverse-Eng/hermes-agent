@@ -113,7 +113,7 @@ async def test_reset_fires_reset_hook(mock_invoke_hook):
 async def test_reset_surfaces_skill_security_scan_report(monkeypatch):
     """/new preloads skills and includes CertiK scan results in the reset reply."""
     runner = _make_runner()
-    runner._skill_security_scan_on_reset = True
+    runner._skill_security_scan_on_session_refresh = True
 
     seen_context = []
     cleared_tokens = []
