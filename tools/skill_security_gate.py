@@ -129,11 +129,12 @@ def format_skill_security_scan_report(reports: list[SkillSecurityScanReport]) ->
     allowed = [r for r in reports if r.decision == "allow"]
     blocked = [r for r in reports if r.decision == "block"]
     failed = [r for r in reports if r.decision not in {"allow", "block"}]
+    skill_label = "skill" if len(reports) == 1 else "skills"
+    target_label = "it" if len(reports) == 1 else "them"
 
     lines = [
-        "🐾 Skill security check",
-        f"🛡️ CertiK scanned {len(reports)} "
-        f"{'skill' if len(reports) == 1 else 'skills'}: "
+        f"🐾 Found {len(reports)} new or updated {skill_label}.",
+        f"🛡️ CertiK scanned {target_label}: "
         f"{len(allowed)} passed, {len(blocked) + len(failed)} did not pass.",
     ]
     if allowed:
@@ -314,6 +315,15 @@ def _allow_record_matches(record: Any, fingerprint: str) -> bool:
     )
 
 
+def _blocked_record_matches(record: Any, fingerprint: str) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("provider") == "certik"
+        and record.get("decision") == "block"
+        and record.get("fingerprint") == fingerprint
+    )
+
+
 def ensure_skill_certik_allowed_for_session_load(
     skill_dir: Path,
     *,
@@ -357,6 +367,19 @@ def ensure_skill_certik_allowed_for_session_load(
         return SkillSecurityDecision(
             True,
             "Previously verified by CertiK",
+            fingerprint=fp.value,
+            scan_id=record.get("scanId") if isinstance(record, dict) else None,
+            archive=scan_archive,
+        )
+    if _blocked_record_matches(record, fp.value):
+        reason = (
+            record.get("reason")
+            if isinstance(record, dict) and isinstance(record.get("reason"), str)
+            else "CertiK security verification did not allow this skill"
+        )
+        return SkillSecurityDecision(
+            False,
+            reason,
             fingerprint=fp.value,
             scan_id=record.get("scanId") if isinstance(record, dict) else None,
             archive=scan_archive,
