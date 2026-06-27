@@ -110,6 +110,55 @@ async def test_reset_fires_reset_hook(mock_invoke_hook):
 
 
 @pytest.mark.asyncio
+async def test_reset_surfaces_skill_security_scan_report(monkeypatch):
+    """/new preloads skills and includes CertiK scan results in the reset reply."""
+    runner = _make_runner()
+    runner._skill_security_scan_on_reset = True
+
+    seen_context = []
+    cleared_tokens = []
+
+    def _set_session_env(context):
+        seen_context.append(context)
+        return ["token"]
+
+    async def _run_in_executor_with_context(func, *args):
+        return func(*args)
+
+    runner._set_session_env = _set_session_env
+    runner._clear_session_env = lambda tokens: cleared_tokens.append(tokens)
+    runner._run_in_executor_with_context = _run_in_executor_with_context
+
+    build_calls = []
+    monkeypatch.setattr(
+        "agent.prompt_builder.build_skills_system_prompt",
+        lambda: build_calls.append(True) or "<available_skills>",
+    )
+    drain_results = iter([[], ["scan-report"]])
+    monkeypatch.setattr(
+        "tools.skill_security_gate.drain_skill_security_scan_reports",
+        lambda: next(drain_results),
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate.format_skill_security_scan_report",
+        lambda reports: (
+            "🐾 Found 1 new or updated skill.\n"
+            "🛡️ CertiK scanned it: 1 passed, 0 did not pass."
+            if reports
+            else ""
+        ),
+    )
+
+    result = await runner._handle_reset_command(_make_event("/new"))
+
+    assert build_calls == [True]
+    assert seen_context and seen_context[0].session_id == "sess-new"
+    assert cleared_tokens == [["token"]]
+    assert "🐾 Found 1 new or updated skill." in str(result)
+    assert "🛡️ CertiK scanned it" in str(result)
+
+
+@pytest.mark.asyncio
 @patch("hermes_cli.plugins.invoke_hook")
 async def test_finalize_before_reset(mock_invoke_hook):
     """on_session_finalize must fire before on_session_reset."""

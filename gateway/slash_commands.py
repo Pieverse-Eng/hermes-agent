@@ -61,6 +61,55 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    async def _scan_skills_for_new_session_reset(
+        self,
+        source: SessionSource,
+        new_entry: Any,
+    ) -> str:
+        """Preload the new session's skill index so /new surfaces scan results."""
+        if not getattr(self, "_skill_security_scan_on_reset", False):
+            return ""
+        if source is None or new_entry is None:
+            return ""
+
+        def _scan() -> str:
+            from agent.prompt_builder import build_skills_system_prompt
+            from tools.skill_security_gate import (
+                drain_skill_security_scan_reports,
+                format_skill_security_scan_report,
+            )
+
+            drain_skill_security_scan_reports()
+            build_skills_system_prompt()
+            return format_skill_security_scan_report(drain_skill_security_scan_reports())
+
+        tokens = None
+        try:
+            from gateway.session import build_session_context
+
+            context = build_session_context(source, self.config, new_entry)
+            set_env = getattr(self, "_set_session_env", None)
+            if callable(set_env):
+                tokens = set_env(context)
+
+            run_with_context = getattr(self, "_run_in_executor_with_context", None)
+            if callable(run_with_context):
+                report = await run_with_context(_scan)
+            else:
+                report = await asyncio.to_thread(_scan)
+            return str(report or "").strip()
+        except Exception:
+            logger.debug("skill security scan on /new failed", exc_info=True)
+            return ""
+        finally:
+            if tokens:
+                clear_env = getattr(self, "_clear_session_env", None)
+                if callable(clear_env):
+                    try:
+                        clear_env(tokens)
+                    except Exception:
+                        logger.debug("session env cleanup after /new scan failed", exc_info=True)
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
@@ -224,9 +273,12 @@ class GatewaySlashCommandsMixin:
         except Exception:
             _tip_line = ""
 
-        if session_info:
-            return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
-        return EphemeralReply(f"{header}{_tip_line}")
+        scan_report = await self._scan_skills_for_new_session_reset(source, new_entry)
+
+        message = f"{header}\n\n{session_info}{_tip_line}" if session_info else f"{header}{_tip_line}"
+        if scan_report:
+            message = f"{message}\n\n{scan_report}"
+        return EphemeralReply(message)
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile — show active profile name and home directory."""

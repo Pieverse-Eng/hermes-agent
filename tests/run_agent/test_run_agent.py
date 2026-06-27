@@ -2109,8 +2109,8 @@ class TestExecuteToolCalls:
             agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
 
         assert len(emitted) == 1
-        assert "🐾 Skill security check" in emitted[0]
-        assert "🛡️ CertiK scanned 1 skill" in emitted[0]
+        assert "🐾 Found 1 new or updated skill." in emitted[0]
+        assert "🛡️ CertiK scanned it" in emitted[0]
         assert "Passed: langgraph-multi-agent." in emitted[0]
 
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
@@ -2310,8 +2310,8 @@ class TestConcurrentToolExecution:
             agent._execute_tool_calls_concurrent(mock_msg, [], "task-1")
 
         assert len(emitted) == 1
-        assert "🐾 Skill security check" in emitted[0]
-        assert "🛡️ CertiK scanned 1 skill" in emitted[0]
+        assert "🐾 Found 1 new or updated skill." in emitted[0]
+        assert "🛡️ CertiK scanned it" in emitted[0]
         assert "Passed: langgraph-multi-agent." in emitted[0]
 
     def test_single_tool_uses_sequential_path(self, agent):

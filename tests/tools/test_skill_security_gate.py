@@ -106,6 +106,34 @@ def test_allows_existing_certik_allow_stamp(monkeypatch, tmp_path):
     assert drain_skill_security_scan_reports() == []
 
 
+def test_blocks_existing_certik_block_stamp_without_rescan(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(tmp_path)
+    fp = fingerprint_skill_dir(skill_dir)
+    _write_index_record(
+        "local:demo-skill",
+        {
+            "provider": "certik",
+            "decision": "block",
+            "fingerprint": fp.value,
+            "scanId": "scan-blocked",
+            "reason": "high severity finding",
+        },
+    )
+
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("scanner should not rerun for a matching block stamp")
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is False
+    assert decision.reason == "high severity finding"
+    assert decision.scan_id == "scan-blocked"
+    assert drain_skill_security_scan_reports() == []
+
+
 def test_ignores_user_writable_bundled_manifest_for_security_skip(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     skill_dir = _write_skill(tmp_path)
@@ -377,7 +405,7 @@ def test_scans_missing_stamp_and_records_allow(monkeypatch, tmp_path):
     assert record["scanId"] == "scan-1"
     assert record["archiveSha256"] == "archive-sha"
     report = format_skill_security_scan_report(drain_skill_security_scan_reports())
-    assert report.startswith("🐾 Skill security check\n🛡️ CertiK scanned 1 skill:")
+    assert report.startswith("🐾 Found 1 new or updated skill.\n🛡️ CertiK scanned it:")
     assert "1 passed, 0 did not pass" in report
     assert "Passed: demo-skill." in report
 
