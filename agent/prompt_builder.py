@@ -1179,6 +1179,30 @@ def _build_skills_tree_cache_digest(skills_dir: Path, external_dirs: list[Path])
     path to re-run the gate instead of serving an old in-process prompt.
     """
     digest = sha256()
+
+    def _add_path_marker(root: Path, path: Path, kind: bytes) -> None:
+        try:
+            rel = path.relative_to(root).as_posix()
+            st = path.lstat()
+        except OSError:
+            return
+        digest.update(kind)
+        digest.update(b"\0")
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(st.st_mode).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(st.st_mtime_ns).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(st.st_size).encode("ascii"))
+        if path.is_symlink():
+            try:
+                digest.update(b":")
+                digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+            except OSError:
+                pass
+        digest.update(b"\0")
+
     roots = [skills_dir, *external_dirs]
     for root in roots:
         root = Path(root)
@@ -1195,19 +1219,11 @@ def _build_skills_tree_cache_digest(skills_dir: Path, external_dirs: list[Path])
         for current, dirs, files in os.walk(root, followlinks=False):
             dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_SKILL_DIRS)
             current_path = Path(current)
+            _add_path_marker(root, current_path, b"dir")
+            for name in dirs:
+                _add_path_marker(root, current_path / name, b"dirent")
             for name in sorted(files):
-                path = current_path / name
-                try:
-                    rel = path.relative_to(root).as_posix()
-                    st = path.lstat()
-                except OSError:
-                    continue
-                digest.update(rel.encode("utf-8"))
-                digest.update(b"\0")
-                digest.update(str(st.st_mtime_ns).encode("ascii"))
-                digest.update(b":")
-                digest.update(str(st.st_size).encode("ascii"))
-                digest.update(b"\0")
+                _add_path_marker(root, current_path / name, b"file")
     digest.update(b"security-index\0")
     digest.update(_security_index_stat_marker().encode("utf-8"))
     return digest.hexdigest()

@@ -420,6 +420,39 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_symlinked_skill_invalidates_in_process_cache(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        base_skill = tmp_path / "skills" / "base"
+        base_skill.mkdir(parents=True)
+        (base_skill / "SKILL.md").write_text(
+            "---\nname: base-skill\ndescription: Base skill\n---\n",
+            encoding="utf-8",
+        )
+
+        first = build_skills_system_prompt()
+        assert "base-skill" in first
+        assert "langgraph-multi-agent" not in first
+
+        real_skill = tmp_path / "home" / ".agents" / "skills" / "langgraph-multi-agent"
+        real_skill.mkdir(parents=True)
+        (real_skill / "SKILL.md").write_text(
+            "---\n"
+            "name: langgraph-multi-agent\n"
+            "description: External symlinked skill\n"
+            "---\n",
+            encoding="utf-8",
+        )
+        link = tmp_path / "skills" / "langgraph-multi-agent"
+        try:
+            link.symlink_to(real_skill, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+        second = build_skills_system_prompt()
+        assert "base-skill" in second
+        assert "langgraph-multi-agent" in second
+        assert "External symlinked skill" in second
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
