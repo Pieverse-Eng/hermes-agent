@@ -846,7 +846,7 @@ def ensure_hermes_home():
         _secure_dir(home)
         for subdir in (
             "cron", "sessions", "logs", "logs/curator", "memories",
-            "pairing", "hooks", "image_cache", "audio_cache", "skills",
+            "hooks", "image_cache", "audio_cache", "skills",
         ):
             d = home / subdir
             d.mkdir(parents=True, exist_ok=True)
