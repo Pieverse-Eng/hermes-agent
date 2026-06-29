@@ -5295,98 +5295,33 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     return results
 
 
-_ADDITIVE_LIST_CONFIG_KEYS = {
-    ("plugins", "enabled"),
-    ("plugins", "disabled"),
-    ("skills", "disabled"),
-}
-
-
-def _list_item_key(value):
-    try:
-        hash(value)
-    except TypeError:
-        return (type(value).__name__, repr(value))
-    return (type(value).__name__, value)
-
-
-def _merge_unique_lists(base: list, override: list) -> list:
-    merged = []
-    seen = set()
-    for value in [*base, *override]:
-        key = _list_item_key(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(value)
-    return merged
-
-
-def _remove_list_items(values: list, removed: list) -> list:
-    removed_keys = {_list_item_key(value) for value in removed}
-    kept = []
-    seen = set()
-    for value in values:
-        key = _list_item_key(value)
-        if key in removed_keys or key in seen:
-            continue
-        seen.add(key)
-        kept.append(value)
-    return kept
-
-
-def _deep_merge(base: dict, override: dict, path: tuple = ()) -> dict:
+def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base*, preserving nested defaults.
 
     Keys in *override* take precedence. If both values are dicts the merge
     recurses, so a user who overrides only ``tts.elevenlabs.voice_id`` will
-    keep the default ``tts.elevenlabs.model_id`` intact. Lists replace by
-    default; allow-list style paths use stable unique union so managed scopes
-    can add platform entries without dropping user-installed entries.
+    keep the default ``tts.elevenlabs.model_id`` intact.
     """
     result = base.copy()
     for key, value in override.items():
-        child_path = (*path, key)
         if (
             key in result
             and isinstance(result[key], dict)
             and isinstance(value, dict)
         ):
-            result[key] = _deep_merge(result[key], value, child_path)
-        elif (
-            child_path in _ADDITIVE_LIST_CONFIG_KEYS
-            and key in result
-            and isinstance(result[key], list)
-            and isinstance(value, list)
-        ):
-            result[key] = _merge_unique_lists(result[key], value)
+            result[key] = _deep_merge(result[key], value)
         else:
             result[key] = value
     return result
 
 
-def _nested_value(cfg: dict, parts: list):
-    node = cfg
-    for part in parts:
-        if not isinstance(node, dict) or part not in node:
-            return None
-        node = node[part]
-    return node
-
-
-def _strip_dotted_keys(
-    cfg: dict,
-    dotted_keys: set,
-    managed_config: Optional[dict] = None,
-) -> Tuple[dict, set]:
+def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     """Remove the given dotted leaf keys from a nested config dict.
 
     Returns ``(pruned_cfg, set_of_stripped_keys_that_were_present)``. Used by
     ``save_config`` to drop managed-scope leaves before persisting, so a bulk
     write never writes a user value that would lose to the managed layer on the
-    next load. Additive list keys keep user-owned entries and strip only the
-    entries supplied by managed scope. Only keys actually present in ``cfg`` are
-    reported as stripped.
+    next load. Only keys actually present in ``cfg`` are reported as stripped.
     """
     stripped: set = set()
     for dotted in dotted_keys:
@@ -5398,21 +5333,7 @@ def _strip_dotted_keys(
                 break
             node = node[p]
         if isinstance(node, dict) and parts[-1] in node:
-            path = tuple(parts)
-            value = node[parts[-1]]
-            managed_value = _nested_value(managed_config or {}, parts)
-            if (
-                path in _ADDITIVE_LIST_CONFIG_KEYS
-                and isinstance(value, list)
-                and isinstance(managed_value, list)
-            ):
-                kept = _remove_list_items(value, managed_value)
-                if kept:
-                    node[parts[-1]] = kept
-                else:
-                    del node[parts[-1]]
-            else:
-                del node[parts[-1]]
+            del node[parts[-1]]
             stripped.add(dotted)
     return cfg, stripped
 
@@ -5961,11 +5882,7 @@ def save_config(config: Dict[str, Any]):
 
         managed_keys = managed_scope.managed_config_keys()
         if managed_keys:
-            config, _stripped = _strip_dotted_keys(
-                copy.deepcopy(config),
-                managed_keys,
-                managed_scope.load_managed_config(),
-            )
+            config, _stripped = _strip_dotted_keys(copy.deepcopy(config), managed_keys)
             if _stripped:
                 print(
                     f"Note: {len(_stripped)} managed setting(s) were not saved "
