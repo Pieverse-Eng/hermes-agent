@@ -83,6 +83,13 @@ model:
 forces `model.default` for every user while leaving `model.fallback` (and every
 other key) under user control.
 
+Lists normally follow the same leaf-level rule: if a managed list pins a key,
+that list replaces the user's list. A small set of allow-list style keys are
+additive instead, so administrators can add entries without erasing user-owned
+entries: `plugins.enabled`, `plugins.disabled`, and `skills.disabled`. Path
+lists such as `plugins.load.paths` and `skills.external_dirs` remain
+replacement-based so managed scope can control code and skill loading sources.
+
 :::note Precedence note
 For the keys it pins, managed scope deliberately wins over the shell environment
 too — otherwise it would not be "managed." This is the one place that inverts the
