@@ -45,6 +45,11 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "DavidMetcalfe@users.noreply.github.com": "DavidMetcalfe",  # upstream e589 refresh attribution
+    "gigakun@agentmail.to": "gigakun3030",  # upstream e589 refresh attribution
+    "jakub.wolniewicz@gmail.com": "frizikk",  # upstream e589 refresh attribution
+    "linwentao888@gmail.com": "xxxxxmax",  # Pieverse harness attribution
+    "markvlcek@gmail.com": "MarkVLK",  # upstream e589 refresh attribution
     "VrtxOmega@pm.me": "VrtxOmega",  # PR #43809 salvage (desktop: WSL folder-picker path bridge)
     "135129512+ansel-f@users.noreply.github.com": "ansel-f",  # PR #62388 salvage (approval: allow exact verifier temp cleanup without broadening rm safety boundary)
     "robert@modern-minds.ai": "Hopfensaft",  # PR #31933 salvage (dashboard: align approvals.mode dropdown with canonical engine values)
