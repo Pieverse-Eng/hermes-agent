@@ -352,6 +352,7 @@ def is_gateway_known_command(name: str | None) -> bool:
     """
     if not name:
         return False
+    name = name.lower().lstrip("/").replace("_", "-")
     if name in GATEWAY_KNOWN_COMMANDS:
         return True
     for plugin_name, _description, _args_hint in _iter_plugin_command_entries():
@@ -405,7 +406,7 @@ def should_bypass_active_session(command_name: str | None) -> bool:
     ACTIVE_SESSION_BYPASS_COMMANDS remains the subset of commands with
     explicit Level-2 handlers; the rest fall through to the catch-all.
     """
-    return resolve_command(command_name) is not None if command_name else False
+    return is_gateway_known_command(command_name)
 
 
 def _resolve_config_gates() -> set[str]:
@@ -477,15 +478,37 @@ def gateway_help_lines() -> list[str]:
     return lines
 
 
-def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
+def _plugin_command_supports_platform(meta: dict, platform: str | None) -> bool:
+    """Return whether plugin command metadata should surface on *platform*."""
+    if not platform:
+        return True
+    configured = meta.get("platforms")
+    if configured is None:
+        return True
+    if isinstance(configured, str):
+        allowed = {configured.strip().lower()} if configured.strip() else set()
+    else:
+        try:
+            allowed = {
+                str(item).strip().lower()
+                for item in configured
+                if str(item).strip()
+            }
+        except TypeError:
+            allowed = set()
+    return platform.strip().lower() in allowed
+
+
+def _iter_plugin_command_entries(
+    platform: str | None = None,
+) -> list[tuple[str, str, str]]:
     """Yield (name, description, args_hint) tuples for all plugin slash commands.
 
     Plugin commands are registered via
     :func:`hermes_cli.plugins.PluginContext.register_command`. They behave
-    like ``CommandDef`` entries for gateway surfacing: they appear in the
-    Telegram command menu, in Slack's ``/hermes`` subcommand mapping, and
-    (via :func:`plugins.platforms.discord.adapter._register_slash_commands`) in
-    Discord's native slash command picker.
+    like ``CommandDef`` entries for gateway surfacing: unless scoped to other
+    platforms, they appear in the Telegram command menu, in Slack's ``/hermes``
+    subcommand mapping, and in Discord's native slash command picker.
 
     Lookup is lazy so importing this module never forces plugin discovery
     (which can trigger filesystem scans and environment-dependent
@@ -502,6 +525,8 @@ def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
     entries: list[tuple[str, str, str]] = []
     for name, meta in commands.items():
         if not isinstance(name, str) or not isinstance(meta, dict):
+            continue
+        if not _plugin_command_supports_platform(meta, platform):
             continue
         description = str(meta.get("description") or f"Run /{name}")
         args_hint = str(meta.get("args_hint") or "").strip()
@@ -534,7 +559,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
         tg_name = _sanitize_telegram_name(cmd.name)
         if tg_name:
             result.append((tg_name, cmd.description))
-    for name, description, args_hint in _iter_plugin_command_entries():
+    for name, description, args_hint in _iter_plugin_command_entries(platform="telegram"):
         if _requires_argument(args_hint):
             continue
         tg_name = _sanitize_telegram_name(name)
@@ -806,13 +831,13 @@ def _collect_gateway_skill_entries(
     # --- Tier 1: Plugin slash commands (never trimmed) ---------------------
     plugin_pairs: list[tuple[str, str]] = []
     try:
-        from hermes_cli.plugins import get_plugin_commands
-        plugin_cmds = get_plugin_commands()
-        for cmd_name in sorted(plugin_cmds):
+        for cmd_name, cmd_desc, _args_hint in sorted(
+            _iter_plugin_command_entries(platform=platform)
+        ):
             name = sanitize_name(cmd_name) if sanitize_name else cmd_name
             if not name:
                 continue
-            desc = plugin_cmds[cmd_name].get("description", "Plugin command")
+            desc = cmd_desc or "Plugin command"
             if len(desc) > desc_limit:
                 desc = desc[:desc_limit - 3] + "..."
             plugin_pairs.append((name, desc))
@@ -1163,7 +1188,14 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - pieverse-byok: hosted key rotation; reached via /hermes pieverse-byok.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "credits",
+    "billing",
+    "moa",
+    "debug",
+    "pieverse-byok",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1253,7 +1285,7 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
     # Third pass: plugin commands.
-    for name, description, args_hint in _iter_plugin_command_entries():
+    for name, description, args_hint in _iter_plugin_command_entries(platform="slack"):
         _add(name, description, args_hint or "")
 
     return entries
@@ -1303,7 +1335,7 @@ def slack_subcommand_map() -> dict[str, str]:
         mapping[cmd.name] = f"/{cmd.name}"
         for alias in cmd.aliases:
             mapping[alias] = f"/{alias}"
-    for name, _description, _args_hint in _iter_plugin_command_entries():
+    for name, _description, _args_hint in _iter_plugin_command_entries(platform="slack"):
         if name not in mapping:
             mapping[name] = f"/{name}"
     return mapping

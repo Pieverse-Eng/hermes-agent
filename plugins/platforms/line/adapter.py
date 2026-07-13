@@ -101,11 +101,8 @@ from gateway.config import Platform
 # Constants
 # ---------------------------------------------------------------------------
 
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
-LINE_LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start"
-LINE_CONTENT_URL_FMT = "https://api-data.line.me/v2/bot/message/{message_id}/content"
-LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
+DEFAULT_LINE_API_BASE_URL = "https://api.line.me"
+DEFAULT_LINE_DATA_API_BASE_URL = "https://api-data.line.me"
 
 # LINE Messaging API hard limits
 LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
@@ -450,9 +447,18 @@ class _LineClient:
     for the four endpoints we actually call).
     """
 
-    def __init__(self, channel_access_token: str, *, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        channel_access_token: str,
+        *,
+        timeout: float = 15.0,
+        api_base_url: str = DEFAULT_LINE_API_BASE_URL,
+        data_api_base_url: Optional[str] = None,
+    ) -> None:
         self._token = channel_access_token
         self._timeout = timeout
+        self._api_base_url = api_base_url.rstrip("/")
+        self._data_api_base_url = (data_api_base_url or api_base_url).rstrip("/")
         self._headers = {
             "Authorization": f"Bearer {channel_access_token}",
             "Content-Type": "application/json",
@@ -463,7 +469,7 @@ class _LineClient:
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(
-                LINE_REPLY_URL,
+                f"{self._api_base_url}/v2/bot/message/reply",
                 headers=self._headers,
                 json={"replyToken": reply_token, "messages": messages},
             ) as resp:
@@ -476,7 +482,7 @@ class _LineClient:
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(
-                LINE_PUSH_URL,
+                f"{self._api_base_url}/v2/bot/message/push",
                 headers=self._headers,
                 json={"to": chat_id, "messages": messages},
             ) as resp:
@@ -495,7 +501,7 @@ class _LineClient:
             timeout = aiohttp.ClientTimeout(total=5.0)
             async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
                 await session.post(
-                    LINE_LOADING_URL,
+                    f"{self._api_base_url}/v2/bot/chat/loading/start",
                     headers=self._headers,
                     json={"chatId": chat_id, "loadingSeconds": clamped},
                 )
@@ -505,7 +511,8 @@ class _LineClient:
     async def fetch_content(self, message_id: str) -> bytes:
         """Download an inbound media message's binary content."""
         import aiohttp
-        url = LINE_CONTENT_URL_FMT.format(message_id=message_id)
+        encoded_message_id = _urlquote(message_id, safe="")
+        url = f"{self._data_api_base_url}/v2/bot/message/{encoded_message_id}/content"
         timeout = aiohttp.ClientTimeout(total=30.0)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
@@ -519,7 +526,10 @@ class _LineClient:
         timeout = aiohttp.ClientTimeout(total=10.0)
         try:
             async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-                async with session.get(LINE_BOT_INFO_URL, headers=self._headers) as resp:
+                async with session.get(
+                    f"{self._api_base_url}/v2/bot/info",
+                    headers=self._headers,
+                ) as resp:
                     if resp.status >= 400:
                         return None
                     data = await resp.json()
@@ -650,6 +660,7 @@ class LineAdapter(BasePlatformAdapter):
         # Credentials
         self.channel_access_token = (
             os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+            or getattr(config, "token", "")
             or extra.get("channel_access_token", "")
         )
         self.channel_secret = (
@@ -658,14 +669,48 @@ class LineAdapter(BasePlatformAdapter):
         )
 
         # Webhook server
-        self.webhook_host = os.getenv("LINE_HOST") or extra.get("host", "0.0.0.0")
+        self.api_base_url = (
+            os.getenv("LINE_API_BASE_URL")
+            or extra.get("api_base_url")
+            or DEFAULT_LINE_API_BASE_URL
+        ).rstrip("/")
+        configured_data_base_url = (
+            os.getenv("LINE_DATA_API_BASE_URL")
+            or extra.get("data_api_base_url")
+        )
+        self.data_api_base_url = (
+            configured_data_base_url
+            or (
+                DEFAULT_LINE_DATA_API_BASE_URL
+                if self.api_base_url == DEFAULT_LINE_API_BASE_URL
+                else self.api_base_url
+            )
+        ).rstrip("/")
+
+        self.webhook_host = (
+            os.getenv("LINE_HOST")
+            or os.getenv("LINE_WEBHOOK_HOST")
+            or extra.get("host")
+            or extra.get("webhook_host")
+            or "0.0.0.0"
+        )
         try:
             self.webhook_port = int(
-                os.getenv("LINE_PORT") or extra.get("port", DEFAULT_WEBHOOK_PORT)
+                os.getenv("LINE_PORT")
+                or os.getenv("LINE_WEBHOOK_PORT")
+                or extra.get("port")
+                or extra.get("webhook_port")
+                or DEFAULT_WEBHOOK_PORT
             )
         except (TypeError, ValueError):
             self.webhook_port = DEFAULT_WEBHOOK_PORT
-        self.webhook_path = extra.get("webhook_path", DEFAULT_WEBHOOK_PATH)
+        self.webhook_path = (
+            os.getenv("LINE_WEBHOOK_PATH")
+            or extra.get("webhook_path")
+            or DEFAULT_WEBHOOK_PATH
+        )
+        if not self.webhook_path.startswith("/"):
+            self.webhook_path = f"/{self.webhook_path}"
 
         # Public base URL — required for media sending when bind isn't
         # publicly reachable.
@@ -765,7 +810,11 @@ class LineAdapter(BasePlatformAdapter):
         except ImportError:
             self._lock_key = None
 
-        self._client = _LineClient(self.channel_access_token)
+        self._client = _LineClient(
+            self.channel_access_token,
+            api_base_url=self.api_base_url,
+            data_api_base_url=self.data_api_base_url,
+        )
 
         # Best-effort: fetch our own bot userId for self-message filtering.
         # If the call fails (offline tests, transient 5xx) we fall back to
@@ -1493,7 +1542,9 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     has_token = bool(
-        os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or extra.get("channel_access_token")
+        os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+        or getattr(config, "token", "")
+        or extra.get("channel_access_token")
     )
     has_secret = bool(
         os.getenv("LINE_CHANNEL_SECRET") or extra.get("channel_secret")
@@ -1516,13 +1567,21 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     if not (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") and os.getenv("LINE_CHANNEL_SECRET")):
         return None
     seeded: Dict[str, Any] = {}
-    if os.getenv("LINE_PORT"):
+    port = os.getenv("LINE_PORT") or os.getenv("LINE_WEBHOOK_PORT")
+    if port:
         try:
-            seeded["port"] = int(os.environ["LINE_PORT"])
+            seeded["port"] = int(port)
         except ValueError:
             pass
-    if os.getenv("LINE_HOST"):
-        seeded["host"] = os.environ["LINE_HOST"]
+    host = os.getenv("LINE_HOST") or os.getenv("LINE_WEBHOOK_HOST")
+    if host:
+        seeded["host"] = host
+    if os.getenv("LINE_WEBHOOK_PATH"):
+        seeded["webhook_path"] = os.environ["LINE_WEBHOOK_PATH"]
+    if os.getenv("LINE_API_BASE_URL"):
+        seeded["api_base_url"] = os.environ["LINE_API_BASE_URL"]
+    if os.getenv("LINE_DATA_API_BASE_URL"):
+        seeded["data_api_base_url"] = os.environ["LINE_DATA_API_BASE_URL"]
     if os.getenv("LINE_PUBLIC_URL"):
         seeded["public_url"] = os.environ["LINE_PUBLIC_URL"]
     if os.getenv("LINE_HOME_CHANNEL"):
@@ -1554,6 +1613,7 @@ async def _standalone_send(
     extra = getattr(pconfig, "extra", {}) or {}
     token = (
         os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+        or getattr(pconfig, "token", "")
         or extra.get("channel_access_token", "")
     )
     if not token or not chat_id:
@@ -1567,7 +1627,25 @@ async def _standalone_send(
         messages.append(_text_message(f"[{len(media_files)} attachment(s) generated; not deliverable from cron]"))
         messages = messages[:LINE_MAX_MESSAGES_PER_CALL]
 
-    client = _LineClient(token)
+    api_base_url = (
+        os.getenv("LINE_API_BASE_URL")
+        or extra.get("api_base_url")
+        or DEFAULT_LINE_API_BASE_URL
+    ).rstrip("/")
+    data_api_base_url = (
+        os.getenv("LINE_DATA_API_BASE_URL")
+        or extra.get("data_api_base_url")
+        or (
+            DEFAULT_LINE_DATA_API_BASE_URL
+            if api_base_url == DEFAULT_LINE_API_BASE_URL
+            else api_base_url
+        )
+    ).rstrip("/")
+    client = _LineClient(
+        token,
+        api_base_url=api_base_url,
+        data_api_base_url=data_api_base_url,
+    )
     try:
         await client.push(chat_id, messages)
         return {"success": True, "message_id": None}

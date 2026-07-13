@@ -267,6 +267,26 @@ async def test_auto_registers_plugin_commands_for_discord(adapter):
 
 
 @pytest.mark.asyncio
+async def test_platform_scoped_plugin_command_is_not_registered_for_discord(adapter):
+    """Plugin commands scoped to other platforms stay out of Discord's picker."""
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "pieverse-byok": {
+                "handler": lambda _a: "ok",
+                "description": "Pieverse BYOK",
+                "args_hint": "[key]",
+                "plugin": "pieverse-byok",
+                "platforms": ("telegram", "line", "slack"),
+            }
+        },
+    ):
+        adapter._register_slash_commands()
+
+    assert "pieverse-byok" not in adapter._client.tree.commands
+
+
+@pytest.mark.asyncio
 async def test_auto_registered_plugin_command_without_args_hint(adapter):
     """Plugin commands without args_hint should register as parameterless."""
     adapter._run_simple_slash = AsyncMock()

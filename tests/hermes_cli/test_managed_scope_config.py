@@ -2,6 +2,7 @@
 import textwrap
 
 import pytest
+import yaml
 
 
 @pytest.fixture
@@ -68,6 +69,88 @@ def test_managed_list_wins_wholesale(homes):
     _write(home / "config.yaml", "toolsets:\n  enabled: [a, b, c]\n")
     _write(managed / "config.yaml", "toolsets:\n  enabled: [x]\n")
     assert cfg_get(load_config(), "toolsets", "enabled") == ["x"]
+
+
+def test_managed_plugin_allow_list_is_additive(homes):
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "plugins:\n  enabled: [okx-a2a, local-helper]\n")
+    _write(managed / "config.yaml", "plugins:\n  enabled: [ax, okx-a2a]\n")
+    assert cfg_get(load_config(), "plugins", "enabled") == [
+        "okx-a2a",
+        "local-helper",
+        "ax",
+    ]
+
+
+def test_managed_plugin_disabled_list_is_additive(homes):
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "plugins:\n  disabled: [local-plugin]\n")
+    _write(managed / "config.yaml", "plugins:\n  disabled: [org-plugin, local-plugin]\n")
+    assert cfg_get(load_config(), "plugins", "disabled") == [
+        "local-plugin",
+        "org-plugin",
+    ]
+
+
+def test_managed_skill_disabled_list_is_additive(homes):
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "skills:\n  disabled: [user-skill]\n")
+    _write(managed / "config.yaml", "skills:\n  disabled: [org-skill, user-skill]\n")
+    assert cfg_get(load_config(), "skills", "disabled") == ["user-skill", "org-skill"]
+
+
+def test_managed_plugin_load_paths_replace_user_paths(homes):
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "plugins:\n  load:\n    paths: [/user/plugin]\n")
+    _write(managed / "config.yaml", "plugins:\n  load:\n    paths: [/platform/plugin]\n")
+    assert cfg_get(load_config(), "plugins", "load", "paths") == ["/platform/plugin"]
+
+
+def test_save_config_persists_only_user_entries_for_additive_managed_list(homes):
+    import hermes_cli.config as cfg
+    from hermes_cli.config import load_config, save_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "plugins:\n  enabled: [okx-a2a]\n")
+    _write(managed / "config.yaml", "plugins:\n  enabled: [ax]\n")
+
+    config = load_config()
+    config["plugins"]["enabled"].append("foo")
+    save_config(config)
+
+    raw = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["plugins"]["enabled"] == ["okx-a2a", "foo"]
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert cfg_get(load_config(), "plugins", "enabled") == ["okx-a2a", "foo", "ax"]
+
+
+def test_plugins_enable_save_path_preserves_user_entries_with_managed_plugins(homes):
+    import hermes_cli.config as cfg
+    from hermes_cli.config import load_config, cfg_get
+    from hermes_cli.plugins_cmd import _save_enabled_set
+
+    home, managed = homes
+    _write(home / "config.yaml", "plugins:\n  enabled: [okx-a2a]\n")
+    _write(managed / "config.yaml", "plugins:\n  enabled: [ax]\n")
+
+    _save_enabled_set({"ax", "foo", "okx-a2a"})
+
+    raw = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["plugins"]["enabled"] == ["foo", "okx-a2a"]
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert cfg_get(load_config(), "plugins", "enabled") == ["foo", "okx-a2a", "ax"]
 
 
 def test_editing_managed_file_invalidates_cache(homes):

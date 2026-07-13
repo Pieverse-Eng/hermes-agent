@@ -1830,6 +1830,22 @@ class TestPluginCommands:
         entry = mgr._plugin_commands["metricas"]
         assert entry["args_hint"] == "dias:7 formato:json"
 
+    def test_register_command_with_platform_scope(self):
+        """platforms limits native gateway command menu registration."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        ctx.register_command(
+            "metricas",
+            lambda a: a,
+            description="Metrics dashboard",
+            platforms=("telegram", "line"),
+        )
+
+        entry = mgr._plugin_commands["metricas"]
+        assert entry["platforms"] == ("line", "telegram")
+
     def test_register_command_args_hint_whitespace_trimmed(self):
         """args_hint leading/trailing whitespace is stripped."""
         mgr = PluginManager()

@@ -2148,6 +2148,32 @@ class TestPluginCommandEnumeration:
         mapping = slack_subcommand_map()
         assert mapping.get("metricas") == "/metricas"
 
+    def test_plugin_command_platform_scope_filters_native_menus(self, monkeypatch):
+        """Platform-scoped plugin commands only appear on allowed gateway menus."""
+        from unittest.mock import patch
+
+        self._patch_plugin_commands(monkeypatch, {
+            "metricas": {
+                "handler": lambda _a: "ok",
+                "description": "Metrics",
+                "args_hint": "",
+                "plugin": "metrics-plugin",
+                "platforms": ("telegram", "line"),
+            }
+        })
+
+        telegram_names = {name for name, _desc in telegram_bot_commands()}
+        slack_mapping = slack_subcommand_map()
+        with patch("agent.skill_commands.get_skill_commands", return_value={}):
+            discord_entries, _hidden = discord_skill_commands(
+                max_slots=10,
+                reserved_names=set(),
+            )
+
+        assert "metricas" in telegram_names
+        assert "metricas" not in slack_mapping
+        assert all(name != "metricas" for name, _desc, _key in discord_entries)
+
     def test_plugin_command_does_not_shadow_builtin_in_slack(self, monkeypatch):
         """If a plugin registers a name that collides with a built-in, the built-in mapping wins."""
         self._patch_plugin_commands(monkeypatch, {
@@ -2190,6 +2216,22 @@ class TestPluginCommandEnumeration:
         })
         assert is_gateway_known_command("metricas") is True
         assert is_gateway_known_command("definitely-not-registered") is False
+
+    def test_should_bypass_active_session_recognizes_plugin_commands(self, monkeypatch):
+        """Plugin slash commands must bypass the adapter active-session queue."""
+        from hermes_cli.commands import should_bypass_active_session
+
+        self._patch_plugin_commands(monkeypatch, {
+            "my-plugin-cmd": {
+                "handler": lambda _a: "ok",
+                "description": "Plugin command",
+                "args_hint": "",
+                "plugin": "p",
+            }
+        })
+
+        assert should_bypass_active_session("my-plugin-cmd") is True
+        assert should_bypass_active_session("my_plugin_cmd") is True
 
     def test_is_gateway_known_command_still_recognizes_builtins(self, monkeypatch):
         """Built-in commands must remain known even when plugin discovery fails."""

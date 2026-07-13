@@ -50,6 +50,16 @@ def test_overlay_preserves_user_siblings(managed):
     assert out["display"]["show_reasoning"] is True
 
 
+def test_overlay_adds_managed_plugin_entries_without_dropping_user_entries(managed):
+    from hermes_cli import managed_scope
+
+    _write(managed, "plugins:\n  enabled: [ax, okx-a2a]\n")
+    out = managed_scope.apply_managed_overlay(
+        {"plugins": {"enabled": ["okx-a2a", "local-helper"]}}
+    )
+    assert out["plugins"]["enabled"] == ["okx-a2a", "local-helper", "ax"]
+
+
 def test_overlay_normalizes_root_model_string(managed):
     """A managed bare `model: x/y` must promote to model.default, not clobber the dict."""
     from hermes_cli import managed_scope

@@ -4299,14 +4299,15 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("Discord auto-register from COMMAND_REGISTRY failed: %s", e)
 
         # ── Plugin-registered slash commands ──
-        # Plugins register via PluginContext.register_command(); we mirror
-        # those into Discord's native slash picker so users get the same
-        # autocomplete UX as for built-in commands. No per-platform plugin
-        # API needed — plugin commands are platform-agnostic.
+        # Plugins register via PluginContext.register_command(); unless scoped
+        # to other platforms, we mirror them into Discord's native slash picker
+        # so users get the same autocomplete UX as for built-in commands.
         try:
             from hermes_cli.commands import _iter_plugin_command_entries
 
-            for plugin_name, plugin_desc, plugin_args_hint in _iter_plugin_command_entries():
+            for plugin_name, plugin_desc, plugin_args_hint in _iter_plugin_command_entries(
+                platform="discord"
+            ):
                 discord_name = plugin_name.lower()[:32]
                 if discord_name in already_registered:
                     continue
