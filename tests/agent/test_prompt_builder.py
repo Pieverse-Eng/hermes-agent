@@ -391,13 +391,8 @@ class TestPromptBuilderImports:
 
 class TestBuildSkillsSystemPrompt:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self, monkeypatch):
+    def _clear_skills_cache(self):
         """Ensure the in-process skills prompt cache doesn't leak between tests."""
-        monkeypatch.setitem(
-            build_skills_system_prompt.__globals__,
-            "_skill_security_allows_prompt_include",
-            lambda _skill_dir: True,
-        )
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
@@ -419,39 +414,6 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
-
-    def test_symlinked_skill_invalidates_in_process_cache(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        base_skill = tmp_path / "skills" / "base"
-        base_skill.mkdir(parents=True)
-        (base_skill / "SKILL.md").write_text(
-            "---\nname: base-skill\ndescription: Base skill\n---\n",
-            encoding="utf-8",
-        )
-
-        first = build_skills_system_prompt()
-        assert "base-skill" in first
-        assert "langgraph-multi-agent" not in first
-
-        real_skill = tmp_path / "home" / ".agents" / "skills" / "langgraph-multi-agent"
-        real_skill.mkdir(parents=True)
-        (real_skill / "SKILL.md").write_text(
-            "---\n"
-            "name: langgraph-multi-agent\n"
-            "description: External symlinked skill\n"
-            "---\n",
-            encoding="utf-8",
-        )
-        link = tmp_path / "skills" / "langgraph-multi-agent"
-        try:
-            link.symlink_to(real_skill, target_is_directory=True)
-        except OSError as exc:
-            pytest.skip(f"symlinks unavailable in test environment: {exc}")
-
-        second = build_skills_system_prompt()
-        assert "base-skill" in second
-        assert "langgraph-multi-agent" in second
-        assert "External symlinked skill" in second
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -662,89 +624,6 @@ class TestBuildSkillsSystemPrompt:
 
         result = build_skills_system_prompt()
         assert "backend-skill" in result
-
-
-class TestBuildSkillsSystemPromptSecurityGate:
-    @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
-        from agent.prompt_builder import clear_skills_system_prompt_cache
-        clear_skills_system_prompt_cache(clear_snapshot=True)
-        yield
-        clear_skills_system_prompt_cache(clear_snapshot=True)
-
-    def test_blocks_skill_from_cold_scan_when_gate_denies(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        skill_dir = tmp_path / "skills" / "security" / "blocked-skill"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: blocked-skill\ndescription: Should not load\n---\n"
-        )
-        monkeypatch.setitem(
-            build_skills_system_prompt.__globals__,
-            "_skill_security_allows_prompt_include",
-            lambda _skill_dir: False,
-        )
-
-        result = build_skills_system_prompt()
-
-        assert result == ""
-
-    def test_snapshot_path_still_checks_gate(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        skill_dir = tmp_path / "skills" / "security" / "snapshot-skill"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: snapshot-skill\ndescription: Snapshot entry\n---\n"
-        )
-        monkeypatch.setitem(
-            build_skills_system_prompt.__globals__,
-            "_skill_security_allows_prompt_include",
-            lambda _skill_dir: True,
-        )
-        first = build_skills_system_prompt()
-        assert "snapshot-skill" in first
-
-        from agent.prompt_builder import clear_skills_system_prompt_cache
-        clear_skills_system_prompt_cache(clear_snapshot=False)
-        monkeypatch.setitem(
-            build_skills_system_prompt.__globals__,
-            "_skill_security_allows_prompt_include",
-            lambda _skill_dir: False,
-        )
-
-        second = build_skills_system_prompt()
-
-        assert second == ""
-
-    def test_skill_tree_change_misses_in_process_cache(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        skill_dir = tmp_path / "skills" / "security" / "mutable-skill"
-        refs_dir = skill_dir / "references"
-        refs_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: mutable-skill\ndescription: Mutable\n---\n"
-        )
-        calls = []
-
-        def _allow(skill_dir):
-            calls.append(str(skill_dir))
-            return True
-
-        monkeypatch.setitem(
-            build_skills_system_prompt.__globals__,
-            "_skill_security_allows_prompt_include",
-            _allow,
-        )
-
-        first = build_skills_system_prompt()
-        assert "mutable-skill" in first
-        assert len(calls) == 1
-
-        (refs_dir / "api.md").write_text("changed supporting content\n")
-        second = build_skills_system_prompt()
-
-        assert "mutable-skill" in second
-        assert len(calls) == 2
 
 
 class TestBuildNousSubscriptionPrompt:
@@ -1049,6 +928,43 @@ class TestFindHermesMd:
         (repo / ".git").mkdir()
         assert _find_hermes_md(repo) is None
 
+    def test_no_git_root_checks_cwd_only(self, tmp_path):
+        """Outside a git repo, only cwd is checked — parents are NOT walked.
+
+        Walking parents with no git root to stop the loop would climb all
+        the way to / and pick up a .hermes.md planted in /tmp, /home, or /
+        on a shared system — a cross-user prompt-injection vector.
+        """
+        from unittest.mock import patch
+
+        parent = tmp_path / "parent"
+        parent.mkdir()
+        (parent / ".hermes.md").write_text("planted by another user")
+        cwd = parent / "work"
+        cwd.mkdir()
+        # No git root anywhere up the tree.
+        with patch("agent.prompt_builder._find_git_root", return_value=None):
+            assert _find_hermes_md(cwd) is None
+
+    def test_no_git_root_finds_in_cwd(self, tmp_path):
+        """Outside a git repo, a .hermes.md in cwd itself is still found."""
+        from unittest.mock import patch
+
+        (tmp_path / ".hermes.md").write_text("local rules")
+        with patch("agent.prompt_builder._find_git_root", return_value=None):
+            assert _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"
+
+    def test_walks_parents_inside_git_repo(self, tmp_path):
+        """Inside a git repo, parent walk up to the git root still works."""
+        from unittest.mock import patch
+
+        (tmp_path / ".hermes.md").write_text("repo root rules")
+        sub = tmp_path / "a" / "b"
+        sub.mkdir(parents=True)
+        # Simulate cwd being inside a repo rooted at tmp_path.
+        with patch("agent.prompt_builder._find_git_root", return_value=tmp_path):
+            assert _find_hermes_md(sub) == tmp_path / ".hermes.md"
+
 
 class TestFindGitRoot:
     def test_finds_git_dir(self, tmp_path):
@@ -1108,12 +1024,20 @@ class TestPromptBuilderConstants:
         assert "whatsapp" in PLATFORM_HINTS
         assert "whatsapp_cloud" in PLATFORM_HINTS
         assert "telegram" in PLATFORM_HINTS
-        assert "line" in PLATFORM_HINTS
         assert "discord" in PLATFORM_HINTS
         assert "cron" in PLATFORM_HINTS
         assert "cli" in PLATFORM_HINTS
+        assert "tui" in PLATFORM_HINTS
         assert "api_server" in PLATFORM_HINTS
         assert "webui" in PLATFORM_HINTS
+
+    def test_cli_and_tui_hints_flag_local_only_cron(self):
+        """#51568 — cron jobs from CLI/TUI sessions don't deliver back into
+        the session, so the agent must be told up front not to promise it."""
+        for key in ("cli", "tui"):
+            hint = PLATFORM_HINTS[key]
+            assert "LOCAL-ONLY" in hint
+            assert "deliver" in hint
 
     def test_whatsapp_cloud_hint_mentions_24h_window(self):
         """The Cloud API's 24-hour conversation window is a hard rule the
@@ -1130,6 +1054,19 @@ class TestPromptBuilderConstants:
         Baileys for outbound attachments."""
         hint = PLATFORM_HINTS["whatsapp_cloud"]
         assert "MEDIA:" in hint
+
+    def test_markdown_converting_platform_hints_do_not_forbid_markdown(self):
+        """#12224 — WhatsApp (Baileys) and Signal adapters actively convert
+        markdown to native formatting (gateway/platforms/whatsapp_common.py
+        format_message + signal_format.markdown_to_signal: bold, italic,
+        strikethrough, headers, bullets). Their hints previously told the
+        agent "do not use markdown", which made it strip bullets/bold the
+        adapter would have rendered. The hint must affirm markdown, not
+        forbid it."""
+        for key in ("whatsapp", "signal"):
+            hint = PLATFORM_HINTS[key]
+            assert "do not use markdown" not in hint.lower()
+            assert "markdown" in hint.lower()
 
     def test_cli_hint_does_not_suggest_media_tags(self):
         # Regression: MEDIA:/path tags are intercepted only by messaging
@@ -1319,6 +1256,46 @@ class TestEnvironmentHints:
         assert "Linux 6.8.0" in result
         assert "/workspace" in result
 
+    def test_probe_remote_backend_imports_real_factory(self, monkeypatch):
+        """Regression for #53667: the probe imported a nonexistent
+        ``get_environment`` from ``tools.environments`` and always died with
+        ``ImportError: cannot import name 'get_environment'`` (cosmetic — it
+        only dropped the live backend description to a static fallback). The
+        real factory is ``_create_environment`` in ``tools.terminal_tool``;
+        the probe must import and call THAT, returning a parsed line instead
+        of None."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": (
+                        "os=Linux\nkernel=6.8.0\nhome=/root\n"
+                        "cwd=/workspace\nuser=root\n"
+                    ),
+                }
+
+        created = {}
+
+        def _fake_create_environment(*, env_type, **kwargs):
+            created["env_type"] = env_type
+            return _FakeEnv()
+
+        # Patch the REAL factory in tools.terminal_tool — the probe imports it
+        # locally, so the import itself must succeed (the bug was here).
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
+
+        line = _pb._probe_remote_backend("docker")
+        assert created.get("env_type") == "docker"
+        assert line is not None
+        assert "Linux 6.8.0" in line
+        assert "root" in line
+
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
         import agent.prompt_builder as _pb
@@ -1439,12 +1416,7 @@ class TestSkillShouldShow:
 
 class TestBuildSkillsSystemPromptConditional:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self, monkeypatch):
-        monkeypatch.setitem(
-            build_skills_system_prompt.__globals__,
-            "_skill_security_allows_prompt_include",
-            lambda _skill_dir: True,
-        )
+    def _clear_skills_cache(self):
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
@@ -1672,3 +1644,5 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
+
+

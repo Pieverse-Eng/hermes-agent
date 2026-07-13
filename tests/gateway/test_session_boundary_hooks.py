@@ -110,55 +110,6 @@ async def test_reset_fires_reset_hook(mock_invoke_hook):
 
 
 @pytest.mark.asyncio
-async def test_reset_surfaces_skill_security_scan_report(monkeypatch):
-    """/new preloads skills and includes CertiK scan results in the reset reply."""
-    runner = _make_runner()
-    runner._skill_security_scan_on_session_refresh = True
-
-    seen_context = []
-    cleared_tokens = []
-
-    def _set_session_env(context):
-        seen_context.append(context)
-        return ["token"]
-
-    async def _run_in_executor_with_context(func, *args):
-        return func(*args)
-
-    runner._set_session_env = _set_session_env
-    runner._clear_session_env = lambda tokens: cleared_tokens.append(tokens)
-    runner._run_in_executor_with_context = _run_in_executor_with_context
-
-    build_calls = []
-    monkeypatch.setattr(
-        "agent.prompt_builder.build_skills_system_prompt",
-        lambda: build_calls.append(True) or "<available_skills>",
-    )
-    drain_results = iter([[], ["scan-report"]])
-    monkeypatch.setattr(
-        "tools.skill_security_gate.drain_skill_security_scan_reports",
-        lambda: next(drain_results),
-    )
-    monkeypatch.setattr(
-        "tools.skill_security_gate.format_skill_security_scan_report",
-        lambda reports: (
-            "🐾 Found 1 new or updated skill.\n"
-            "🛡️ CertiK scanned it: 1 passed, 0 did not pass."
-            if reports
-            else ""
-        ),
-    )
-
-    result = await runner._handle_reset_command(_make_event("/new"))
-
-    assert build_calls == [True]
-    assert seen_context and seen_context[0].session_id == "sess-new"
-    assert cleared_tokens == [["token"]]
-    assert "🐾 Found 1 new or updated skill." in str(result)
-    assert "🛡️ CertiK scanned it" in str(result)
-
-
-@pytest.mark.asyncio
 @patch("hermes_cli.plugins.invoke_hook")
 async def test_finalize_before_reset(mock_invoke_hook):
     """on_session_finalize must fire before on_session_reset."""
@@ -301,4 +252,82 @@ async def test_idle_expiry_fires_finalize_hook(mock_invoke_hook):
     assert "sess-expired" in session_ids, (
         f"on_session_finalize was not fired during idle expiry; "
         f"got session_ids={session_ids} (regression of #14981)"
+    )
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_idle_expiry_clears_last_resolved_model(mock_invoke_hook):
+    """Regression test for #58403.
+
+    ``_session_expiry_watcher`` permanently finalizes an expired session and
+    already drops ``_session_model_overrides`` / the reasoning override /
+    ``_pending_model_notes`` — a resumed conversation must not inherit stale
+    per-session state. It missed ``_last_resolved_model``: without clearing
+    it, a resumed session could serve a cached model from before it went
+    idle on a transient config-cache miss, exactly the #58403 class the
+    /new and compression-exhausted-reset paths already guard against.
+    """
+    from datetime import datetime, timedelta
+
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._running_agents = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._last_session_store_prune_ts = 0.0
+
+    session_key = "agent:main:telegram:dm:42"
+    expired_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-expired",
+        created_at=datetime.now() - timedelta(hours=2),
+        updated_at=datetime.now() - timedelta(hours=2),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    expired_entry.expiry_finalized = False
+
+    runner.session_store = MagicMock()
+    runner.session_store._ensure_loaded = MagicMock()
+    runner.session_store._entries = {session_key: expired_entry}
+    runner.session_store._is_session_expired = MagicMock(return_value=True)
+    runner.session_store._lock = MagicMock()
+    runner.session_store._lock.__enter__ = MagicMock(return_value=None)
+    runner.session_store._lock.__exit__ = MagicMock(return_value=None)
+    runner.session_store._save = MagicMock()
+
+    runner._evict_cached_agent = MagicMock()
+    runner._cleanup_agent_resources = MagicMock()
+    runner._sweep_idle_cached_agents = MagicMock(return_value=0)
+    runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
+    runner._last_resolved_model = {
+        session_key: "gpt-5",
+        "agent:main:telegram:dm:other": "keep-me",
+    }
+
+    _orig_sleep = __import__("asyncio").sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    def _hook_and_stop(*a, **kw):
+        runner._running = False
+        return None
+
+    mock_invoke_hook.side_effect = _hook_and_stop
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await runner._session_expiry_watcher(interval=0)
+
+    assert session_key not in runner._last_resolved_model, (
+        "session-expiry finalization did not clear the expired session's "
+        "_last_resolved_model entry (#58403)"
+    )
+    assert runner._last_resolved_model["agent:main:telegram:dm:other"] == "keep-me", (
+        "session-expiry finalization must only clear the expired session's "
+        "own key, not unrelated sessions' cached entries"
     )

@@ -108,23 +108,6 @@ def test_returns_empty_when_config_missing(tmp_path, monkeypatch):
     assert get_external_skills_dirs() == []
 
 
-def test_cache_observes_default_agents_dir_created_later(tmp_path, monkeypatch):
-    """A mid-session cross-agent install creates .agents/skills after cache prime."""
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    (home / "config.yaml").write_text("skills:\n  external_dirs: []\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    _external_dirs_cache_clear()
-
-    assert get_external_skills_dirs() == []
-
-    agents_skills = home / ".agents" / "skills"
-    agents_skills.mkdir(parents=True)
-
-    assert get_external_skills_dirs() == [agents_skills.resolve()]
-
-
 def test_returned_list_is_a_copy(hermes_home_with_config):
     """Callers can't poison the cache by mutating the returned list."""
     first = get_external_skills_dirs()

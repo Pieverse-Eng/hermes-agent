@@ -36,15 +36,6 @@ class TestGetExternalSkillsDirs:
             result = get_external_skills_dirs()
         assert result == []
 
-    def test_default_agents_skills_dir_returned(self, hermes_home):
-        agents_skills = hermes_home / ".agents" / "skills"
-        agents_skills.mkdir(parents=True)
-        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
-        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
-            from agent.skill_utils import get_external_skills_dirs
-            result = get_external_skills_dirs()
-        assert result == [agents_skills.resolve()]
-
     def test_nonexistent_dir_skipped(self, hermes_home):
         (hermes_home / "config.yaml").write_text(
             "skills:\n  external_dirs:\n    - /nonexistent/path\n"
@@ -127,51 +118,6 @@ class TestExternalSkillsInFindAll:
         names = [s["name"] for s in skills]
         assert "my-external-skill" in names
 
-    def test_default_agents_skills_found(self, hermes_home):
-        agents_skill = hermes_home / ".agents" / "skills" / "agent-installed-skill"
-        agents_skill.mkdir(parents=True)
-        (agents_skill / "SKILL.md").write_text(
-            "---\n"
-            "name: agent-installed-skill\n"
-            "description: Installed by a cross-agent installer\n"
-            "---\n\n"
-            "# Agent Installed Skill\n",
-            encoding="utf-8",
-        )
-        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
-        local_skills = hermes_home / "skills"
-        with (
-            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
-            patch("tools.skills_tool.SKILLS_DIR", local_skills),
-        ):
-            from tools.skills_tool import _find_all_skills
-            skills = _find_all_skills()
-        names = [s["name"] for s in skills]
-        assert "agent-installed-skill" in names
-
-    def test_skills_list_reads_default_agents_when_local_missing(self, hermes_home):
-        agents_skill = hermes_home / ".agents" / "skills" / "agent-installed-skill"
-        agents_skill.mkdir(parents=True)
-        (agents_skill / "SKILL.md").write_text(
-            "---\n"
-            "name: agent-installed-skill\n"
-            "description: Installed by a cross-agent installer\n"
-            "---\n\n"
-            "# Agent Installed Skill\n",
-            encoding="utf-8",
-        )
-        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
-        local_skills = hermes_home / "skills"
-        local_skills.rmdir()
-        with (
-            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
-            patch("tools.skills_tool.SKILLS_DIR", local_skills),
-        ):
-            from tools.skills_tool import skills_list
-            result = json.loads(skills_list())
-        names = [s["name"] for s in result["skills"]]
-        assert "agent-installed-skill" in names
-
     def test_local_takes_precedence(self, hermes_home, external_skills_dir):
         """If the same skill name exists locally and externally, local wins."""
         local_skills = hermes_home / "skills"
@@ -208,26 +154,3 @@ class TestExternalSkillView:
             result = json.loads(skill_view("my-external-skill"))
         assert result["success"] is True
         assert "external things" in result["content"]
-
-    def test_skill_view_finds_default_agents_skill(self, hermes_home):
-        agents_skill = hermes_home / ".agents" / "skills" / "agent-installed-skill"
-        agents_skill.mkdir(parents=True)
-        (agents_skill / "SKILL.md").write_text(
-            "---\n"
-            "name: agent-installed-skill\n"
-            "description: Installed by a cross-agent installer\n"
-            "---\n\n"
-            "# Agent Installed Skill\n\n"
-            "Do agent-installed things.\n",
-            encoding="utf-8",
-        )
-        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
-        local_skills = hermes_home / "skills"
-        with (
-            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
-            patch("tools.skills_tool.SKILLS_DIR", local_skills),
-        ):
-            from tools.skills_tool import skill_view
-            result = json.loads(skill_view("agent-installed-skill"))
-        assert result["success"] is True
-        assert "agent-installed things" in result["content"]

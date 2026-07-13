@@ -84,6 +84,18 @@ def test_managed_plugin_allow_list_is_additive(homes):
     ]
 
 
+def test_managed_plugin_disabled_list_is_additive(homes):
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "plugins:\n  disabled: [local-plugin]\n")
+    _write(managed / "config.yaml", "plugins:\n  disabled: [org-plugin, local-plugin]\n")
+    assert cfg_get(load_config(), "plugins", "disabled") == [
+        "local-plugin",
+        "org-plugin",
+    ]
+
+
 def test_managed_skill_disabled_list_is_additive(homes):
     from hermes_cli.config import load_config, cfg_get
 

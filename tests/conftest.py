@@ -402,27 +402,6 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
-@pytest.fixture(autouse=True)
-def _allow_skill_view_security_gate_by_default(_hermetic_environment, monkeypatch):
-    """Keep legacy skill_view tests focused unless they opt into gate behavior."""
-    try:
-        from types import SimpleNamespace
-
-        import tools.skills_tool as _skills_tool
-
-        monkeypatch.setattr(
-            _skills_tool,
-            "_skill_security_allows_view",
-            lambda _skill_dir, _name, **kwargs: SimpleNamespace(
-                allowed=True,
-                reason="",
-                archive=kwargs.get("archive"),
-            ),
-        )
-    except Exception:
-        pass
-
-
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``
@@ -637,6 +616,13 @@ def _live_system_guard(request, monkeypatch):
     real_kill = _os.kill
 
     def _guarded_kill(pid, sig, *args, **kwargs):
+        # Signal 0 is a pure liveness probe — it cannot terminate anything.
+        # psutil.pid_exists() uses os.kill(pid, 0) on POSIX, and probing a
+        # just-killed grandchild that was reparented to init (zombie with a
+        # foreign parent chain) must not trip the guard. Flaked in CI on
+        # test_entire_tree_is_sigkilled_not_just_parent.
+        if int(sig) == 0:
+            return real_kill(pid, sig, *args, **kwargs)
         if _is_own_subtree(int(pid)):
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
@@ -662,6 +648,9 @@ def _live_system_guard(request, monkeypatch):
         own_pgid = _os.getpgrp()
 
         def _guarded_killpg(pgid, sig, *args, **kwargs):
+            # Signal 0 is a pure liveness probe — never destructive.
+            if int(sig) == 0:
+                return real_killpg(pgid, sig, *args, **kwargs)
             if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(

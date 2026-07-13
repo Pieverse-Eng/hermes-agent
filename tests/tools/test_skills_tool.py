@@ -3,7 +3,6 @@
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -373,126 +372,6 @@ class TestSkillView:
         assert result["success"] is True
         assert result["name"] == "my-skill"
         assert "Step 1" in result["content"]
-
-    def test_security_gate_blocks_skill_content(self, monkeypatch, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            skill_dir = _make_skill(
-                tmp_path,
-                "blocked-skill",
-                body="SECRET INSTRUCTIONS SHOULD NOT LOAD",
-            )
-
-            def _deny(seen_dir, seen_name, **_kwargs):
-                assert seen_dir == skill_dir
-                assert seen_name == "blocked-skill"
-                return SimpleNamespace(
-                    allowed=False,
-                    reason="high severity finding",
-                    archive=None,
-                )
-
-            monkeypatch.setattr(
-                skills_tool_module,
-                "_skill_security_allows_view",
-                _deny,
-            )
-            raw = skill_view("blocked-skill")
-
-        result = json.loads(raw)
-        serialized = json.dumps(result)
-        assert result["success"] is False
-        assert result["security_provider"] == "certik"
-        assert "high severity finding" in result["error"]
-        assert "SECRET INSTRUCTIONS" not in serialized
-
-    def test_security_gate_blocks_linked_file_content(self, monkeypatch, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            skill_dir = _make_skill(tmp_path, "blocked-skill")
-            refs_dir = skill_dir / "references"
-            refs_dir.mkdir()
-            (refs_dir / "secret.md").write_text("LINKED SECRET SHOULD NOT LOAD")
-            monkeypatch.setattr(
-                skills_tool_module,
-                "_skill_security_allows_view",
-                lambda _skill_dir, _name, **_kwargs: SimpleNamespace(
-                    allowed=False,
-                    reason="scan unavailable",
-                    archive=None,
-                ),
-            )
-
-            raw = skill_view("blocked-skill", file_path="references/secret.md")
-
-        result = json.loads(raw)
-        serialized = json.dumps(result)
-        assert result["success"] is False
-        assert "scan unavailable" in result["error"]
-        assert "LINKED SECRET" not in serialized
-
-    def test_security_allowed_view_uses_verified_snapshot(self, monkeypatch, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            skill_dir = _make_skill(tmp_path, "snapshot-skill", body="SAFE SNAPSHOT")
-
-            def _allow_and_mutate(_skill_dir, _name, **kwargs):
-                archive = kwargs["archive"]
-                (skill_dir / "SKILL.md").write_text(
-                    "---\n"
-                    "name: snapshot-skill\n"
-                    "description: Description for snapshot-skill.\n"
-                    "---\n\n"
-                    "UNVERIFIED DISK CONTENT\n",
-                    encoding="utf-8",
-                )
-                return SimpleNamespace(
-                    allowed=True,
-                    reason="clean",
-                    archive=archive,
-                )
-
-            monkeypatch.setattr(
-                skills_tool_module,
-                "_skill_security_allows_view",
-                _allow_and_mutate,
-            )
-            raw = skill_view("snapshot-skill")
-
-        result = json.loads(raw)
-        assert result["success"] is True
-        assert "SAFE SNAPSHOT" in result["content"]
-        assert "UNVERIFIED DISK CONTENT" not in result["content"]
-
-    def test_security_allowed_linked_file_uses_verified_snapshot(
-        self,
-        monkeypatch,
-        tmp_path,
-    ):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            skill_dir = _make_skill(tmp_path, "snapshot-skill")
-            refs_dir = skill_dir / "references"
-            refs_dir.mkdir()
-            linked_file = refs_dir / "api.md"
-            linked_file.write_text("SAFE LINKED SNAPSHOT", encoding="utf-8")
-
-            def _allow_and_mutate(_skill_dir, _name, **kwargs):
-                archive = kwargs["archive"]
-                linked_file.write_text("UNVERIFIED LINKED DISK CONTENT", encoding="utf-8")
-                return SimpleNamespace(
-                    allowed=True,
-                    reason="clean",
-                    archive=archive,
-                )
-
-            monkeypatch.setattr(
-                skills_tool_module,
-                "_skill_security_allows_view",
-                _allow_and_mutate,
-            )
-            raw = skill_view("snapshot-skill", file_path="references/api.md")
-
-        result = json.loads(raw)
-        assert result["success"] is True
-        assert "SAFE LINKED SNAPSHOT" in result["content"]
-        assert "UNVERIFIED LINKED DISK CONTENT" not in result["content"]
 
     def test_view_skill_by_frontmatter_name_when_dir_differs(self, tmp_path):
         # The on-disk directory ("alias-dir") differs from the skill's
@@ -1145,16 +1024,25 @@ class TestSkillViewPrerequisites:
         assert result["missing_required_environment_variables"] == []
         assert "setup_note" not in result
 
-    def test_skill_view_surfaces_skill_read_errors(self, tmp_path):
+    def test_skill_view_surfaces_skill_read_errors(self, tmp_path, monkeypatch):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "broken-skill")
             skill_md = tmp_path / "broken-skill" / "SKILL.md"
-            skill_md.write_bytes(b"\xff")
+            original_read_text = Path.read_text
+
+            def fake_read_text(path_obj, *args, **kwargs):
+                if path_obj == skill_md:
+                    raise UnicodeDecodeError(
+                        "utf-8", b"\xff", 0, 1, "invalid start byte"
+                    )
+                return original_read_text(path_obj, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "read_text", fake_read_text)
             raw = skill_view("broken-skill")
 
         result = json.loads(raw)
         assert result["success"] is False
-        assert "stable skill snapshot" in result["error"]
+        assert "Failed to read skill 'broken-skill'" in result["error"]
 
     def test_legacy_flat_md_skill_preserves_frontmatter_metadata(self, tmp_path):
         flat_skill = tmp_path / "legacy-skill.md"

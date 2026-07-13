@@ -35,7 +35,6 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -73,10 +72,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SIDECAR_PORT = 8789
 _DEFAULT_SIDECAR_BIND = "127.0.0.1"
-_DEFAULT_SIDECAR_READY_TIMEOUT_SECONDS = 60.0
-_SIDECAR_STREAM_FAILURE_MIN_EVENTS = 3
-_SIDECAR_STREAM_FAILURE_RESTART_SECONDS = 90.0
-_SIDECAR_STREAM_FAILURE_RESET_SECONDS = 10 * 60.0
 
 # Photon iMessage messages from the SDK side have no documented hard
 # limit, but the underlying iMessage protocol limits practical message
@@ -89,6 +84,30 @@ _DEDUP_MAX_SIZE = 4000
 _DEDUP_WINDOW_SECONDS = 48 * 3600
 
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
+
+# Cap on a self-heal `npm ci`/`npm install` of the sidecar deps. A cold
+# install of the pinned spectrum-ts tree normally takes well under a minute;
+# a wedged npm (dead registry, network blackhole) must not stall the photon
+# connect path indefinitely.
+_NPM_REINSTALL_TIMEOUT = 600
+
+# Photon / Envoy / spectrum-ts error substrings that indicate a transient
+# upstream overload rather than a permanent failure.  These are not in the
+# core _RETRYABLE_ERROR_PATTERNS because they are specific to this adapter.
+_PHOTON_RETRYABLE_PATTERNS = (
+    "internal sidecar error",
+    "upstream connect error",
+    "upstream unavailable",
+    "connection dropped",
+    "reset reason: overflow",
+    "upstream_overflow",
+    "upstream_unavailable",
+)
+
+# Minimum seconds between typing-indicator calls for the same chat.
+# iMessage is a personal channel — suppressing rapid repeats reduces
+# upstream gRPC pressure during Photon overflow events.
+_TYPING_COOLDOWN_SECONDS = 5.0
 
 # Group-chat mention wake words. When ``require_mention`` is enabled, group
 # messages are ignored unless they match one of these patterns — same
@@ -110,41 +129,6 @@ def _coerce_port(value: Any, default: int) -> int:
         return default
 
 
-def _coerce_positive_float(value: Any, default: float) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _sidecar_ready_timeout_seconds() -> float:
-    return _coerce_positive_float(
-        os.getenv("PHOTON_SIDECAR_READY_TIMEOUT_SECONDS")
-        or os.getenv("PHOTON_SIDECAR_READY_TIMEOUT"),
-        _DEFAULT_SIDECAR_READY_TIMEOUT_SECONDS,
-    )
-
-
-def _is_sidecar_stream_failure_line(line: str) -> bool:
-    """Detect spectrum-ts log lines that mean the gRPC event stream is stuck."""
-    text = line.lower()
-    if "spectrum.stream" in text and "stream persistently failing" in text:
-        return True
-    if "catchupevents" in text and (
-        "connection dropped" in text or "unknown server error" in text
-    ):
-        return True
-    return False
-
-
-def _is_sidecar_stream_recovered_line(line: str) -> bool:
-    text = line.lower()
-    return (
-        "spectrum.lifecycle" in text and "spectrum started" in text
-    ) or "photon-sidecar: listening" in text
-
-
 def check_requirements() -> bool:
     """Return True when both Python deps and the Node sidecar are available."""
     if not HTTPX_AVAILABLE:
@@ -157,6 +141,77 @@ def check_requirements() -> bool:
         # surfaces the missing-deps state in `hermes setup` / status.
         return False
     return True
+
+
+def _sidecar_deps_stale() -> bool:
+    """True when node_modules exists but is older than the committed lockfile.
+
+    `hermes update` rewrites ``package-lock.json`` when the spectrum-ts pin is
+    bumped, but does not reinstall ``node_modules``. npm records the state of
+    the last install in ``node_modules/.package-lock.json``; when the top-level
+    lockfile is newer than that marker, the install is out of date. This is the
+    same signal ``npm ci`` uses. Returns False (do nothing) if either file is
+    missing or unreadable, so a first-run or odd filesystem never blocks start.
+    """
+    lockfile = _SIDECAR_DIR / "package-lock.json"
+    marker = _SIDECAR_DIR / "node_modules" / ".package-lock.json"
+    try:
+        return lockfile.stat().st_mtime > marker.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _reinstall_sidecar_deps() -> None:
+    """Reinstall the sidecar's node_modules from the lockfile (blocking).
+
+    Mirrors ``hermes photon install-sidecar``: ``npm ci`` for an exact,
+    reproducible install, falling back to ``npm install`` if the lockfile is
+    missing or drifted. Runs the postinstall patch as part of the install.
+    Best-effort — a failure here just leaves the (stale) deps in place and the
+    normal ``_start_sidecar`` readiness check reports the real error.
+    """
+    npm = shutil.which("npm")
+    if not npm:
+        logger.warning("[photon] cannot reinstall stale sidecar deps: npm not on PATH")
+        return
+    try:
+        result = subprocess.run(  # noqa: S603
+            [npm, "ci"],
+            cwd=str(_SIDECAR_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_NPM_REINSTALL_TIMEOUT,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "[photon] sidecar `npm ci` failed; falling back to `npm install`"
+            )
+            result = subprocess.run(  # noqa: S603
+                [npm, "install"],
+                cwd=str(_SIDECAR_DIR),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_NPM_REINSTALL_TIMEOUT,
+            )
+    except subprocess.TimeoutExpired:
+        # A wedged npm (dead registry, network blackhole) must not stall the
+        # photon connect forever — give up, leave the stale deps in place, and
+        # let the readiness check report the real error. Retried on the next
+        # reconnect tick.
+        logger.error(
+            "[photon] sidecar dependency reinstall timed out after %ss",
+            _NPM_REINSTALL_TIMEOUT,
+        )
+        return
+    if result.returncode != 0:
+        logger.error(
+            "[photon] sidecar dependency reinstall failed: %s",
+            (result.stderr or result.stdout or "").strip(),
+        )
+    else:
+        logger.info("[photon] sidecar dependencies reinstalled from lockfile")
 
 
 def validate_config(cfg: PlatformConfig) -> bool:
@@ -260,14 +315,11 @@ class PhotonAdapter(BasePlatformAdapter):
         # Runtime state
         self._sidecar_proc: Optional[subprocess.Popen] = None
         self._sidecar_supervisor_task: Optional[asyncio.Task] = None
-        self._sidecar_restart_task: Optional[asyncio.Task] = None
-        self._sidecar_restart_lock = asyncio.Lock()
-        self._sidecar_stream_failure_first_seen: Optional[float] = None
-        self._sidecar_stream_failure_count = 0
-        self._sidecar_stream_failure_triggered = False
         self._inbound_task: Optional[asyncio.Task] = None
+        self._sidecar_health_task: Optional[asyncio.Task] = None
         self._inbound_running = False
         self._http_client: Optional["httpx.AsyncClient"] = None
+        self._sidecar_health_interval = 15.0
         # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
         # may see the same messageId more than once (e.g. after a reconnect).
         self._seen_messages: Dict[str, float] = {}
@@ -279,6 +331,8 @@ class PhotonAdapter(BasePlatformAdapter):
         # react action default to "the message that triggered me" without
         # requiring the model to thread message ids through tool calls.
         self._last_inbound_by_chat: Dict[str, str] = {}
+        # Last time we sent a typing indicator per chat, for cooldown gating.
+        self._typing_last_sent: Dict[str, float] = {}
 
         # Group-chat mention gating (parity with BlueBubbles). When enabled,
         # group messages are ignored unless they match a wake word; DMs are
@@ -357,7 +411,7 @@ class PhotonAdapter(BasePlatformAdapter):
 
     # -- Connection lifecycle ---------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not HTTPX_AVAILABLE:
             self._set_fatal_error(
                 "MISSING_DEP", "httpx not installed", retryable=False
@@ -399,6 +453,9 @@ class PhotonAdapter(BasePlatformAdapter):
         self._inbound_task = asyncio.get_event_loop().create_task(
             self._inbound_loop()
         )
+        self._sidecar_health_task = asyncio.get_event_loop().create_task(
+            self._monitor_sidecar_health()
+        )
 
         self._mark_connected()
         logger.info(
@@ -409,6 +466,17 @@ class PhotonAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._inbound_running = False
+        if self._sidecar_health_task is not None:
+            task = self._sidecar_health_task
+            self._sidecar_health_task = None
+            task.cancel()
+            if task is not asyncio.current_task():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
         if self._inbound_task is not None:
             self._inbound_task.cancel()
             try:
@@ -418,7 +486,6 @@ class PhotonAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._inbound_task = None
-        await self._cancel_sidecar_restart()
         await self._stop_sidecar()
         if self._http_client is not None:
             try:
@@ -470,6 +537,49 @@ class PhotonAdapter(BasePlatformAdapter):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    async def _monitor_sidecar_health(self) -> None:
+        """Promote degraded upstream Photon stream health into reconnect.
+
+        The sidecar HTTP process can stay alive while spectrum-ts repeatedly
+        fails to maintain the upstream inbound gRPC stream. Polling `/healthz`
+        keeps that from becoming a silent inbound outage.
+        """
+        while self._inbound_running:
+            await asyncio.sleep(self._sidecar_health_interval)
+            if not self._inbound_running:
+                break
+            try:
+                data = await self._sidecar_call("/healthz", {})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[photon] sidecar health check failed: %s", exc)
+                continue
+
+            stream = data.get("stream") if isinstance(data, dict) else None
+            if not isinstance(stream, dict) or stream.get("ok") is not False:
+                continue
+
+            state = str(stream.get("state") or "unknown")
+            degraded_for_ms = stream.get("degradedForMs")
+            last_issue = str(stream.get("lastIssue") or "unknown stream issue")
+            message = (
+                "Photon upstream stream degraded"
+                f" (state={state}, degradedForMs={degraded_for_ms}): "
+                f"{last_issue}"
+            )
+            logger.error("[photon] %s", message)
+            self._set_fatal_error(
+                "UPSTREAM_STREAM_DEGRADED",
+                message,
+                retryable=True,
+            )
+            try:
+                await self._notify_fatal_error()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[photon] fatal-error notification failed: %s", exc)
+            break
+
     async def _on_inbound_line(self, line: str) -> None:
         try:
             event = json.loads(line)
@@ -517,7 +627,8 @@ class PhotonAdapter(BasePlatformAdapter):
                           "encoding"?}
                        | {"type": "reaction", "emoji": "❤️",
                           "targetMessageId": "..." | null,
-                          "targetDirection": "inbound"|"outbound" | null},
+                          "targetDirection": "inbound"|"outbound" | null,
+                          "targetText": "..." | null},
               "timestamp": "2026-05-14T19:06:32.000Z"
 
         Attachment and voice content carry the bytes inline as base64 ``data``
@@ -609,12 +720,22 @@ class PhotonAdapter(BasePlatformAdapter):
                 user_id=sender_id,
                 user_name=sender_id or None,
             )
+            # Correlate the tapback to the message it reacted to, so the agent
+            # sees WHAT was reacted to. `is_ours` above guarantees the target is
+            # one of the bot's own messages, so reply_to_is_own_message holds and
+            # the gateway injects `[Replying to your previous message: "..."]`.
+            # reply_to_text comes from the sidecar (hydrated reaction target);
+            # it's None for attachment/voice-only targets, and the gateway only
+            # injects the pointer when both id and text are present.
             await self.handle_message(
                 MessageEvent(
                     text=f"reaction:added:{emoji}",
                     message_type=MessageType.TEXT,
                     source=source,
                     message_id=event.get("messageId"),
+                    reply_to_message_id=target_id,
+                    reply_to_text=content.get("targetText") or None,
+                    reply_to_is_own_message=True,
                     raw_message=event,
                     timestamp=timestamp,
                 )
@@ -791,96 +912,25 @@ class PhotonAdapter(BasePlatformAdapter):
                 f"PHOTON_SIDECAR_PORT to a different port"
             )
 
-    def _reset_sidecar_stream_failure_watch(self) -> None:
-        self._sidecar_stream_failure_first_seen = None
-        self._sidecar_stream_failure_count = 0
-        self._sidecar_stream_failure_triggered = False
-
-    def _observe_sidecar_log_line(self, line: str) -> None:
-        if _is_sidecar_stream_recovered_line(line):
-            self._reset_sidecar_stream_failure_watch()
-            return
-        if not _is_sidecar_stream_failure_line(line):
-            return
-
-        now = time.time()
-        first_seen = self._sidecar_stream_failure_first_seen
-        if (
-            first_seen is None
-            or now - first_seen > _SIDECAR_STREAM_FAILURE_RESET_SECONDS
-        ):
-            self._sidecar_stream_failure_first_seen = now
-            self._sidecar_stream_failure_count = 0
-            self._sidecar_stream_failure_triggered = False
-            first_seen = now
-
-        self._sidecar_stream_failure_count += 1
-        elapsed = now - first_seen
-        if (
-            self._sidecar_stream_failure_count
-            >= _SIDECAR_STREAM_FAILURE_MIN_EVENTS
-            and elapsed >= _SIDECAR_STREAM_FAILURE_RESTART_SECONDS
-            and not self._sidecar_stream_failure_triggered
-        ):
-            self._sidecar_stream_failure_triggered = True
-            self._request_sidecar_restart(
-                f"Spectrum stream failed {self._sidecar_stream_failure_count} "
-                f"times over {elapsed:.0f}s"
-            )
-
-    def _request_sidecar_restart(self, reason: str) -> None:
-        if not self._inbound_running:
-            return
-        task = self._sidecar_restart_task
-        if task is not None and not task.done():
-            return
-        loop = asyncio.get_event_loop()
-        task = loop.create_task(self._restart_sidecar_after_stream_failure(reason))
-        task.add_done_callback(self._clear_sidecar_restart_task)
-        self._sidecar_restart_task = task
-
-    def _clear_sidecar_restart_task(self, task: asyncio.Task) -> None:
-        if self._sidecar_restart_task is task:
-            self._sidecar_restart_task = None
-
-    async def _cancel_sidecar_restart(self) -> None:
-        task = self._sidecar_restart_task
-        if task is None:
-            return
-        task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await task
-        if self._sidecar_restart_task is task:
-            self._sidecar_restart_task = None
-
-    async def _restart_sidecar_after_stream_failure(self, reason: str) -> None:
-        async with self._sidecar_restart_lock:
-            if not self._inbound_running:
-                return
-            logger.warning(
-                "[photon] restarting sidecar after stalled Spectrum stream: %s",
-                reason,
-            )
-            try:
-                await self._stop_sidecar()
-                if not self._inbound_running:
-                    return
-                await self._start_sidecar()
-                self._reset_sidecar_stream_failure_watch()
-            except Exception:
-                self._sidecar_stream_failure_triggered = False
-                logger.exception(
-                    "[photon] failed to restart sidecar after stalled "
-                    "Spectrum stream"
-                )
-
     async def _start_sidecar(self) -> None:
         if not (_SIDECAR_DIR / "node_modules").exists():
             raise RuntimeError(
                 f"Photon sidecar deps not installed. Run: "
                 f"cd {_SIDECAR_DIR} && npm install   (or `hermes photon setup`)"
             )
-        self._reset_sidecar_stream_failure_watch()
+        # A `hermes update` that bumps the spectrum-ts pin rewrites
+        # package-lock.json but never reinstalls node_modules, so the sidecar
+        # spawns against stale deps and dies on every reconnect (the v8 patch
+        # script can't find @spectrum-ts/imessage/dist that only v8 ships).
+        # Self-heal by reinstalling when the lockfile is newer than npm's
+        # install marker. Runs off the event loop so a cold install can't
+        # freeze every other platform's traffic.
+        if _sidecar_deps_stale():
+            logger.warning(
+                "[photon] sidecar deps are stale (lockfile newer than install); "
+                "reinstalling before start"
+            )
+            await asyncio.to_thread(_reinstall_sidecar_deps)
         await self._reap_stale_sidecar()
 
         env = os.environ.copy()
@@ -931,10 +981,8 @@ class PhotonAdapter(BasePlatformAdapter):
             self._supervise_sidecar(self._sidecar_proc)
         )
 
-        # Wait for /healthz to come up. Production cold starts can spend
-        # longer than a few seconds inside spectrum-ts before the sidecar binds.
-        ready_timeout = _sidecar_ready_timeout_seconds()
-        deadline = time.time() + ready_timeout
+        # Wait for /healthz to come up — give it up to 15s on cold start.
+        deadline = time.time() + 15.0
         last_err: Optional[Exception] = None
         async with httpx.AsyncClient(timeout=2.0) as client:
             while time.time() < deadline:
@@ -954,7 +1002,7 @@ class PhotonAdapter(BasePlatformAdapter):
                     last_err = e
                 await asyncio.sleep(0.2)
         raise RuntimeError(
-            f"Photon sidecar did not become ready within {ready_timeout:g}s: {last_err}"
+            f"Photon sidecar did not become ready within 15s: {last_err}"
         )
 
     async def _supervise_sidecar(self, proc: subprocess.Popen) -> None:
@@ -968,11 +1016,24 @@ class PhotonAdapter(BasePlatformAdapter):
                 line = await loop.run_in_executor(None, stdout.readline)
                 if not line:
                     break
-                text = line.decode("utf-8", "replace").rstrip()
-                logger.info("[photon-sidecar] %s", text)
-                self._observe_sidecar_log_line(text)
+                logger.info("[photon-sidecar] %s", line.decode("utf-8", "replace").rstrip())
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("[photon-sidecar] supervisor exited: %s", e)
+        if self._inbound_running:
+            exit_code = proc.poll()
+            logger.error(
+                "[photon] sidecar exited unexpectedly (code %s) — triggering reconnect",
+                exit_code,
+            )
+            self._set_fatal_error(
+                "SIDECAR_CRASHED",
+                f"Photon sidecar exited unexpectedly (code {exit_code})",
+                retryable=True,
+            )
+            try:
+                await self._notify_fatal_error()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[photon] fatal-error notification failed: %s", exc)
 
     async def _stop_sidecar(self) -> None:
         proc = self._sidecar_proc
@@ -1122,6 +1183,10 @@ class PhotonAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
+        now = time.time()
+        if now - self._typing_last_sent.get(chat_id, 0.0) < _TYPING_COOLDOWN_SECONDS:
+            return
+        self._typing_last_sent[chat_id] = now
         try:
             await self._sidecar_call(
                 "/typing", {"spaceId": chat_id, "state": "start"}
@@ -1130,6 +1195,7 @@ class PhotonAdapter(BasePlatformAdapter):
             logger.debug("[photon] send_typing failed: %s", e)
 
     async def stop_typing(self, chat_id: str) -> None:
+        self._typing_last_sent.pop(chat_id, None)
         try:
             await self._sidecar_call(
                 "/typing", {"spaceId": chat_id, "state": "stop"}
@@ -1323,13 +1389,22 @@ class PhotonAdapter(BasePlatformAdapter):
             return content
         return strip_markdown(content)
 
+    @staticmethod
+    def _is_retryable_error(error: Optional[str]) -> bool:
+        if BasePlatformAdapter._is_retryable_error(error):
+            return True
+        if not error:
+            return False
+        lowered = error.lower()
+        return any(pat in lowered for pat in _PHOTON_RETRYABLE_PATTERNS)
+
     async def _send_with_retry(
         self,
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
         metadata: Any = None,
-        max_retries: int = 2,
+        max_retries: int = 1,
         base_delay: float = 2.0,
     ) -> SendResult:
         """Retry sends without the generic Markdown banner.

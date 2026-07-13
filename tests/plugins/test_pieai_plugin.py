@@ -23,15 +23,22 @@ class _Response:
 
 
 def test_plain_key_message_rewrites_to_pieverse_byok_command():
-    assert pieai._pre_gateway_dispatch(event=type("Event", (), {"text": VALID_KEY})()) == {
+    assert pieai._pre_gateway_dispatch(
+        event=type("Event", (), {"text": VALID_KEY})()
+    ) == {
         "action": "rewrite",
         "text": f"/pieverse-byok {VALID_KEY}",
     }
 
 
 def test_unrelated_text_does_not_rewrite():
-    assert pieai._pre_gateway_dispatch(event=type("Event", (), {"text": "hello there"})()) is None
-    assert pieai._pre_gateway_dispatch(event=type("Event", (), {"text": "/new"})()) is None
+    assert (
+        pieai._pre_gateway_dispatch(event=type("Event", (), {"text": "hello there"})())
+        is None
+    )
+    assert (
+        pieai._pre_gateway_dispatch(event=type("Event", (), {"text": "/new"})()) is None
+    )
 
 
 def test_invalid_key_returns_usage_without_network(monkeypatch):
@@ -82,9 +89,14 @@ def test_success_schedules_restart_when_platform_requires_it(monkeypatch):
     monkeypatch.setattr(
         pieai,
         "_save_key",
-        lambda _key: {"ok": True, "data": {"key": "sk-pv-aaaa...aaaa", "restartRequired": True}},
+        lambda _key: {
+            "ok": True,
+            "data": {"key": "sk-pv-aaaa...aaaa", "restartRequired": True},
+        },
     )
-    monkeypatch.setattr(pieai, "_schedule_gateway_restart", lambda: scheduled.append(True))
+    monkeypatch.setattr(
+        pieai, "_schedule_gateway_restart", lambda: scheduled.append(True)
+    )
 
     message = pieai._handle_pieverse_byok_sync(VALID_KEY)
 
@@ -102,7 +114,9 @@ def test_runtime_sync_pending_does_not_schedule_restart(monkeypatch):
             "data": {"key": "sk-pv-aaaa...aaaa", "runtimeSyncPending": True},
         },
     )
-    monkeypatch.setattr(pieai, "_schedule_gateway_restart", lambda: scheduled.append(True))
+    monkeypatch.setattr(
+        pieai, "_schedule_gateway_restart", lambda: scheduled.append(True)
+    )
 
     message = pieai._handle_pieverse_byok_sync(VALID_KEY)
 
@@ -149,3 +163,22 @@ async def test_async_handler_runs_sync_path(monkeypatch):
     monkeypatch.setattr(pieai, "_handle_pieverse_byok_sync", lambda raw: f"ok:{raw}")
 
     assert await pieai._handle_pieverse_byok("abc") == "ok:abc"
+
+
+def test_register_uses_current_plugin_command_api():
+    calls = {}
+
+    class _Context:
+        def register_hook(self, name, handler):
+            calls["hook"] = (name, handler)
+
+        def register_command(self, name, **kwargs):
+            calls["command"] = (name, kwargs)
+
+    pieai.register(_Context())
+
+    assert calls["hook"] == ("pre_gateway_dispatch", pieai._pre_gateway_dispatch)
+    assert calls["command"][0] == "pieverse-byok"
+    assert calls["command"][1]["handler"] is pieai._handle_pieverse_byok
+    assert calls["command"][1]["args_hint"] == "[sk-pv-key]"
+    assert calls["command"][1]["platforms"] == ("telegram", "line", "slack")

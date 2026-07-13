@@ -174,7 +174,9 @@ def _handle_pieverse_byok_sync(raw_args: str) -> str:
             f"Saved your Pieverse AI Gateway key ({masked}). "
             "Hermes is refreshing now and will use your key next."
         )
-    return f"Saved your Pieverse AI Gateway key ({masked}). Hermes will use your key next."
+    return (
+        f"Saved your Pieverse AI Gateway key ({masked}). Hermes will use your key next."
+    )
 
 
 async def _handle_pieverse_byok(raw_args: str) -> str:

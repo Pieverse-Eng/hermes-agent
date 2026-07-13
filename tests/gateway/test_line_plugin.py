@@ -39,6 +39,7 @@ _is_system_bypass = _line._is_system_bypass
 RequestCache = _line.RequestCache
 State = _line.State
 LineAdapter = _line.LineAdapter
+_LineClient = _line._LineClient
 register = _line.register
 check_requirements = _line.check_requirements
 validate_config = _line.validate_config
@@ -611,6 +612,60 @@ class TestAdapterInit:
         assert ad.public_base_url == "https://x.example.com"
         assert ad.allowed_users == {"U1", "U2"}
 
+    def test_init_supports_pieverse_gateway_compatibility_keys(self, monkeypatch):
+        for key in (
+            "LINE_CHANNEL_ACCESS_TOKEN",
+            "LINE_CHANNEL_SECRET",
+            "LINE_API_BASE_URL",
+            "LINE_DATA_API_BASE_URL",
+            "LINE_HOST",
+            "LINE_PORT",
+            "LINE_WEBHOOK_HOST",
+            "LINE_WEBHOOK_PORT",
+            "LINE_WEBHOOK_PATH",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        from gateway.config import PlatformConfig
+
+        cfg = PlatformConfig(
+            enabled=True,
+            token="gateway-managed",
+            extra={
+                "channel_secret": "tenant-secret",
+                "api_base_url": "http://channel-gateway/line/",
+                "webhook_host": "0.0.0.0",
+                "webhook_port": 18789,
+                "webhook_path": "line/webhook",
+            },
+        )
+        ad = LineAdapter(cfg)
+
+        assert ad.channel_access_token == "gateway-managed"
+        assert ad.api_base_url == "http://channel-gateway/line"
+        assert ad.data_api_base_url == "http://channel-gateway/line"
+        assert ad.webhook_host == "0.0.0.0"
+        assert ad.webhook_port == 18789
+        assert ad.webhook_path == "/line/webhook"
+
+    def test_legacy_pieverse_env_overrides_are_supported(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "gateway-managed")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "tenant-secret")
+        monkeypatch.setenv("LINE_API_BASE_URL", "http://channel-gateway/line/")
+        monkeypatch.setenv("LINE_WEBHOOK_HOST", "127.0.0.1")
+        monkeypatch.setenv("LINE_WEBHOOK_PORT", "18789")
+        monkeypatch.setenv("LINE_WEBHOOK_PATH", "line/webhook")
+        monkeypatch.delenv("LINE_HOST", raising=False)
+        monkeypatch.delenv("LINE_PORT", raising=False)
+        from gateway.config import PlatformConfig
+
+        ad = LineAdapter(PlatformConfig(enabled=True))
+
+        assert ad.api_base_url == "http://channel-gateway/line"
+        assert ad.data_api_base_url == "http://channel-gateway/line"
+        assert ad.webhook_host == "127.0.0.1"
+        assert ad.webhook_port == 18789
+        assert ad.webhook_path == "/line/webhook"
+
     def test_env_overrides_extra(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "env-tok")
         monkeypatch.setenv("LINE_PORT", "1234")
@@ -641,6 +696,87 @@ class TestAdapterInit:
         assert asyncio.run(ad.get_chat_info("U123"))["type"] == "dm"
         assert asyncio.run(ad.get_chat_info("C123"))["type"] == "group"
         assert asyncio.run(ad.get_chat_info("R123"))["type"] == "channel"
+
+
+class TestLineClientBaseUrls:
+
+    def test_custom_api_base_routes_all_gateway_calls_through_proxy(self):
+        client = _LineClient(
+            "gateway-managed",
+            api_base_url="http://channel-gateway/line/",
+            data_api_base_url="http://channel-gateway/line/",
+        )
+
+        assert client._api_base_url == "http://channel-gateway/line"
+        assert client._data_api_base_url == "http://channel-gateway/line"
+
+    def test_custom_api_base_is_used_by_http_requests(self, monkeypatch):
+        import aiohttp
+
+        requests = []
+
+        class _Response:
+            status = 200
+
+            def __await__(self):
+                async def _result():
+                    return self
+
+                return _result().__await__()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def text(self):
+                return ""
+
+            async def read(self):
+                return b"content"
+
+            async def json(self):
+                return {"userId": "Ubot"}
+
+        class _Session:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, url, **_kwargs):
+                requests.append(("POST", url))
+                return _Response()
+
+            def get(self, url, **_kwargs):
+                requests.append(("GET", url))
+                return _Response()
+
+        monkeypatch.setattr(aiohttp, "ClientSession", _Session)
+        client = _LineClient(
+            "gateway-managed",
+            api_base_url="http://channel-gateway/line",
+            data_api_base_url="http://channel-gateway/line",
+        )
+
+        asyncio.run(client.reply("reply-token", [{"type": "text", "text": "ok"}]))
+        asyncio.run(client.push("Uchat", [{"type": "text", "text": "ok"}]))
+        asyncio.run(client.loading("Uchat"))
+        assert asyncio.run(client.fetch_content("message/id")) == b"content"
+        assert asyncio.run(client.get_bot_user_id()) == "Ubot"
+
+        assert requests == [
+            ("POST", "http://channel-gateway/line/v2/bot/message/reply"),
+            ("POST", "http://channel-gateway/line/v2/bot/message/push"),
+            ("POST", "http://channel-gateway/line/v2/bot/chat/loading/start"),
+            ("GET", "http://channel-gateway/line/v2/bot/message/message%2Fid/content"),
+            ("GET", "http://channel-gateway/line/v2/bot/info"),
+        ]
 
 
 # ---------------------------------------------------------------------------

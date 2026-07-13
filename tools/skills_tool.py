@@ -68,6 +68,7 @@ Usage:
 
 import json
 import logging
+import time
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -86,12 +87,76 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Per-session skill discovery cache.  _find_all_skills() re-reads every
+# SKILL.md on every call; with hundreds of skills this is wasteful.
+# Cache validation (mirrors hermes_cli/profiles.py::_count_skills, d5eee133e):
+#   - signature = per-dir max mtime of the dir AND its immediate children
+#     (one scandir per dir; catches skill add/remove inside categories,
+#     which does NOT bump the root dir's mtime), plus the disabled-set
+#     (config-driven — changes with no filesystem mtime bump at all)
+#   - a short TTL bounds staleness from in-place SKILL.md edits, which
+#     bump only the file's mtime, invisible to any directory signature.
+# skip_disabled True/False are cached separately.
+_SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_list)}
+_SKILLS_CACHE_TTL_SECONDS = 30.0
+_SKILLS_CACHE_KEY_DISABLED = "with_disabled"
+_SKILLS_CACHE_KEY_FILTERED = "filtered"
+
+
+def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+    """Cheap change-signature for the skill scan inputs.
+
+    O(#dirs + #categories) stat calls, not a recursive walk. Includes the
+    platform the scan's ``skill_matches_platform`` filter will use (read
+    from ``agent.skill_utils``'s ``sys`` so test patches of that module
+    are honored) — the scan result is platform-dependent.
+    """
+    from agent import skill_utils as _skill_utils
+
+    platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
+    sig = []
+    for d in dirs_to_scan:
+        try:
+            m = d.stat().st_mtime
+        except OSError:
+            continue
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            em = entry.stat(follow_symlinks=False).st_mtime
+                            if em > m:
+                                m = em
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        sig.append((str(d), m))
+    return (tuple(sig), frozenset(disabled), platform)
+
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
 # This is the single source of truth -- agent edits, hub installs, and bundled
 # skills all coexist here without polluting the git repo.
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
+_SKILLS_DIR_AT_IMPORT = SKILLS_DIR
+
+
+def _skills_dir() -> Path:
+    """Return the active profile's skills directory at call time.
+
+    Some long-lived runtimes import this module before the active profile has
+    set HERMES_HOME. Keep the legacy SKILLS_DIR module attribute for tests and
+    external patchers, but when it has not been patched, resolve from the live
+    profile-scoped HERMES_HOME on every call.
+    """
+    configured = Path(SKILLS_DIR)
+    if configured != _SKILLS_DIR_AT_IMPORT:
+        return configured
+    return get_hermes_home() / "skills"
+
 
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
@@ -149,6 +214,8 @@ def load_env() -> Dict[str, str]:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
+                if line.startswith("export "):
+                    line = line[7:]
                 key, _, value = line.partition("=")
                 env_vars[key.strip()] = value.strip().strip("\"'")
     return env_vars
@@ -499,9 +566,9 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
     Also works for external skill dirs configured via skills.external_dirs.
     """
-    # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
+    # Try the active profile skills dir first (respects monkeypatching in tests),
     # then fall back to external dirs from config.
-    dirs_to_check = [SKILLS_DIR]
+    dirs_to_check = [_skills_dir()]
     try:
         from agent.skill_utils import get_external_skills_dirs
         dirs_to_check.extend(get_external_skills_dirs())
@@ -599,28 +666,6 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _skill_security_allows_view(
-    skill_dir: Path,
-    name: str,
-    *,
-    archive: Any = None,
-) -> Any:
-    """Return the CertiK decision for a directory-backed skill_view load."""
-    try:
-        from tools.skill_security_gate import ensure_skill_certik_allowed_for_session_load
-
-        return ensure_skill_certik_allowed_for_session_load(skill_dir, archive=archive)
-    except Exception as exc:
-        logger.warning("Skill security gate failed for %s: %s", skill_dir, exc)
-        from types import SimpleNamespace
-
-        return SimpleNamespace(
-            allowed=False,
-            reason=f"CertiK security verification could not run: {exc}",
-            archive=None,
-        )
-
-
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
@@ -631,21 +676,47 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     Returns:
         List of skill metadata dicts (name, description, category).
+
+    Results are cached per-session; the cache is invalidated when the scan
+    signature changes (dir/category mtimes or the disabled-set) and expires
+    after a short TTL to bound staleness from in-place SKILL.md edits.
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+
+    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+
+    # Load disabled set once (not per-skill). Part of the cache signature:
+    # disabling a skill is a config change with no filesystem mtime bump.
+    disabled = set() if skip_disabled else _get_disabled_skill_names()
+
+    # Collect directories to scan — same resolution as the scan loop below
+    # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
+    # SKILLS_DIR can be stale in long-lived runtimes).
+    dirs_to_scan: list = []
+    active_skills_dir = _skills_dir()
+    if active_skills_dir.exists():
+        dirs_to_scan.append(active_skills_dir)
+    dirs_to_scan.extend(get_external_skills_dirs())
+
+    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    now = time.monotonic()
+
+    cached = _SKILLS_CACHE.get(cache_key)
+    if (
+        cached is not None
+        and cached[0] == signature
+        and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS
+    ):
+        # Per-call shallow copies: callers mutate the returned dicts
+        # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
+        # out the cached objects would poison the cache for everyone else.
+        return [dict(s) for s in cached[2]]
 
     skills = []
     seen_names: set = set()
 
-    # Load disabled set once (not per-skill)
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
-
-    # Scan local dir first, then external dirs (local takes precedence)
-    dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
-    dirs_to_scan.extend(get_external_skills_dirs())
-
+    # Scan local dir first, then external dirs (local takes precedence) —
+    # dirs_to_scan already resolved above for the signature.
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
@@ -698,7 +769,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 )
                 continue
 
-    return skills
+    # Store in cache keyed by the scan signature computed BEFORE the scan
+    # (a write racing the scan changes the signature, so the next call
+    # re-scans rather than serving the torn result past the TTL). Same
+    # shallow-copy contract as the hit path — the caller may mutate.
+    _SKILLS_CACHE[cache_key] = (signature, now, skills)
+    return [dict(s) for s in skills]
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -721,26 +797,29 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
-        created_skills_dir = False
-        if not SKILLS_DIR.exists():
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-            created_skills_dir = True
-
-        # Find all skills
-        all_skills = _find_all_skills()
-
-        if not all_skills:
-            message = (
-                f"No skills found. Skills directory created at {display_hermes_home()}/skills/"
-                if created_skills_dir
-                else "No skills found in skills/ directory."
-            )
+        active_skills_dir = _skills_dir()
+        if not active_skills_dir.exists():
+            active_skills_dir.mkdir(parents=True, exist_ok=True)
             return json.dumps(
                 {
                     "success": True,
                     "skills": [],
                     "categories": [],
-                    "message": message,
+                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
+                },
+                ensure_ascii=False,
+            )
+
+        # Find all skills
+        all_skills = _find_all_skills()
+
+        if not all_skills:
+            return json.dumps(
+                {
+                    "success": True,
+                    "skills": [],
+                    "categories": [],
+                    "message": "No skills found in skills/ directory.",
                 },
                 ensure_ascii=False,
             )
@@ -1002,8 +1081,9 @@ def skill_view(
 
         # Build list of all skill directories to search
         all_dirs = []
-        if SKILLS_DIR.exists():
-            all_dirs.append(SKILLS_DIR)
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            all_dirs.append(active_skills_dir)
         all_dirs.extend(get_external_skills_dirs())
 
         if not all_dirs:
@@ -1138,44 +1218,22 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        security_archive = None
-        if skill_dir:
-            try:
-                from tools.skill_security_certik import build_skill_security_archive
-
-                security_archive = build_skill_security_archive(skill_dir)
-                content = security_archive.read_text("SKILL.md")
-            except Exception as e:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": (
-                            f"Skill '{name}' was not loaded because "
-                            f"CertiK security verification could not prepare "
-                            f"a stable skill snapshot: {e}"
-                        ),
-                        "security_provider": "certik",
-                        "security_status": "blocked",
-                    },
-                    ensure_ascii=False,
-                )
-        else:
-            # Legacy flat .md skills are not directory-backed packages.
-            try:
-                content = skill_md.read_text(encoding="utf-8")
-            except Exception as e:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": f"Failed to read skill '{name}': {e}",
-                    },
-                    ensure_ascii=False,
-                )
+        # Read the file once — reused for platform check and main content below
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+        except Exception as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Failed to read skill '{name}': {e}",
+                },
+                ensure_ascii=False,
+            )
 
         # Security: warn if skill is loaded from outside trusted directories
         # (local skills dir + configured external_dirs are all trusted)
         _outside_skills_dir = True
-        _trusted_dirs = [SKILLS_DIR.resolve()]
+        _trusted_dirs = [active_skills_dir.resolve()]
         try:
             _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
         except Exception:
@@ -1231,35 +1289,6 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        if skill_dir:
-            security_decision = _skill_security_allows_view(
-                skill_dir,
-                str(resolved_name or name),
-                archive=security_archive,
-            )
-            security_allowed = bool(getattr(security_decision, "allowed", False))
-            security_reason = (
-                getattr(security_decision, "reason", "")
-                or f"Skill '{resolved_name}' was not allowed by CertiK"
-            )
-            if not security_allowed:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": (
-                            f"Skill '{resolved_name}' was not loaded because "
-                            f"CertiK security verification did not allow it: "
-                            f"{security_reason}"
-                        ),
-                        "security_provider": "certik",
-                        "security_status": "blocked",
-                    },
-                    ensure_ascii=False,
-                )
-            security_archive = (
-                getattr(security_decision, "archive", None) or security_archive
-            )
-
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:
             from tools.path_security import validate_within_dir, has_traversal_component
@@ -1288,13 +1317,7 @@ def skill_view(
                     },
                     ensure_ascii=False,
                 )
-            snapshot_rel_path = Path(file_path).as_posix()
-            snapshot_file = (
-                security_archive.get_bytes(snapshot_rel_path)
-                if security_archive is not None
-                else None
-            )
-            if snapshot_file is None:
+            if not target_file.exists():
                 # List available files in the skill directory, organized by type
                 available_files = {
                     "references": [],
@@ -1304,37 +1327,28 @@ def skill_view(
                     "other": [],
                 }
 
-                if security_archive is not None:
-                    candidate_files = sorted(
-                        rel for rel in security_archive.files if rel != "SKILL.md"
-                    )
-                else:
-                    candidate_files = []
-                    for f in skill_dir.rglob("*"):
-                        if f.is_file() and f.name != "SKILL.md":
-                            candidate_files.append(str(f.relative_to(skill_dir)))
-
                 # Scan for all readable files
-                for rel in candidate_files:
-                    rel_path = PurePosixPath(rel)
-                    if rel.startswith("references/"):
-                        available_files["references"].append(rel)
-                    elif rel.startswith("templates/"):
-                        available_files["templates"].append(rel)
-                    elif rel.startswith("assets/"):
-                        available_files["assets"].append(rel)
-                    elif rel.startswith("scripts/"):
-                        available_files["scripts"].append(rel)
-                    elif rel_path.suffix in {
-                        ".md",
-                        ".py",
-                        ".yaml",
-                        ".yml",
-                        ".json",
-                        ".tex",
-                        ".sh",
-                    }:
-                        available_files["other"].append(rel)
+                for f in skill_dir.rglob("*"):
+                    if f.is_file() and f.name != "SKILL.md":
+                        rel = str(f.relative_to(skill_dir))
+                        if rel.startswith("references/"):
+                            available_files["references"].append(rel)
+                        elif rel.startswith("templates/"):
+                            available_files["templates"].append(rel)
+                        elif rel.startswith("assets/"):
+                            available_files["assets"].append(rel)
+                        elif rel.startswith("scripts/"):
+                            available_files["scripts"].append(rel)
+                        elif f.suffix in {
+                            ".md",
+                            ".py",
+                            ".yaml",
+                            ".yml",
+                            ".json",
+                            ".tex",
+                            ".sh",
+                        }:
+                            available_files["other"].append(rel)
 
                 # Remove empty categories
                 available_files = {k: v for k, v in available_files.items() if v}
@@ -1349,8 +1363,9 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
+            # Read the file content
             try:
-                content = snapshot_file.decode("utf-8")
+                content = target_file.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
                 return json.dumps(
@@ -1358,13 +1373,21 @@ def skill_view(
                         "success": True,
                         "name": name,
                         "file": file_path,
-                        "content": (
-                            f"[Binary file: {target_file.name}, "
-                            f"size: {len(snapshot_file)} bytes]"
-                        ),
+                        "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
                         "is_binary": True,
                     },
                     ensure_ascii=False,
+                )
+
+            try:
+                from tools.skill_manager_tool import mark_background_review_skill_read
+
+                mark_background_review_skill_read(target_file)
+            except Exception:
+                logger.debug(
+                    "Could not record background-review skill read for %s",
+                    target_file,
+                    exc_info=True,
                 )
 
             return json.dumps(
@@ -1387,35 +1410,7 @@ def skill_view(
         asset_files = []
         script_files = []
 
-        if skill_dir and security_archive is not None:
-            snapshot_paths = sorted(
-                rel for rel in security_archive.files if rel != "SKILL.md"
-            )
-            for rel in snapshot_paths:
-                rel_path = PurePosixPath(rel)
-                if (
-                    rel_path.parent.as_posix() == "references"
-                    and rel_path.suffix == ".md"
-                ):
-                    reference_files.append(rel)
-                elif rel.startswith("templates/") and rel_path.suffix in {
-                    ".md",
-                    ".py",
-                    ".yaml",
-                    ".yml",
-                    ".json",
-                    ".tex",
-                    ".sh",
-                }:
-                    template_files.append(rel)
-                elif rel.startswith("assets/"):
-                    asset_files.append(rel)
-                elif (
-                    rel_path.parent.as_posix() == "scripts"
-                    and rel_path.suffix in {".py", ".sh", ".bash", ".js", ".ts", ".rb"}
-                ):
-                    script_files.append(rel)
-        elif skill_dir:
+        if skill_dir:
             references_dir = skill_dir / "references"
             if references_dir.exists():
                 reference_files = [
@@ -1478,7 +1473,7 @@ def skill_view(
             linked_files["scripts"] = script_files
 
         try:
-            rel_path = str(skill_md.relative_to(SKILLS_DIR))
+            rel_path = str(skill_md.relative_to(active_skills_dir))
         except ValueError:
             # External skill — use path relative to the skill's own parent dir
             rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
@@ -1597,6 +1592,17 @@ def skill_view(
 
         if capture_result["gateway_setup_hint"]:
             result["gateway_setup_hint"] = capture_result["gateway_setup_hint"]
+
+        try:
+            from tools.skill_manager_tool import mark_background_review_skill_read
+
+            mark_background_review_skill_read(skill_md)
+        except Exception:
+            logger.debug(
+                "Could not record background-review skill read for %s",
+                skill_md,
+                exc_info=True,
+            )
 
         if setup_needed:
             missing_items = [

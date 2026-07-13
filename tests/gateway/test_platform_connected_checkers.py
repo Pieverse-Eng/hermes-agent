@@ -91,9 +91,6 @@ def test_checker_returns_true_when_configured(platform, checker, monkeypatch):
     # Set up platform-specific mock extra fields so the checker succeeds
     if platform == Platform.WEIXIN:
         mock_config.extra = {"account_id": "123", "token": "***"}
-    elif platform == Platform.LINE:
-        mock_config.token = "line-token"
-        mock_config.extra = {"channel_secret": "secret"}
     elif platform == Platform.SIGNAL:
         mock_config.extra = {"http_url": "http://signal:8080"}
     elif platform == Platform.EMAIL:

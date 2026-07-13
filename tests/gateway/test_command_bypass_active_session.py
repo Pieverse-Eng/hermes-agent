@@ -29,7 +29,7 @@ from gateway.session import SessionSource, build_session_key
 class _StubAdapter(BasePlatformAdapter):
     """Concrete adapter with abstract methods stubbed out."""
 
-    async def connect(self):
+    async def connect(self, *, is_reconnect: bool = False):
         pass
 
     async def disconnect(self):
@@ -159,6 +159,33 @@ class TestCommandBypassActiveSession:
 
         assert sk not in adapter._pending_messages
         assert any("handled:status" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_bypasses_guard(self, monkeypatch):
+        """Plugin commands must be dispatched directly while a session is active."""
+        from hermes_cli import plugins as plugins_module
+
+        monkeypatch.setattr(
+            plugins_module,
+            "get_plugin_commands",
+            lambda: {
+                "pieverse-byok": {
+                    "handler": lambda _a: "ok",
+                    "description": "Pieverse BYOK",
+                    "args_hint": "[key]",
+                    "plugin": "pieverse-byok",
+                    "platforms": ("telegram", "line", "slack"),
+                }
+            },
+        )
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event(f"/pieverse-byok sk-pv-{'a' * 48}"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:pieverse-byok" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
     async def test_agents_bypasses_guard(self):

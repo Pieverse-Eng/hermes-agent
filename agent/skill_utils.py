@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import get_config_path, get_hermes_home, get_skills_dir, is_termux
+from hermes_constants import get_config_path, get_skills_dir, is_termux
 
 logger = logging.getLogger(__name__)
 
@@ -160,27 +160,8 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
 # ── Platform matching ─────────────────────────────────────────────────────
 
 
-def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
-    """Return True when the skill is compatible with the current OS.
-
-    Skills declare platform requirements via a top-level ``platforms`` list
-    in their YAML frontmatter::
-
-        platforms: [macos]          # macOS only
-        platforms: [macos, linux]   # macOS and Linux
-
-    If the field is absent or empty the skill is compatible with **all**
-    platforms (backward-compatible default).
-
-    Termux note: on Termux/Android, ``sys.platform`` is ``"linux"`` on
-    older Pythons but became ``"android"`` on Python 3.13+. Termux is a
-    Linux userland riding on the Android kernel, so skills tagged
-    ``linux`` are treated as compatible in Termux regardless of which
-    ``sys.platform`` value Python reports. Individual Linux commands
-    inside a skill may still misbehave (no systemd, BusyBox utils, no
-    apt/dnf, etc.) but that is on the skill, not on platform gating.
-    """
-    platforms = frontmatter.get("platforms")
+def skill_matches_platform_list(platforms: Any) -> bool:
+    """Return True when *platforms* is compatible with the current OS."""
     if not platforms:
         return True
     if not isinstance(platforms, list):
@@ -202,6 +183,29 @@ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
         if running_in_termux and mapped in ("termux", "android"):
             return True
     return False
+
+
+def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
+    """Return True when the skill is compatible with the current OS.
+
+    Skills declare platform requirements via a top-level ``platforms`` list
+    in their YAML frontmatter::
+
+        platforms: [macos]          # macOS only
+        platforms: [macos, linux]   # macOS and Linux
+
+    If the field is absent or empty the skill is compatible with **all**
+    platforms (backward-compatible default).
+
+    Termux note: on Termux/Android, ``sys.platform`` is ``"linux"`` on
+    older Pythons but became ``"android"`` on Python 3.13+. Termux is a
+    Linux userland riding on the Android kernel, so skills tagged
+    ``linux`` are treated as compatible in Termux regardless of which
+    ``sys.platform`` value Python reports. Individual Linux commands
+    inside a skill may still misbehave (no systemd, BusyBox utils, no
+    apt/dnf, etc.) but that is on the skill, not on platform gating.
+    """
+    return skill_matches_platform_list(frontmatter.get("platforms"))
 
 
 # ── Environment matching ──────────────────────────────────────────────────
@@ -280,9 +284,9 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     This is an OFFER-time filter: it controls whether a skill shows up in the
     skills index / autocomplete / slash-command list. It is intentionally NOT
     enforced by ``skill_view`` or ``--skills`` preloading — an explicit load is
-    explicit consent, and load-bearing force-loads (e.g. the kanban dispatcher
-    injecting ``--skills kanban-worker``) must always succeed regardless of how
-    the offer surfaces filter the skill.
+    explicit consent, and load-bearing force-loads (e.g. a dispatcher pinning
+    a task to a specialist skill via ``--skills``) must always succeed
+    regardless of how the offer surfaces filter the skill.
 
     A skill matches when ANY of its declared environments is currently active
     (OR semantics, mirroring ``platforms``). Unknown env tags fail open.
@@ -398,13 +402,13 @@ def _normalize_string_set(values) -> Set[str]:
 
 # ── External skills directories ──────────────────────────────────────────
 
-# (config marker, default-dir marker) -> resolved external dirs list.  Keyed by
-# config.yaml mtime plus the default cross-agent skills directory existence so
-# config edits and late ``npx skills add`` installs are picked up automatically;
-# otherwise every call would re-read + re-YAML-parse the 15KB config, which
-# becomes the dominant cost of ``hermes`` startup when ~120 skills each trigger
-# a category lookup during banner construction (10+ seconds of pure waste).
-_EXTERNAL_DIRS_CACHE: Dict[Tuple[Any, ...], List[Path]] = {}
+# (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
+# mtime_ns so a config.yaml edit mid-run is picked up automatically;
+# otherwise every call would re-read + re-YAML-parse the 15KB config,
+# which becomes the dominant cost of ``hermes`` startup when ~120 skills
+# each trigger a category lookup during banner construction (10+ seconds
+# of pure waste).
+_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
@@ -413,98 +417,61 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
-def _default_external_skills_candidates(hermes_home: Path | None = None) -> List[Path]:
-    """Return implicit cross-agent skill roots under HERMES_HOME."""
-    home = hermes_home if hermes_home is not None else get_hermes_home()
-    return [home / ".agents" / "skills"]
-
-
-def _default_external_skills_marker(hermes_home: Path) -> Tuple[Tuple[str, int, int], ...]:
-    """Return a cheap marker that changes when default external roots appear."""
-    markers: list[tuple[str, int, int]] = []
-    for candidate in _default_external_skills_candidates(hermes_home):
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            resolved = candidate
-        try:
-            st = resolved.stat()
-            markers.append((str(resolved), st.st_mtime_ns, 1 if resolved.is_dir() else 0))
-        except OSError:
-            markers.append((str(resolved), 0, 0))
-    return tuple(markers)
-
-
-def _append_existing_external_dir(
-    result: List[Path],
-    seen: Set[Path],
-    candidate: Path,
-    *,
-    local_skills: Path,
-) -> None:
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        resolved = candidate
-    if resolved == local_skills:
-        return
-    if resolved in seen:
-        return
-    if resolved.is_dir():
-        seen.add(resolved)
-        result.append(resolved)
-    else:
-        logger.debug("External skills dir does not exist, skipping: %s", candidate)
-
-
 def get_external_skills_dirs() -> List[Path]:
-    """Return implicit and configured external skill directories.
+    """Read ``skills.external_dirs`` from config.yaml and return validated paths.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
     path.  Only directories that actually exist are returned.  Duplicates and
     paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
-    Hermes also treats ``$HERMES_HOME/.agents/skills`` as an implicit external
-    root so skills installed by cross-agent installers are scanned and gated at
-    load time.
 
     Cached in-process, keyed on ``config.yaml`` mtime — the function is
-    called once per skill during banner / tool-registry scans, and YAML parsing
-    a non-trivial config dominates ``hermes`` cold-start time when the cache is
-    absent.  The implicit default root's existence marker is part of the cache
-    key so installing the first ``.agents`` skill mid-session is observed.
+    called once per skill during banner / tool-registry scans, and YAML
+    parsing a non-trivial config dominates ``hermes`` cold-start time
+    when the cache is absent.
     """
-    hermes_home = get_hermes_home()
     config_path = get_config_path()
+    if not config_path.exists():
+        return []
 
     # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
     # the full YAML parse, so the fast path is nearly free.
     try:
         stat = config_path.stat()
-        config_marker: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
+        cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
     except OSError:
-        config_marker = (str(config_path), 0)
+        cache_key = None  # type: ignore[assignment]
 
-    cache_key: Tuple[Any, ...] = (
-        config_marker,
-        _default_external_skills_marker(hermes_home),
-    )
-
-    cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
-    if cached is not None:
-        # Return a copy so callers can't mutate the cached list.
-        return list(cached)
-
-    local_skills = get_skills_dir().resolve()
-    seen: Set[Path] = set()
-    result: List[Path] = []
+    if cache_key is not None:
+        cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
+        if cached is not None:
+            # Return a copy so callers can't mutate the cached list.
+            return list(cached)
 
     parsed = _load_raw_config()
-    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
-    raw_dirs = skills_cfg.get("external_dirs") if isinstance(skills_cfg, dict) else []
+    if not parsed:
+        return []
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return []
+
+    raw_dirs = skills_cfg.get("external_dirs")
+    if not raw_dirs:
+        result: List[Path] = []
+        if cache_key is not None:
+            _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+        return result
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
     if not isinstance(raw_dirs, list):
-        raw_dirs = []
+        return []
+
+    from hermes_constants import get_hermes_home
+
+    hermes_home = get_hermes_home()
+    local_skills = get_skills_dir().resolve()
+    seen: Set[Path] = set()
+    result = []
 
     for entry in raw_dirs:
         entry = str(entry).strip()
@@ -515,23 +482,21 @@ def get_external_skills_dirs() -> List[Path]:
         p = Path(expanded)
         # Resolve relative paths against HERMES_HOME, not cwd
         if not p.is_absolute():
-            p = hermes_home / p
-        _append_existing_external_dir(
-            result,
-            seen,
-            p,
-            local_skills=local_skills,
-        )
+            p = (hermes_home / p).resolve()
+        else:
+            p = p.resolve()
+        if p == local_skills:
+            continue
+        if p in seen:
+            continue
+        if p.is_dir():
+            seen.add(p)
+            result.append(p)
+        else:
+            logger.debug("External skills dir does not exist, skipping: %s", p)
 
-    for candidate in _default_external_skills_candidates(hermes_home):
-        _append_existing_external_dir(
-            result,
-            seen,
-            candidate,
-            local_skills=local_skills,
-        )
-
-    _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+    if cache_key is not None:
+        _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
 
 
@@ -539,12 +504,96 @@ def get_all_skills_dirs() -> List[Path]:
     """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
 
     The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order, with the
-    implicit ``$HERMES_HOME/.agents/skills`` root last when it exists.
+    yet — callers handle that).  External dirs follow in config order.
     """
     dirs = [get_skills_dir()]
     dirs.extend(get_external_skills_dirs())
     return dirs
+
+
+def normalize_skill_lookup_name(identifier: str) -> str:
+    """Normalize a skill identifier to a ``skill_view()``-safe relative path.
+
+    Slash commands and cron jobs may store absolute paths to skills that live
+    under ``~/.hermes/skills/`` (including via symlinks) or configured
+    ``skills.external_dirs``. ``skill_view()`` rejects absolute names for
+    security, so callers must translate trusted absolute paths to their
+    relative form first.
+    """
+    raw_identifier = (identifier or "").strip()
+    if not raw_identifier:
+        return raw_identifier
+
+    identifier_path = Path(raw_identifier).expanduser()
+    if not identifier_path.is_absolute():
+        return raw_identifier.lstrip("/")
+
+    # Look the primary skills root up on tools.skills_tool at CALL time
+    # (not via get_skills_dir()): callers and tests patch
+    # ``tools.skills_tool.SKILLS_DIR`` and skill_view() itself resolves
+    # against that module attribute, so normalization must agree with the
+    # exact root skill_view() will enforce.  Import deferred to avoid a
+    # module cycle (tools.skills_tool imports agent.skill_utils).
+    try:
+        from tools import skills_tool as _skills_tool
+        primary_root = Path(_skills_tool.SKILLS_DIR)
+    except Exception:
+        primary_root = get_skills_dir()
+
+    trusted_roots = [primary_root]
+    try:
+        trusted_roots.extend(get_external_skills_dirs())
+    except Exception:
+        pass
+
+    # Prefer the lexical path under a trusted skill root before resolving
+    # symlinks. Slash-command discovery can legitimately find a skill via
+    # ~/.hermes/skills/<name> where <name> is a symlink to a checked-out
+    # skill elsewhere. Resolving first turns that trusted visible path into
+    # an arbitrary absolute path that skill_view() refuses to load.
+    for root in trusted_roots:
+        try:
+            return str(identifier_path.relative_to(root))
+        except ValueError:
+            continue
+
+    try:
+        return str(identifier_path.resolve().relative_to(primary_root.resolve()))
+    except Exception:
+        logger.debug(
+            "Skill identifier %r is an absolute path outside trusted skills "
+            "roots — passing through unchanged (skill_view will reject it)",
+            raw_identifier,
+        )
+        return raw_identifier
+
+
+def _resolve_for_skill_ownership(path) -> Path:
+    path_obj = path if isinstance(path, Path) else Path(str(path))
+    try:
+        return path_obj.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return path_obj.expanduser().absolute()
+
+
+def is_external_skill_path(path) -> bool:
+    """Return True when ``path`` lives under a configured external skills dir.
+
+    ``skills.external_dirs`` are externally owned: Hermes can discover and view
+    their skills, and foreground user-directed tool calls may still edit them,
+    but autonomous lifecycle maintenance must treat them as read-only. This
+    helper centralizes the ownership boundary so curator/reporting/tool paths do
+    not each need to re-interpret the config.
+    """
+    candidate = _resolve_for_skill_ownership(path)
+    for root in get_external_skills_dirs():
+        resolved_root = _resolve_for_skill_ownership(root)
+        try:
+            candidate.relative_to(resolved_root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 # ── Condition extraction ──────────────────────────────────────────────────
@@ -742,8 +791,9 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     ``SKILL.md`` files, but they are progressive-disclosure data loaded through
     ``skill_view(..., file_path=...)`` rather than active skill roots.
     """
-    matches = []
-    for root, dirs, files in os.walk(skills_dir, followlinks=True):
+    skills_dir_str = str(skills_dir)
+    matches: list[str] = []
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
         has_skill_md = "SKILL.md" in files
         dirs[:] = [
             d
@@ -752,9 +802,9 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:
-            matches.append(Path(root) / filename)
-    for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
-        yield path
+            matches.append(os.path.join(root, filename))
+    for path in sorted(matches):
+        yield Path(path)
 
 
 # ── Namespace helpers for plugin-provided skills ───────────────────────────

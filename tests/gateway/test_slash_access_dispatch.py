@@ -315,6 +315,74 @@ async def test_plugin_registered_command_is_gated(monkeypatch):
     assert "/myplugin is admin-only here" in result
 
 
+@pytest.mark.asyncio
+async def test_non_admin_denied_for_unlisted_quick_command_exec():
+    """A non-admin must not reach the quick_commands exec sink for a command
+    that isn't in user_allowed_commands. Regression for #44727 — quick
+    commands are never in the gateway registry, so the early gate skips them;
+    the sink gate must catch them."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    runner.config.quick_commands = {
+        "limits": {"type": "exec", "command": "printf quick-command-bypass-confirmed"}
+    }
+
+    result = await runner._handle_message(
+        _make_event("/limits", _make_source(user_id="999"))
+    )
+
+    assert result is not None
+    assert "⛔" in result
+    assert "/limits is admin-only here" in result
+    assert "quick-command-bypass-confirmed" not in result
+
+
+@pytest.mark.asyncio
+async def test_listed_quick_command_runs_for_non_admin():
+    """When the operator lists the quick command in user_allowed_commands, a
+    non-admin can run it — the gate must allow, not blanket-deny."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["limits"],
+        }
+    )
+    runner.config.quick_commands = {
+        "limits": {"type": "exec", "command": "printf quick-command-allowed"}
+    }
+
+    result = await runner._handle_message(
+        _make_event("/limits", _make_source(user_id="999"))
+    )
+
+    assert result == "quick-command-allowed"
+
+
+@pytest.mark.asyncio
+async def test_admin_runs_quick_command_when_gating_enabled():
+    """An admin runs the quick command even under an enabled gate with an
+    empty user_allowed_commands list."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    runner.config.quick_commands = {
+        "limits": {"type": "exec", "command": "printf quick-command-admin"}
+    }
+
+    result = await runner._handle_message(
+        _make_event("/limits", _make_source(user_id="111"))
+    )
+
+    assert result == "quick-command-admin"
+
+
 # ---------------------------------------------------------------------------
 # Running-agent fast-path gating — admin/user split must hold even when an
 # agent is already running. The fast-path block in _handle_message dispatches
@@ -390,6 +458,91 @@ async def test_running_agent_fastpath_status_always_works():
     result = await runner._handle_message(_make_event("/status", src))
     assert result == "status-handled"
     assert "⛔" not in (result or "")
+
+
+@pytest.mark.asyncio
+async def test_running_agent_fastpath_dispatches_plugin_command(monkeypatch):
+    """A recognized plugin command executes instead of interrupting the run."""
+    runner = _make_runner()
+    src = _make_source(user_id="111")
+    sk = build_session_key(src)
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
+    runner._running_agents_ts[sk] = 0
+
+    from hermes_cli import plugins as plugins_module
+
+    handler = AsyncMock(return_value="plugin-handled")
+    monkeypatch.setattr(
+        plugins_module,
+        "get_plugin_commands",
+        lambda: {
+            "pieverse-byok": {
+                "handler": handler,
+                "description": "Pieverse BYOK",
+                "args_hint": "[key]",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        plugins_module,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "pieverse-byok" else None,
+    )
+
+    result = await runner._handle_message(
+        _make_event("/pieverse-byok test-key", src)
+    )
+
+    assert result == "plugin-handled"
+    handler.assert_awaited_once_with("test-key")
+    running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_running_agent_fastpath_gates_plugin_command(monkeypatch):
+    """Plugin dispatch in the running path keeps slash access enforcement."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    src = _make_source(user_id="999")
+    sk = build_session_key(src)
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
+    runner._running_agents_ts[sk] = 0
+
+    from hermes_cli import plugins as plugins_module
+
+    handler = AsyncMock(return_value="must-not-run")
+    monkeypatch.setattr(
+        plugins_module,
+        "get_plugin_commands",
+        lambda: {
+            "pieverse-byok": {
+                "handler": handler,
+                "description": "Pieverse BYOK",
+                "args_hint": "[key]",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        plugins_module,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "pieverse-byok" else None,
+    )
+
+    result = await runner._handle_message(
+        _make_event("/pieverse-byok test-key", src)
+    )
+
+    assert result is not None
+    assert "⛔" in result
+    assert "/pieverse-byok is admin-only here" in result
+    handler.assert_not_awaited()
+    running_agent.interrupt.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
