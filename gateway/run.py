@@ -9228,10 +9228,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
                 ACTIVE_SESSION_BYPASS_COMMANDS as _DEDICATED_HANDLERS,
+                resolve_gateway_command_token as _resolve_gateway_token_inner,
                 resolve_command as _resolve_cmd_inner,
             )
             _evt_cmd = event.get_command()
-            _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+            _gateway_token_inner = (
+                _resolve_gateway_token_inner(_evt_cmd) if _evt_cmd else None
+            )
+            _cmd_def_inner = (
+                _resolve_cmd_inner(_gateway_token_inner)
+                if _gateway_token_inner
+                else None
+            )
+            _plugin_cmd_inner = (
+                _gateway_token_inner
+                if _gateway_token_inner and _cmd_def_inner is None
+                else None
+            )
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -9239,10 +9252,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /status above is intentionally pre-gate so users always see
             # session state. /help and /whoami fall under the always-allowed
             # floor inside _check_slash_access.
-            if _evt_cmd and _cmd_def_inner is not None:
-                _denied = self._check_slash_access(source, _cmd_def_inner.name)
+            _access_cmd_inner = (
+                _cmd_def_inner.name if _cmd_def_inner else _plugin_cmd_inner
+            )
+            if _access_cmd_inner:
+                _denied = self._check_slash_access(source, _access_cmd_inner)
                 if _denied is not None:
                     return _denied
+
+            # Plugin commands bypass the adapter's active-session guard just
+            # like built-ins, so they must also execute in the runner's
+            # running-agent path. Without this branch they fall through to the
+            # generic busy-input handling and may interrupt the current agent.
+            if _plugin_cmd_inner:
+                try:
+                    from hermes_cli.plugins import get_plugin_command_handler
+
+                    plugin_handler = get_plugin_command_handler(_plugin_cmd_inner)
+                    if plugin_handler:
+                        result = plugin_handler(event.get_command_args().strip())
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        return str(result) if result else None
+                except Exception as exc:
+                    logger.warning(
+                        "Plugin command /%s failed during active session: %s",
+                        _plugin_cmd_inner,
+                        exc,
+                    )
+                return f"Plugin command `/{_plugin_cmd_inner}` is unavailable."
 
             # Telegram sends /start for bot launches/deep-links. Treat it as a
             # platform ping, not a user command: no help dump, no agent

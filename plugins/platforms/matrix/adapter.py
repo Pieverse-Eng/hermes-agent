@@ -166,14 +166,14 @@ def _resolve_matrix_bang_command(name: str) -> str | None:
         candidates.append(hyphenated)
 
     try:
-        from hermes_cli.commands import is_gateway_known_command
+        from hermes_cli.commands import resolve_gateway_command_token
 
-        for candidate in candidates:
-            if is_gateway_known_command(candidate):
-                return candidate
+        resolved = resolve_gateway_command_token(name)
+        if resolved is not None:
+            return resolved
     except Exception:
         logger.debug(
-            "Matrix: is_gateway_known_command failed for %r", name, exc_info=True
+            "Matrix: gateway command resolution failed for %r", name, exc_info=True
         )
 
     try:

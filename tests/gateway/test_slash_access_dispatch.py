@@ -460,6 +460,91 @@ async def test_running_agent_fastpath_status_always_works():
     assert "⛔" not in (result or "")
 
 
+@pytest.mark.asyncio
+async def test_running_agent_fastpath_dispatches_plugin_command(monkeypatch):
+    """A recognized plugin command executes instead of interrupting the run."""
+    runner = _make_runner()
+    src = _make_source(user_id="111")
+    sk = build_session_key(src)
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
+    runner._running_agents_ts[sk] = 0
+
+    from hermes_cli import plugins as plugins_module
+
+    handler = AsyncMock(return_value="plugin-handled")
+    monkeypatch.setattr(
+        plugins_module,
+        "get_plugin_commands",
+        lambda: {
+            "pieverse-byok": {
+                "handler": handler,
+                "description": "Pieverse BYOK",
+                "args_hint": "[key]",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        plugins_module,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "pieverse-byok" else None,
+    )
+
+    result = await runner._handle_message(
+        _make_event("/pieverse-byok test-key", src)
+    )
+
+    assert result == "plugin-handled"
+    handler.assert_awaited_once_with("test-key")
+    running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_running_agent_fastpath_gates_plugin_command(monkeypatch):
+    """Plugin dispatch in the running path keeps slash access enforcement."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    src = _make_source(user_id="999")
+    sk = build_session_key(src)
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
+    runner._running_agents_ts[sk] = 0
+
+    from hermes_cli import plugins as plugins_module
+
+    handler = AsyncMock(return_value="must-not-run")
+    monkeypatch.setattr(
+        plugins_module,
+        "get_plugin_commands",
+        lambda: {
+            "pieverse-byok": {
+                "handler": handler,
+                "description": "Pieverse BYOK",
+                "args_hint": "[key]",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        plugins_module,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "pieverse-byok" else None,
+    )
+
+    result = await runner._handle_message(
+        _make_event("/pieverse-byok test-key", src)
+    )
+
+    assert result is not None
+    assert "⛔" in result
+    assert "/pieverse-byok is admin-only here" in result
+    handler.assert_not_awaited()
+    running_agent.interrupt.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution — /h aliases to /help; the gate must canonicalize before
 # checking access. /hist (history alias) is a real one to exercise.

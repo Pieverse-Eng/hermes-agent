@@ -2217,6 +2217,12 @@ class TestPluginCommandEnumeration:
         assert is_gateway_known_command("metricas") is True
         assert is_gateway_known_command("definitely-not-registered") is False
 
+    def test_gateway_command_token_returns_dispatchable_underscore_form(self):
+        """Telegram spelling resolves to the registered hyphenated token."""
+        from hermes_cli.commands import resolve_gateway_command_token
+
+        assert resolve_gateway_command_token("set_home") == "set-home"
+
     def test_should_bypass_active_session_recognizes_plugin_commands(self, monkeypatch):
         """Plugin slash commands must bypass the adapter active-session queue."""
         from hermes_cli.commands import should_bypass_active_session

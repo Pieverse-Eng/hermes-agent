@@ -340,8 +340,14 @@ GATEWAY_KNOWN_COMMANDS: frozenset[str] = frozenset(
 )
 
 
-def is_gateway_known_command(name: str | None) -> bool:
-    """Return True if ``name`` resolves to a gateway-dispatchable slash command.
+def resolve_gateway_command_token(name: str | None) -> str | None:
+    """Return the registered token that ``name`` resolves to in the gateway.
+
+    Exact names win.  When no exact command exists, the underscored form used
+    by Telegram menus is retried with underscores replaced by hyphens.  The
+    returned token is deliberately not canonicalized through ``CommandDef``:
+    callers such as the Matrix ``!command`` bridge need the exact dispatchable
+    spelling while preserving built-in aliases.
 
     This covers both built-in commands (``GATEWAY_KNOWN_COMMANDS`` derived
     from ``COMMAND_REGISTRY``) and plugin-registered commands, which are
@@ -351,14 +357,32 @@ def is_gateway_known_command(name: str | None) -> bool:
     events as built-ins.
     """
     if not name:
-        return False
-    name = name.lower().lstrip("/").replace("_", "-")
-    if name in GATEWAY_KNOWN_COMMANDS:
-        return True
-    for plugin_name, _description, _args_hint in _iter_plugin_command_entries():
-        if plugin_name == name:
-            return True
-    return False
+        return None
+    raw_name = name.lower().lstrip("/")
+    candidates = [raw_name]
+    hyphenated = raw_name.replace("_", "-")
+    if hyphenated != raw_name:
+        candidates.append(hyphenated)
+
+    for candidate in candidates:
+        if candidate in GATEWAY_KNOWN_COMMANDS:
+            return candidate
+
+    # Keep built-in lookups on the cheap path. Plugin discovery can scan the
+    # filesystem, so only pay for it after no built-in token resolved.
+    plugin_names = {
+        plugin_name
+        for plugin_name, _description, _args_hint in _iter_plugin_command_entries()
+    }
+    for candidate in candidates:
+        if candidate in plugin_names:
+            return candidate
+    return None
+
+
+def is_gateway_known_command(name: str | None) -> bool:
+    """Return True if ``name`` resolves to a gateway-dispatchable command."""
+    return resolve_gateway_command_token(name) is not None
 
 
 # Commands with explicit Level-2 running-agent handlers in gateway/run.py.
