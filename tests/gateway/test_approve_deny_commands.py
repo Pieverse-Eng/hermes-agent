@@ -76,6 +76,12 @@ def _clear_approval_state():
     mod._pending.clear()
 
 
+@pytest.fixture(autouse=True)
+def _use_manual_approval_mode(monkeypatch):
+    """Exercise gateway approve/deny flows without invoking the smart-approval LLM."""
+    monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "manual")
+
+
 # ------------------------------------------------------------------
 # Blocking gateway approval infrastructure (tools/approval.py)
 # ------------------------------------------------------------------
