@@ -124,6 +124,7 @@ async def test_internal_runtime_sync_writes_managed_files(tmp_path, monkeypatch)
                     ".env": "API_SERVER_KEY=sk-test\n",
                     "SOUL.md": "You are Purr-Fect Claw.\n",
                     "platform-builtin-skills.env": "PLATFORM_BUILTIN_SKILL_SLUGS='instance-billing'\n",
+                    "merchant.env": "MERCHANT_ENABLED='true'\n",
                 }
             },
         )
@@ -136,6 +137,7 @@ async def test_internal_runtime_sync_writes_managed_files(tmp_path, monkeypatch)
         ".env",
         "SOUL.md",
         "platform-builtin-skills.env",
+        "merchant.env",
     }
     assert data["reloadRecommended"] is True
     assert (managed / "config.yaml").read_text(encoding="utf-8") == "model: test-model\n"
@@ -144,6 +146,7 @@ async def test_internal_runtime_sync_writes_managed_files(tmp_path, monkeypatch)
     assert (
         home / "platform-builtin-skills.env"
     ).read_text(encoding="utf-8") == "PLATFORM_BUILTIN_SKILL_SLUGS='instance-billing'\n"
+    assert (home / "merchant.env").read_text(encoding="utf-8") == "MERCHANT_ENABLED='true'\n"
 
 
 @pytest.mark.asyncio

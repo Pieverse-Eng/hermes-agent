@@ -101,6 +101,7 @@ PLATFORM_RUNTIME_SYNC_FILES = frozenset({
     ".env",
     "SOUL.md",
     "platform-builtin-skills.env",
+    "merchant.env",
 })
 
 
