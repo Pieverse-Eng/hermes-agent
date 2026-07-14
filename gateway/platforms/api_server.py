@@ -96,6 +96,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+PLATFORM_RUNTIME_SYNC_FILES = frozenset({"config.yaml", ".env", "SOUL.md"})
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -896,6 +897,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Optional GatewayRunner back-reference injected by gateway.run.  The
+        # internal platform control plane uses it to access the live pairing
+        # store, runtime status, and per-session agent cache without shelling
+        # into the container.
+        self.gateway_runner: Optional[Any] = None
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -1456,6 +1462,492 @@ class APIServerAdapter(BasePlatformAdapter):
             "exit_reason": runtime.get("exit_reason"),
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
+        })
+
+    # ------------------------------------------------------------------
+    # Internal platform control plane
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _platform_process_marker() -> str:
+        """Return a stable marker for this gateway process instance.
+
+        Platform code historically used ``pid:starttime`` from ``/proc`` via
+        kubectl exec.  Keep the same shape on Linux so callers can detect a
+        real gateway restart without gaining shell access.  Non-Linux hosts
+        fall back to a pid-only marker; these internal routes are primarily for
+        hosted Linux containers.
+        """
+        pid = os.getpid()
+        try:
+            proc_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            fields = proc_stat.strip().rsplit(") ", 1)[1].split()
+            start_time = fields[19]
+            return f"{pid}:{start_time}"
+        except Exception:
+            return f"{pid}:unknown"
+
+    def _platform_pairing_store(self):
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "pairing_store", None)
+        if store is not None:
+            return store
+        from gateway.pairing import PairingStore
+
+        return PairingStore()
+
+    @staticmethod
+    def _platform_runtime_target(filename: str) -> tuple[Path, int]:
+        """Resolve a supported platform-managed runtime file target."""
+        name = str(filename or "").strip()
+        if name not in PLATFORM_RUNTIME_SYNC_FILES:
+            raise ValueError(f"Unsupported runtime file: {name!r}")
+
+        from hermes_constants import get_hermes_home
+
+        home = Path(os.environ.get("HERMES_HOME") or get_hermes_home())
+        if name == "config.yaml":
+            managed_dir = Path(
+                os.environ.get("PLATFORM_MANAGED_DIR")
+                or os.environ.get("HERMES_MANAGED_DIR")
+                or str(home / ".platform")
+            )
+            return managed_dir / "config.yaml", 0o644
+        mode = 0o600 if name == ".env" else 0o644
+        return home / name, mode
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str, mode: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            tmp.write_text(content, encoding="utf-8")
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _runtime_sync_files_from_body(body: Dict[str, Any]) -> Dict[str, Any]:
+        files: Dict[str, Any] = {}
+        raw_files = body.get("files")
+        if isinstance(raw_files, dict):
+            for name, content in raw_files.items():
+                files[str(name)] = content
+
+        aliases = {
+            "configYaml": "config.yaml",
+            "config_yaml": "config.yaml",
+            "config": "config.yaml",
+            "env": ".env",
+            "dotEnv": ".env",
+            "dot_env": ".env",
+            "soul": "SOUL.md",
+            "soulMd": "SOUL.md",
+            "soul_md": "SOUL.md",
+        }
+        for key, filename in aliases.items():
+            value = body.get(key)
+            if isinstance(value, str):
+                files[filename] = value
+
+        return files
+
+    @staticmethod
+    def _approved_users_from_body(body: Dict[str, Any]) -> list:
+        raw = body.get("users")
+        if raw is None:
+            raw = body.get("userIds")
+        if raw is None:
+            raw = body.get("user_ids")
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list):
+            raise ValueError("users must be a list")
+        return raw
+
+    @staticmethod
+    def _platform_from_body(body: Dict[str, Any], default: str = "telegram") -> Platform:
+        value = str(body.get("platform") or default).strip().lower()
+        if not value:
+            value = default
+        return Platform(value)
+
+    @staticmethod
+    def _string_field(body: Dict[str, Any], *names: str) -> str:
+        for name in names:
+            value = body.get(name)
+            if value is not None:
+                return str(value).strip()
+        return ""
+
+    def _source_from_prewarm_body(self, body: Dict[str, Any]):
+        from gateway.session import SessionSource
+
+        platform = self._platform_from_body(body, "telegram")
+        user_id = self._string_field(body, "userId", "user_id", "user")
+        chat_id = self._string_field(body, "chatId", "chat_id", "chat") or user_id
+        if not chat_id:
+            raise ValueError("chatId or userId is required")
+        return SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_name=self._string_field(body, "chatName", "chat_name") or None,
+            chat_type=self._string_field(body, "chatType", "chat_type") or "dm",
+            user_id=user_id or None,
+            user_name=self._string_field(body, "userName", "user_name") or None,
+            user_id_alt=self._string_field(body, "userIdAlt", "user_id_alt") or None,
+            thread_id=self._string_field(body, "threadId", "thread_id") or None,
+            parent_chat_id=self._string_field(body, "parentChatId", "parent_chat_id") or None,
+            profile=self._string_field(body, "profile") or None,
+        )
+
+    def _prewarm_gateway_session_sync(
+        self,
+        source: Any,
+        *,
+        session_key_override: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            raise RuntimeError("gateway runner is not attached")
+
+        from run_agent import AIAgent
+        from gateway.run import _current_max_iterations, _load_gateway_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        session_store = getattr(runner, "session_store", None)
+        if session_store is not None:
+            session_entry = session_store.get_or_create_session(source)
+            derived_session_key = getattr(session_entry, "session_key", None)
+            derived_session_id = getattr(session_entry, "session_id", None)
+            if session_key_override and session_key_override != derived_session_key:
+                raise ValueError("sessionKey does not match the supplied source")
+            if session_id and derived_session_id and session_id != derived_session_id:
+                raise ValueError("sessionId does not match the supplied source")
+            session_key = session_key_override or derived_session_key
+            session_id = session_id or derived_session_id
+        else:
+            session_key = session_key_override or runner._session_key_for_source(source)
+
+        platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
+        if not session_id:
+            return {
+                "sessionKey": session_key,
+                "platform": platform_key,
+                "cacheHit": False,
+                "cached": False,
+                "skipped": True,
+                "reason": "session store unavailable; sessionId is required for safe prewarm",
+            }
+
+        user_config = _load_gateway_config()
+
+        combined_ephemeral = ""
+        try:
+            cfg_channel_prompt = runner._get_system_prompt_for_channel(
+                source.platform,
+                source.chat_id or "",
+                thread_id=getattr(source, "thread_id", None),
+                parent_id=getattr(source, "parent_chat_id", None),
+            )
+            if cfg_channel_prompt:
+                combined_ephemeral = str(cfg_channel_prompt).strip()
+        except Exception:
+            logger.debug("platform prewarm could not resolve channel prompt", exc_info=True)
+
+        model, runtime_kwargs = runner._resolve_session_agent_runtime(
+            source=source,
+            session_key=session_key,
+            user_config=user_config,
+        )
+        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        agent_cfg = user_config.get("agent") or {}
+        disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+        reasoning_config = runner._resolve_session_reasoning_config(
+            source=source,
+            session_key=session_key,
+        )
+        runner._reasoning_config = reasoning_config
+        runner._service_tier = runner._load_service_tier()
+        turn_route = runner._resolve_turn_agent_config("", model, runtime_kwargs)
+        signature = runner._agent_config_signature(
+            turn_route["model"],
+            turn_route["runtime"],
+            enabled_toolsets,
+            combined_ephemeral,
+            cache_keys=runner._extract_cache_busting_config(user_config),
+            user_id=getattr(source, "user_id", None),
+            user_id_alt=getattr(source, "user_id_alt", None),
+        )
+
+        cache = getattr(runner, "_agent_cache", None)
+        cache_lock = getattr(runner, "_agent_cache_lock", None)
+        if cache is not None and cache_lock is not None:
+            with cache_lock:
+                cached = cache.get(session_key)
+                if cached and len(cached) > 1 and cached[1] == signature:
+                    if hasattr(cache, "move_to_end"):
+                        try:
+                            cache.move_to_end(session_key)
+                        except KeyError:
+                            pass
+                    return {
+                        "sessionKey": session_key,
+                        "sessionId": cached[3] if len(cached) > 3 else session_id,
+                        "platform": platform_key,
+                        "cacheHit": True,
+                        "cached": True,
+                        "model": turn_route["model"],
+                        "toolCount": len(getattr(cached[0], "tools", []) or []),
+                    }
+                if cached:
+                    return {
+                        "sessionKey": session_key,
+                        "sessionId": session_id,
+                        "platform": platform_key,
+                        "cacheHit": False,
+                        "cached": False,
+                        "skipped": True,
+                        "reason": "existing cached agent has a different signature",
+                    }
+
+        current_message_count = None
+        session_db = getattr(runner, "_session_db", None)
+        if session_db is not None and session_id:
+            try:
+                db = getattr(session_db, "_db", session_db)
+                if hasattr(db, "get_session"):
+                    row = db.get_session(session_id)
+                    if row:
+                        current_message_count = row.get("message_count", 0)
+            except Exception:
+                logger.debug("platform prewarm message-count snapshot failed", exc_info=True)
+
+        pr = getattr(runner, "_provider_routing", {}) or {}
+        agent = AIAgent(
+            model=turn_route["model"],
+            **turn_route["runtime"],
+            max_iterations=_current_max_iterations(),
+            quiet_mode=True,
+            verbose_logging=False,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            ephemeral_system_prompt=combined_ephemeral or None,
+            prefill_messages=getattr(runner, "_prefill_messages", None) or None,
+            reasoning_config=reasoning_config,
+            service_tier=getattr(runner, "_service_tier", None),
+            request_overrides=turn_route.get("request_overrides"),
+            providers_allowed=pr.get("only"),
+            providers_ignored=pr.get("ignore"),
+            providers_order=pr.get("order"),
+            provider_sort=pr.get("sort"),
+            provider_require_parameters=pr.get("require_parameters", False),
+            provider_data_collection=pr.get("data_collection"),
+            session_id=session_id,
+            platform=platform_key,
+            user_id=getattr(source, "user_id", None),
+            user_id_alt=getattr(source, "user_id_alt", None),
+            user_name=getattr(source, "user_name", None),
+            chat_id=getattr(source, "chat_id", None),
+            chat_name=getattr(source, "chat_name", None),
+            chat_type=getattr(source, "chat_type", None),
+            thread_id=getattr(source, "thread_id", None),
+            gateway_session_key=session_key,
+            session_db=getattr(getattr(runner, "_session_db", None), "_db", getattr(runner, "_session_db", None)),
+            fallback_model=runner._refresh_fallback_model(),
+        )
+        if getattr(agent, "_cached_system_prompt", None) is None:
+            try:
+                agent._cached_system_prompt = agent._build_system_prompt(None)
+            except Exception:
+                logger.debug("platform prewarm system-prompt build failed", exc_info=True)
+
+        cached = False
+        raced = False
+        if cache is not None and cache_lock is not None:
+            with cache_lock:
+                existing = cache.get(session_key)
+                if existing and len(existing) > 1 and existing[1] == signature:
+                    raced = True
+                    if hasattr(cache, "move_to_end"):
+                        try:
+                            cache.move_to_end(session_key)
+                        except KeyError:
+                            pass
+                elif existing:
+                    raced = True
+                else:
+                    cache[session_key] = (agent, signature, current_message_count, session_id)
+                    try:
+                        runner._enforce_agent_cache_cap()
+                    except Exception:
+                        logger.debug("platform prewarm cache cap enforcement failed", exc_info=True)
+                    cached = True
+
+        if raced:
+            release = getattr(runner, "_release_evicted_agent_soft", None)
+            if callable(release):
+                try:
+                    release(agent)
+                except Exception:
+                    logger.debug("platform prewarm cleanup of raced agent failed", exc_info=True)
+
+        return {
+            "sessionKey": session_key,
+            "sessionId": session_id,
+            "platform": platform_key,
+            "cacheHit": False,
+            "cached": cached,
+            "skipped": raced and not cached,
+            "reason": "cache filled concurrently" if raced and not cached else None,
+            "model": turn_route["model"],
+            "toolCount": len(getattr(agent, "tools", []) or []),
+            "systemPromptWarmed": bool(getattr(agent, "_cached_system_prompt", None)),
+        }
+
+    async def _handle_internal_gateway_status(self, request: "web.Request") -> "web.Response":
+        """GET /internal/platform/gateway/status — platform control-plane status."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from gateway.status import read_runtime_status
+
+        runtime = read_runtime_status() or {}
+        runner = getattr(self, "gateway_runner", None)
+        cache = getattr(runner, "_agent_cache", None)
+        return web.json_response({
+            "ok": True,
+            "platform": "hermes-agent",
+            "version": _hermes_version(),
+            "pid": os.getpid(),
+            "processMarker": self._platform_process_marker(),
+            "gatewayState": runtime.get("gateway_state"),
+            "platforms": runtime.get("platforms", {}),
+            "updatedAt": runtime.get("updated_at"),
+            "agentCacheSize": len(cache) if cache is not None else None,
+        })
+
+    async def _handle_internal_runtime_sync(self, request: "web.Request") -> "web.Response":
+        """POST /internal/platform/runtime-sync — write platform-managed runtime files."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        files = self._runtime_sync_files_from_body(body)
+        targets = []
+        written = []
+        try:
+            for filename, content in files.items():
+                if not isinstance(content, str):
+                    return web.json_response(_openai_error(f"{filename} content must be a string"), status=400)
+                path, mode = self._platform_runtime_target(filename)
+                targets.append((filename, path, mode, content))
+            for filename, path, mode, content in targets:
+                self._atomic_write_text(path, content, mode)
+                written.append(filename)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception:
+            logger.exception("internal platform runtime-sync failed")
+            return web.json_response(_openai_error("runtime sync failed", err_type="server_error"), status=500)
+
+        return web.json_response({
+            "ok": True,
+            "written": written,
+            "reloadRecommended": bool(written),
+        })
+
+    async def _handle_internal_telegram_approved_users(self, request: "web.Request") -> "web.Response":
+        """GET/POST /internal/platform/telegram/approved-users."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        store = self._platform_pairing_store()
+        if request.method == "GET":
+            return web.json_response({
+                "ok": True,
+                "platform": "telegram",
+                "users": store.list_approved("telegram"),
+            })
+
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        try:
+            users = store.replace_approved("telegram", self._approved_users_from_body(body))
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception:
+            logger.exception("internal platform approved-users sync failed")
+            return web.json_response(_openai_error("approved-users sync failed", err_type="server_error"), status=500)
+        return web.json_response({"ok": True, "platform": "telegram", "users": users})
+
+    async def _handle_internal_gateway_reload(self, request: "web.Request") -> "web.Response":
+        """POST /internal/platform/gateway/reload — request a gateway restart/reload."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None or not hasattr(runner, "request_restart"):
+            return web.json_response(_openai_error("gateway runner is not attached", err_type="server_error"), status=503)
+        started = bool(runner.request_restart(detached=False, via_service=False))
+        return web.json_response({
+            "ok": True,
+            "accepted": started,
+            "processMarker": self._platform_process_marker(),
+        }, status=202 if started else 200)
+
+    async def _handle_internal_gateway_prewarm_session(self, request: "web.Request") -> "web.Response":
+        """POST /internal/platform/gateway/prewarm-session — warm a gateway session agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        try:
+            source = self._source_from_prewarm_body(body)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+
+        session_key = self._string_field(body, "sessionKey", "session_key") or None
+        session_id = self._string_field(body, "sessionId", "session_id") or None
+        started = time.time()
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: self._prewarm_gateway_session_sync(
+                    source,
+                    session_key_override=session_key,
+                    session_id=session_id,
+                ),
+            )
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            logger.warning("internal platform gateway prewarm failed: %s", exc, exc_info=True)
+            return web.json_response(
+                _openai_error(f"gateway prewarm failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+        result = {k: v for k, v in result.items() if v is not None}
+        return web.json_response({
+            "ok": True,
+            "durationMs": int((time.time() - started) * 1000),
+            **result,
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
@@ -4843,6 +5335,12 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/internal/platform/gateway/status", self._handle_internal_gateway_status)
+            self._app.router.add_post("/internal/platform/runtime-sync", self._handle_internal_runtime_sync)
+            self._app.router.add_get("/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users)
+            self._app.router.add_post("/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users)
+            self._app.router.add_post("/internal/platform/gateway/reload", self._handle_internal_gateway_reload)
+            self._app.router.add_post("/internal/platform/gateway/prewarm-session", self._handle_internal_gateway_prewarm_session)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)

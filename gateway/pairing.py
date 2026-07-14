@@ -361,6 +361,71 @@ class PairingStore:
                 results.append({"platform": p, "user_id": uid, **info})
         return results
 
+    def replace_approved(self, platform: str, users: list) -> list:
+        """Atomically replace one platform's approved-user store.
+
+        This is the control-plane counterpart to ``approve_code()``.  It updates
+        the pairing grant file Hermes reads on every authorization check, but it
+        deliberately does not mutate static ``*_ALLOWED_USERS`` environment
+        allowlists.  Hosted platforms can therefore project their DB-owned
+        allowlist into a live gateway process without rewriting operator-owned
+        env config.
+
+        ``users`` accepts either strings or dictionaries with ``user_id`` /
+        ``userId`` plus optional ``user_name`` / ``userName``.  Existing
+        metadata is preserved for users that remain approved.
+        """
+        normalized_platform = str(platform or "").strip().lower()
+        if not normalized_platform:
+            raise ValueError("platform is required")
+        if not isinstance(users, list):
+            raise TypeError("users must be a list")
+
+        with self._lock:
+            existing = self._load_json(self._approved_path(normalized_platform))
+            if not isinstance(existing, dict):
+                existing = {}
+
+            desired: dict[str, dict] = {}
+            now = time.time()
+            for item in users:
+                user_name = ""
+                if isinstance(item, str):
+                    raw_user_id = item
+                elif isinstance(item, dict):
+                    raw_user_id = item.get("user_id") or item.get("userId") or item.get("id")
+                    raw_name = item.get("user_name") or item.get("userName") or item.get("name") or ""
+                    user_name = str(raw_name)
+                else:
+                    continue
+
+                normalized_user_id = self._normalize_user_id(normalized_platform, raw_user_id)
+                if not normalized_user_id:
+                    continue
+
+                existing_key = next(
+                    (
+                        approved_user_id
+                        for approved_user_id in existing
+                        if self._user_ids_match(normalized_platform, approved_user_id, normalized_user_id)
+                    ),
+                    None,
+                )
+                previous = existing.get(existing_key, {}) if existing_key else {}
+                if not isinstance(previous, dict):
+                    previous = {}
+                desired[normalized_user_id] = {
+                    "user_name": user_name or previous.get("user_name", ""),
+                    "approved_at": previous.get("approved_at", now),
+                }
+
+            self._save_json(self._approved_path(normalized_platform), desired)
+
+        return [
+            {"platform": normalized_platform, "user_id": uid, **info}
+            for uid, info in desired.items()
+        ]
+
     def _approve_user(self, platform: str, user_id: str, user_name: str = "") -> None:
         """Add a user to the approved list. Must be called under self._lock."""
         approved = self._load_json(self._approved_path(platform))
