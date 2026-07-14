@@ -26,6 +26,122 @@ def _make_runner():
     return runner
 
 
+class TestTelegramDmPrewarmTemplate:
+    """Telegram DM topic sessions may reuse only the threadless prewarm prompt."""
+
+    def test_topic_reads_threadless_platform_prewarm_prompt_without_merging_sessions(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        class FakeAgent:
+            _cached_system_prompt = "warm system prompt"
+
+        runner = _make_runner()
+        threadless_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+            user_id="42",
+        )
+        topic_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+            user_id="42",
+            thread_id="1001",
+        )
+        threadless_key = runner._session_key_for_source(threadless_source)
+        topic_key = runner._session_key_for_source(topic_source)
+
+        assert threadless_key == "agent:main:telegram:dm:42"
+        assert topic_key == "agent:main:telegram:dm:42:1001"
+        assert topic_key != threadless_key
+
+        with runner._agent_cache_lock:
+            runner._agent_cache[threadless_key] = (
+                FakeAgent(),
+                "full-threadless-sig",
+                0,
+                "threadless-session-id",
+                {
+                    "platform_prewarm_template": True,
+                    "template_kind": "telegram_dm_threadless",
+                    "prompt_template_signature": "template-sig",
+                },
+            )
+
+        assert runner._telegram_dm_threadless_prewarm_prompt_for_source(
+            topic_source, "template-sig",
+        ) == ("warm system prompt", threadless_key)
+
+    def test_topic_rejects_non_template_or_non_empty_threadless_cache(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        class FakeAgent:
+            _cached_system_prompt = "warm system prompt"
+
+        runner = _make_runner()
+        threadless_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+            user_id="42",
+        )
+        topic_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+            user_id="42",
+            thread_id="1001",
+        )
+        threadless_key = runner._session_key_for_source(threadless_source)
+
+        with runner._agent_cache_lock:
+            runner._agent_cache[threadless_key] = (
+                FakeAgent(),
+                "sig",
+                0,
+                "threadless-session-id",
+                None,
+            )
+        assert runner._telegram_dm_threadless_prewarm_prompt_for_source(
+            topic_source, "sig",
+        ) is None
+
+        with runner._agent_cache_lock:
+            runner._agent_cache[threadless_key] = (
+                FakeAgent(),
+                "sig",
+                2,
+                "threadless-session-id",
+                {
+                    "platform_prewarm_template": True,
+                    "template_kind": "telegram_dm_threadless",
+                    "prompt_template_signature": "template-sig",
+                },
+            )
+        assert runner._telegram_dm_threadless_prewarm_prompt_for_source(
+            topic_source, "template-sig",
+        ) is None
+
+        with runner._agent_cache_lock:
+            runner._agent_cache[threadless_key] = (
+                FakeAgent(),
+                "full-threadless-sig",
+                0,
+                "threadless-session-id",
+                {
+                    "platform_prewarm_template": True,
+                    "template_kind": "telegram_dm_threadless",
+                    "prompt_template_signature": "old-template-sig",
+                },
+            )
+        assert runner._telegram_dm_threadless_prewarm_prompt_for_source(
+            topic_source, "template-sig",
+        ) is None
+
+
 class TestAgentConfigSignature:
     """Config signature produces stable, distinct keys."""
 
