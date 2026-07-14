@@ -123,6 +123,8 @@ async def test_internal_runtime_sync_writes_managed_files(tmp_path, monkeypatch)
                     "config.yaml": "model: test-model\n",
                     ".env": "API_SERVER_KEY=sk-test\n",
                     "SOUL.md": "You are Purr-Fect Claw.\n",
+                    "platform-builtin-skills.env": "PLATFORM_BUILTIN_SKILL_SLUGS='instance-billing'\n",
+                    "merchant.env": "MERCHANT_ENABLED='true'\n",
                 }
             },
         )
@@ -130,11 +132,21 @@ async def test_internal_runtime_sync_writes_managed_files(tmp_path, monkeypatch)
         data = await resp.json()
 
     assert data["ok"] is True
-    assert set(data["written"]) == {"config.yaml", ".env", "SOUL.md"}
+    assert set(data["written"]) == {
+        "config.yaml",
+        ".env",
+        "SOUL.md",
+        "platform-builtin-skills.env",
+        "merchant.env",
+    }
     assert data["reloadRecommended"] is True
     assert (managed / "config.yaml").read_text(encoding="utf-8") == "model: test-model\n"
     assert (home / ".env").read_text(encoding="utf-8") == "API_SERVER_KEY=sk-test\n"
     assert (home / "SOUL.md").read_text(encoding="utf-8") == "You are Purr-Fect Claw.\n"
+    assert (
+        home / "platform-builtin-skills.env"
+    ).read_text(encoding="utf-8") == "PLATFORM_BUILTIN_SKILL_SLUGS='instance-billing'\n"
+    assert (home / "merchant.env").read_text(encoding="utf-8") == "MERCHANT_ENABLED='true'\n"
 
 
 @pytest.mark.asyncio
@@ -278,4 +290,9 @@ async def test_internal_prewarm_session_populates_gateway_agent_cache(monkeypatc
     assert created[0]["platform"] == "telegram"
     assert created[0]["gateway_session_key"] == "agent:main:telegram:dm:42"
     assert runner._agent_cache["agent:main:telegram:dm:42"][3] == "session-real-1"
+    assert runner._agent_cache["agent:main:telegram:dm:42"][4] == {
+        "platform_prewarm_template": True,
+        "template_kind": "telegram_dm_threadless",
+        "prompt_template_signature": "sig",
+    }
     assert runner.enforced is True

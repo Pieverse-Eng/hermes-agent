@@ -96,7 +96,13 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
-PLATFORM_RUNTIME_SYNC_FILES = frozenset({"config.yaml", ".env", "SOUL.md"})
+PLATFORM_RUNTIME_SYNC_FILES = frozenset({
+    "config.yaml",
+    ".env",
+    "SOUL.md",
+    "platform-builtin-skills.env",
+    "merchant.env",
+})
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1549,6 +1555,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "soul": "SOUL.md",
             "soulMd": "SOUL.md",
             "soul_md": "SOUL.md",
+            "platformBuiltinSkillsEnv": "platform-builtin-skills.env",
+            "platform_builtin_skills_env": "platform-builtin-skills.env",
         }
         for key, filename in aliases.items():
             value = body.get(key)
@@ -1676,12 +1684,22 @@ class APIServerAdapter(BasePlatformAdapter):
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._load_service_tier()
         turn_route = runner._resolve_turn_agent_config("", model, runtime_kwargs)
+        cache_keys = runner._extract_cache_busting_config(user_config)
         signature = runner._agent_config_signature(
             turn_route["model"],
             turn_route["runtime"],
             enabled_toolsets,
             combined_ephemeral,
-            cache_keys=runner._extract_cache_busting_config(user_config),
+            cache_keys=cache_keys,
+            user_id=getattr(source, "user_id", None),
+            user_id_alt=getattr(source, "user_id_alt", None),
+        )
+        prompt_template_signature = runner._agent_config_signature(
+            turn_route["model"],
+            turn_route["runtime"],
+            enabled_toolsets,
+            "",
+            cache_keys=cache_keys,
             user_id=getattr(source, "user_id", None),
             user_id_alt=getattr(source, "user_id_alt", None),
         )
@@ -1783,7 +1801,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 elif existing:
                     raced = True
                 else:
-                    cache[session_key] = (agent, signature, current_message_count, session_id)
+                    cache_entry = (agent, signature, current_message_count, session_id)
+                    if (
+                        platform_key == "telegram"
+                        and getattr(source, "chat_type", None) == "dm"
+                        and not getattr(source, "thread_id", None)
+                    ):
+                        cache_entry = (
+                            *cache_entry,
+                            {
+                                "platform_prewarm_template": True,
+                                "template_kind": "telegram_dm_threadless",
+                                "prompt_template_signature": prompt_template_signature,
+                            },
+                        )
+                    cache[session_key] = cache_entry
                     try:
                         runner._enforce_agent_cache_cap()
                     except Exception:

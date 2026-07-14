@@ -3521,6 +3521,98 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=_profile,
         )
 
+    def _telegram_dm_threadless_prewarm_prompt_for_source(
+        self,
+        source: SessionSource,
+        template_signature: str,
+    ) -> Optional[tuple[str, str]]:
+        """Return a threadless Telegram-DM prewarm prompt for a topic session.
+
+        Platform connect prewarms a threadless DM session before the first
+        Telegram message arrives. Telegram topic-mode DMs then receive the real
+        first message under a distinct ``...:<thread_id>`` session key.  Reusing
+        the prewarmed AIAgent object would merge conversation state, so this
+        helper only copies the already-built system prompt into the fresh topic
+        agent when the threadless cache entry was explicitly created as a
+        platform prewarm template and the non-ephemeral agent config signature
+        still matches.
+
+        The normal agent-cache signature includes ``ephemeral_system_prompt``.
+        Telegram topic sessions legitimately have a different ephemeral prompt
+        from the threadless prewarm source because their context mentions
+        ``thread_id``. That context is appended at API-call time and is not part
+        of ``_cached_system_prompt``, so comparing a separate template signature
+        lets the first topic message reuse the warmed prompt without reusing or
+        mislabeling thread-specific context.
+        """
+        platform = getattr(source, "platform", None)
+        platform_value = getattr(platform, "value", platform)
+        if platform_value != Platform.TELEGRAM.value:
+            return None
+        if getattr(source, "chat_type", None) != "dm":
+            return None
+        if not getattr(source, "thread_id", None):
+            return None
+        if not getattr(source, "chat_id", None):
+            return None
+
+        try:
+            threadless_source = dataclasses.replace(
+                source,
+                thread_id=None,
+                chat_topic=None,
+                parent_chat_id=None,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to derive threadless Telegram DM prewarm source",
+                exc_info=True,
+            )
+            return None
+
+        try:
+            template_key = self._session_key_for_source(threadless_source)
+        except Exception:
+            logger.debug(
+                "Failed to resolve threadless Telegram DM prewarm session key",
+                exc_info=True,
+            )
+            return None
+
+        cache = getattr(self, "_agent_cache", None)
+        cache_lock = getattr(self, "_agent_cache_lock", None)
+        if cache is None or cache_lock is None:
+            return None
+
+        with cache_lock:
+            cached = cache.get(template_key)
+            if not isinstance(cached, tuple) or len(cached) < 5:
+                return None
+            metadata = cached[4] if isinstance(cached[4], dict) else {}
+            if metadata.get("platform_prewarm_template") is not True:
+                return None
+            if metadata.get("template_kind") != "telegram_dm_threadless":
+                return None
+            if metadata.get("prompt_template_signature") != template_signature:
+                return None
+
+            cached_message_count = cached[2] if len(cached) > 2 else None
+            if cached_message_count != 0:
+                return None
+
+            template_agent = cached[0]
+            system_prompt = getattr(template_agent, "_cached_system_prompt", None)
+            if not isinstance(system_prompt, str) or not system_prompt:
+                return None
+
+            if hasattr(cache, "move_to_end"):
+                try:
+                    cache.move_to_end(template_key)
+                except KeyError:
+                    pass
+
+        return system_prompt, template_key
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -18206,17 +18298,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
+            _cache_keys = self._extract_cache_busting_config(user_config)
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys=_cache_keys,
+                user_id=getattr(source, "user_id", None),
+                user_id_alt=getattr(source, "user_id_alt", None),
+            )
+            _prewarm_template_sig = self._agent_config_signature(
+                turn_route["model"],
+                turn_route["runtime"],
+                enabled_toolsets,
+                "",
+                cache_keys=_cache_keys,
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
             )
             agent = None
             reused_cached_agent = False
+            prewarmed_system_prompt = None
+            prewarm_template_key = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             _cache = getattr(self, "_agent_cache", None)
 
@@ -18339,6 +18443,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
 
             if agent is None:
+                prewarm_template = self._telegram_dm_threadless_prewarm_prompt_for_source(
+                    source, _prewarm_template_sig,
+                )
+                if prewarm_template is not None:
+                    prewarmed_system_prompt, prewarm_template_key = prewarm_template
+
                 # Config changed or first message — create fresh agent
                 agent = AIAgent(
                     model=turn_route["model"],
@@ -18373,6 +18483,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                if (
+                    prewarmed_system_prompt
+                    and getattr(agent, "_cached_system_prompt", None) is None
+                ):
+                    agent._cached_system_prompt = prewarmed_system_prompt
+                    logger.debug(
+                        "Seeded Telegram DM topic agent system prompt from "
+                        "threadless platform prewarm template "
+                        "(session=%s template=%s)",
+                        session_key,
+                        prewarm_template_key,
+                    )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for
