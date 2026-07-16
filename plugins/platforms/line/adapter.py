@@ -959,13 +959,7 @@ class LineAdapter(BasePlatformAdapter):
             return
 
         # Allowlist gate.
-        if not _allowed_for_source(
-            source,
-            allow_all=self.allow_all,
-            user_ids=self.allowed_users,
-            group_ids=self.allowed_groups,
-            room_ids=self.allowed_rooms,
-        ):
+        if not self._is_source_allowed(source):
             logger.info("LINE: rejecting unauthorized source %s", source)
             return
 
@@ -977,6 +971,30 @@ class LineAdapter(BasePlatformAdapter):
             logger.info("LINE: lifecycle event %s from %s", event_type, source)
         else:
             logger.debug("LINE: ignoring event type %r", event_type)
+
+    def _is_source_allowed(self, source: Dict[str, Any]) -> bool:
+        """Apply static LINE gates plus live DM pairing grants."""
+        if _allowed_for_source(
+            source,
+            allow_all=self.allow_all,
+            user_ids=self.allowed_users,
+            group_ids=self.allowed_groups,
+            room_ids=self.allowed_rooms,
+        ):
+            return True
+
+        if (source or {}).get("type") != "user":
+            return False
+        user_id = (source or {}).get("userId", "")
+        if not user_id:
+            return False
+
+        try:
+            from gateway.pairing import PairingStore
+
+            return PairingStore().is_approved("line", user_id)
+        except Exception:
+            return False
 
     async def _handle_message_event(self, event: Dict[str, Any]) -> None:
         msg = event.get("message") or {}
