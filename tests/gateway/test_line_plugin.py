@@ -151,6 +151,26 @@ class TestAllowlist:
         src = {"type": "weird"}
         assert not _allowed_for_source(src, allow_all=False, user_ids=set(), group_ids=set(), room_ids=set())
 
+    def test_pairing_approved_after_adapter_start_is_allowed(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.delenv("LINE_ALLOWED_USERS", raising=False)
+
+        from gateway import pairing
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setattr(pairing, "PAIRING_DIR", tmp_path)
+        adapter = LineAdapter(PlatformConfig(enabled=True))
+        source = {"type": "user", "userId": "Unew"}
+
+        assert not adapter._is_source_allowed(source)
+
+        pairing.PairingStore().replace_approved("line", ["Unew"])
+
+        assert adapter._is_source_allowed(source)
+
 
 # ---------------------------------------------------------------------------
 # 4. Inbound dedup
