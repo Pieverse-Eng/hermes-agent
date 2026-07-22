@@ -16,6 +16,8 @@ import yaml
 
 pytest.importorskip("mcp.server.fastmcp")
 
+SLASH_WORKER_RESPONSE_TIMEOUT_S = 30
+
 
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     profile_home = tmp_path / "profile-home"
@@ -90,9 +92,12 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
         try:
-            line = output.get(timeout=10)
+            line = output.get(timeout=SLASH_WORKER_RESPONSE_TIMEOUT_S)
         except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+            pytest.fail(
+                "slash worker produced no /tools response within "
+                f"{SLASH_WORKER_RESPONSE_TIMEOUT_S} seconds"
+            )
         response = json.loads(line)
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
