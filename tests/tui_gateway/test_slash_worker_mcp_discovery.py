@@ -16,7 +16,8 @@ import yaml
 
 pytest.importorskip("mcp.server.fastmcp")
 
-SLASH_WORKER_RESPONSE_TIMEOUT_S = 30
+SLASH_WORKER_DISCOVERY_TIMEOUT_S = 20
+SLASH_WORKER_RESPONSE_TIMEOUT_S = 45
 
 
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
@@ -44,6 +45,7 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                "mcp_discovery_timeout": SLASH_WORKER_DISCOVERY_TIMEOUT_S,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
