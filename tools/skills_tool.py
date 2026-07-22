@@ -720,12 +720,26 @@ def _skill_security_prepare_archive(
     name: str,
 ) -> tuple[Any | None, str | None, str | None]:
     try:
-        from tools.skill_security_gate import hosted_merchant_skill_security_decision
+        from tools.skill_security_gate import (
+            cached_skill_certik_decision_for_session_load,
+            trusted_skill_security_decision_for_session_load,
+        )
 
-        hosted_merchant = hosted_merchant_skill_security_decision(skill_dir)
-        if hosted_merchant is not None:
-            if not hosted_merchant.allowed:
-                return None, None, f"Skill '{name}' was not loaded: {hosted_merchant.reason}"
+        trusted_decision = trusted_skill_security_decision_for_session_load(skill_dir)
+        if trusted_decision is not None:
+            if not trusted_decision.allowed:
+                return None, None, f"Skill '{name}' was not loaded: {trusted_decision.reason}"
+            content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+            return None, content, None
+
+        cached_decision = cached_skill_certik_decision_for_session_load(skill_dir)
+        if cached_decision is not None:
+            if not cached_decision.allowed:
+                return (
+                    None,
+                    None,
+                    f"Skill '{name}' was not loaded: {cached_decision.reason}",
+                )
             content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
             return None, content, None
 

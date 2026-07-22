@@ -1112,6 +1112,17 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             message += f" Content absorbed into '{absorbed_target}'."
         return {"success": True, "message": message, "_archived": True}
 
+    try:
+        from tools.skill_security_gate import forget_skill_certik_decision
+
+        forget_skill_certik_decision(skill_dir)
+    except Exception:
+        logger.debug(
+            "Could not clear CertiK skill security stamp for %s",
+            skill_dir,
+            exc_info=True,
+        )
+
     shutil.rmtree(skill_dir)
 
     # Clean up empty category directories (don't remove the skills root itself)

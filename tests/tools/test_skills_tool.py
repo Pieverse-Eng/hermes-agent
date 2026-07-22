@@ -1112,6 +1112,60 @@ class TestSkillViewPrerequisites:
         assert result["success"] is True
         assert result["name"] == "purrfect-merchant-skill"
 
+    def test_platform_managed_view_ignores_stale_certik_block_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills"
+        skill_dir = _make_skill(skills_dir, "okx")
+        platform_source = tmp_path / "platform-source"
+        source_skill = platform_source / "okx"
+        source_skill.mkdir(parents=True)
+        (source_skill / "SKILL.md").write_text(
+            (skill_dir / "SKILL.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "tools.skill_security_gate._PLATFORM_MANAGED_SKILLS_DIR",
+            platform_source,
+        )
+
+        from tools.skill_security_gate import security_index_path
+
+        index_path = security_index_path()
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "skills": {
+                        "local:okx": {
+                            "provider": "certik",
+                            "decision": "block",
+                            "fingerprint": "archive-sha256:old",
+                            "reason": "old user-skill block",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def _fail_archive(_skill_dir):
+            raise AssertionError("platform-managed skill should not be archived")
+
+        monkeypatch.setattr(
+            "tools.skill_security_certik.build_skill_security_archive",
+            _fail_archive,
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            raw = skill_view("okx")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "okx"
+
     def test_legacy_flat_md_skill_is_blocked_for_runtime_use(self, tmp_path):
         flat_skill = tmp_path / "legacy-skill.md"
         flat_skill.write_text(

@@ -23,6 +23,7 @@ from tools.skill_security_gate import (
     drain_skill_security_warnings,
     ensure_skill_certik_allowed_for_session_load,
     format_skill_security_scan_report,
+    forget_skill_certik_decision,
     fingerprint_skill_dir,
     SkillFingerprintError,
     security_index_path,
@@ -65,7 +66,7 @@ def _write_index_record(key, record):
     path = security_index_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"version": 1, "skills": {key: record}}),
+        json.dumps({"version": 2, "skills": {key: record}}),
         encoding="utf-8",
     )
 
@@ -139,15 +140,60 @@ def test_allows_existing_certik_allow_stamp(monkeypatch, tmp_path):
     )
 
     def _fail_scan(*_args, **_kwargs):
-        raise AssertionError("scanner should not run for a matching allow stamp")
+        raise AssertionError("scanner should not run for an existing allow stamp")
 
+    def _fail_archive(*_args, **_kwargs):
+        raise AssertionError("archive should not be rebuilt for an existing allow stamp")
+
+    (skill_dir / ".env").write_text("SECRET_TOKEN=local-only\n", encoding="utf-8")
     monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
 
     decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
 
     assert decision.allowed is True
     assert decision.scan_id == "scan-ok"
     assert drain_skill_security_scan_reports() == []
+
+
+def test_forget_certik_decision_forces_next_load_to_scan(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(tmp_path)
+    fp = fingerprint_skill_dir(skill_dir)
+    _write_index_record(
+        "local:demo-skill",
+        {
+            "provider": "certik",
+            "decision": "allow",
+            "fingerprint": fp.value,
+            "scanId": "scan-ok",
+        },
+    )
+
+    scan_calls = []
+
+    def _scan(skill_dir_arg, *, skill_slug=None, archive=None):
+        del skill_slug
+        scan_calls.append((skill_dir_arg, archive))
+        return SkillSecurityScanResult(
+            decision="allow",
+            reason="ok",
+            scan_id="scan-new",
+            archive_sha256=(archive.archive_sha256 if archive else None),
+        )
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+
+    cached = ensure_skill_certik_allowed_for_session_load(skill_dir)
+    (skill_dir / "new-package.py").write_text("print('new package')\n", encoding="utf-8")
+    forget_skill_certik_decision(skill_dir)
+    rescanned = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert cached.allowed is True
+    assert cached.scan_id == "scan-ok"
+    assert rescanned.allowed is True
+    assert rescanned.scan_id == "scan-new"
+    assert len(scan_calls) == 1
 
 
 def test_blocks_existing_certik_block_stamp_without_rescan(monkeypatch, tmp_path):
@@ -166,9 +212,14 @@ def test_blocks_existing_certik_block_stamp_without_rescan(monkeypatch, tmp_path
     )
 
     def _fail_scan(*_args, **_kwargs):
-        raise AssertionError("scanner should not rerun for a matching block stamp")
+        raise AssertionError("scanner should not rerun for an existing block stamp")
 
+    def _fail_archive(*_args, **_kwargs):
+        raise AssertionError("archive should not be rebuilt for an existing block stamp")
+
+    (skill_dir / "fixed.py").write_text("print('fixed')\n", encoding="utf-8")
     monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
 
     decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
 
@@ -375,6 +426,48 @@ def test_skips_matching_platform_managed_source_tree(monkeypatch, tmp_path):
         raise AssertionError("scanner should not run for a platform-managed skill")
 
     monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.source == "managed"
+    assert "Platform-managed skill" in decision.reason
+
+
+def test_platform_managed_source_tree_ignores_stale_certik_block_stamp(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(tmp_path, name="okx")
+    platform_source = tmp_path / "platform-source"
+    source_skill = platform_source / "okx"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text(
+        "---\nname: okx\ndescription: Demo skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate._PLATFORM_MANAGED_SKILLS_DIR",
+        platform_source,
+    )
+    _write_index_record(
+        "local:okx",
+        {
+            "provider": "certik",
+            "decision": "block",
+            "fingerprint": "archive-sha256:old",
+            "reason": "old user-skill block",
+        },
+    )
+
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("scanner should not run for a platform-managed skill")
+
+    def _fail_archive(*_args, **_kwargs):
+        raise AssertionError("platform-managed skill should not be archived")
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
 
     decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
 
@@ -627,7 +720,7 @@ def test_blocks_when_scan_blocks(monkeypatch, tmp_path):
     assert "Blocked: demo-skill (high severity finding)." in report
 
 
-def test_stale_allow_stamp_rescans_after_file_change(monkeypatch, tmp_path):
+def test_existing_allow_stamp_survives_user_file_changes(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     skill_dir = _write_skill(tmp_path)
     old_fp = fingerprint_skill_dir(skill_dir)
@@ -642,24 +735,22 @@ def test_stale_allow_stamp_rescans_after_file_change(monkeypatch, tmp_path):
     )
     (skill_dir / "references").mkdir()
     (skill_dir / "references" / "changed.md").write_text("new content", encoding="utf-8")
-    calls = []
+    (skill_dir / "large-runtime.bin").write_bytes(b"x" * (MAX_ARCHIVE_FILE_BYTES + 1))
 
-    def _scan(_skill_dir_arg, *, skill_slug, archive):
-        calls.append((skill_slug, archive.fingerprint))
-        return SkillSecurityScanResult(
-            decision="allow",
-            reason="clean after change",
-            scan_id="new-scan",
-        )
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("scanner should not rerun for an existing allow stamp")
 
-    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+    def _fail_archive(*_args, **_kwargs):
+        raise AssertionError("archive should not be rebuilt for an existing allow stamp")
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
 
     decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
 
     assert decision.allowed is True
-    assert decision.scan_id == "new-scan"
-    assert len(calls) == 1
-    assert calls[0][1] != old_fp.value
+    assert decision.scan_id == "old-scan"
+    assert decision.fingerprint == old_fp.value
 
 
 def test_archive_and_fingerprint_include_dependency_named_dirs(monkeypatch, tmp_path):

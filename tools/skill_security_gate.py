@@ -1,7 +1,7 @@
 """Load-time CertiK gate for Hermes skills.
 
-This module is intentionally fail-closed: a skill is allowed into the session
-prompt only when the current directory fingerprint has a CertiK ``allow`` stamp.
+This module is intentionally fail-closed: a user-installed skill is allowed into
+the session prompt only after its install key has a CertiK ``allow`` stamp.
 Missing credentials, scanner retry responses, and scanner errors all block load.
 """
 
@@ -12,7 +12,7 @@ import os
 import re
 import threading
 import contextvars
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -217,6 +217,18 @@ def _skill_key(skill_dir: Path) -> str:
         return "path:" + sha256(str(resolved).encode("utf-8")).hexdigest()
 
 
+def forget_skill_certik_decision(skill_dir: Path) -> None:
+    try:
+        key = _skill_key(skill_dir)
+    except Exception:
+        return
+    with _INDEX_LOCK:
+        data = _read_index()
+        skills = data.setdefault("skills", {})
+        if skills.pop(key, None) is not None:
+            _write_index(data)
+
+
 def _skill_slug(skill_dir: Path) -> str:
     raw = skill_dir.name.strip().lower().replace("_", "-")
     slug = _SLUG_RE.sub("-", raw).strip("-")
@@ -410,6 +422,26 @@ def _managed_skill_reason(
     skill_dir: Path,
     archive: SkillSecurityArchive | None = None,
 ) -> tuple[str, str] | None:
+    skills_root = get_skills_dir()
+    try:
+        rel = skill_dir.relative_to(skills_root.resolve())
+    except ValueError:
+        return None
+
+    managed_sources: list[tuple[str, Path]] = []
+    bundled_source_root = _bundled_skills_source_dir(skills_root)
+    if bundled_source_root is not None:
+        bundled_source = bundled_source_root / rel
+        if bundled_source.is_dir():
+            managed_sources.append(("Hermes bundled skill", bundled_source))
+
+    platform_source = _PLATFORM_MANAGED_SKILLS_DIR / rel
+    if platform_source.is_dir():
+        managed_sources.append(("Platform-managed skill", platform_source))
+
+    if not managed_sources:
+        return None
+
     current_hash = (
         _managed_skill_files_hash(archive.files)
         if archive is not None
@@ -418,25 +450,10 @@ def _managed_skill_reason(
     if not current_hash:
         return None
 
-    skills_root = get_skills_dir()
-    try:
-        rel = skill_dir.relative_to(skills_root.resolve())
-    except ValueError:
-        return None
-
-    bundled_source_root = _bundled_skills_source_dir(skills_root)
-    if bundled_source_root is not None:
-        bundled_source = bundled_source_root / rel
-        if bundled_source.is_dir():
-            source_hash = _managed_skill_content_hash(bundled_source)
-            if source_hash and source_hash == current_hash:
-                return "Hermes bundled skill", current_hash
-
-    platform_source = _PLATFORM_MANAGED_SKILLS_DIR / rel
-    if platform_source.is_dir():
-        source_hash = _managed_skill_content_hash(platform_source)
+    for source_label, source_dir in managed_sources:
+        source_hash = _managed_skill_content_hash(source_dir)
         if source_hash and source_hash == current_hash:
-            return "Platform-managed skill", current_hash
+            return source_label, current_hash
     return None
 
 
@@ -452,22 +469,103 @@ def fingerprint_skill_dir(skill_dir: Path) -> SkillFingerprint:
     )
 
 
-def _allow_record_matches(record: Any, fingerprint: str) -> bool:
+def _allow_record_matches(record: Any) -> bool:
     return (
         isinstance(record, dict)
         and record.get("provider") == "certik"
         and record.get("decision") == "allow"
-        and record.get("fingerprint") == fingerprint
     )
 
 
-def _blocked_record_matches(record: Any, fingerprint: str) -> bool:
+def _blocked_record_matches(record: Any) -> bool:
     return (
         isinstance(record, dict)
         and record.get("provider") == "certik"
         and record.get("decision") == "block"
-        and record.get("fingerprint") == fingerprint
     )
+
+
+def _decision_from_index_record(record: Any) -> SkillSecurityDecision | None:
+    if _allow_record_matches(record):
+        fingerprint = (
+            str(record.get("fingerprint"))
+            if isinstance(record, dict) and record.get("fingerprint")
+            else "certik-allow"
+        )
+        return SkillSecurityDecision(
+            True,
+            "Previously verified by CertiK",
+            fingerprint=fingerprint,
+            scan_id=record.get("scanId") if isinstance(record, dict) else None,
+        )
+    if _blocked_record_matches(record):
+        reason = (
+            record.get("reason")
+            if isinstance(record, dict) and isinstance(record.get("reason"), str)
+            else "CertiK security verification did not allow this skill"
+        )
+        fingerprint = (
+            str(record.get("fingerprint"))
+            if isinstance(record, dict) and record.get("fingerprint")
+            else "certik-block"
+        )
+        return SkillSecurityDecision(
+            False,
+            reason,
+            fingerprint=fingerprint,
+            scan_id=record.get("scanId") if isinstance(record, dict) else None,
+        )
+    return None
+
+
+def _decision_with_archive(
+    decision: SkillSecurityDecision,
+    archive: SkillSecurityArchive | None,
+) -> SkillSecurityDecision:
+    if decision.archive is not None or archive is None:
+        return decision
+    return replace(decision, archive=archive)
+
+
+def cached_skill_certik_decision_for_session_load(
+    skill_dir: Path,
+) -> SkillSecurityDecision | None:
+    """Return an existing CertiK allow/block decision for a user-installed skill."""
+    key = _skill_key(skill_dir.resolve())
+    with _INDEX_LOCK:
+        record = _read_index().get("skills", {}).get(key)
+    return _decision_from_index_record(record)
+
+
+def trusted_skill_security_decision_for_session_load(
+    skill_dir: Path,
+) -> SkillSecurityDecision | None:
+    """Return a non-CertiK decision for image-managed/bundled skills."""
+    original_skill_dir = skill_dir
+    skill_dir = skill_dir.resolve()
+
+    official_okx = _official_okx_onchainos_skill_security_decision(
+        original_skill_dir,
+        skill_dir,
+    )
+    if official_okx is not None:
+        return official_okx
+
+    hosted_merchant = hosted_merchant_skill_security_decision(skill_dir)
+    if hosted_merchant is not None:
+        return hosted_merchant
+
+    managed = _managed_skill_reason(skill_dir)
+    if managed is not None:
+        source_label, content_hash = managed
+        return SkillSecurityDecision(
+            True,
+            f"{source_label}; CertiK scan not required",
+            fingerprint=f"managed-sha256:{content_hash}",
+            source="managed",
+        )
+
+    return None
 
 
 def ensure_skill_certik_allowed_for_session_load(
@@ -487,27 +585,25 @@ def ensure_skill_certik_allowed_for_session_load(
             archive=archive,
         )
 
-    official_okx = _official_okx_onchainos_skill_security_decision(
-        original_skill_dir,
-        skill_dir,
-    )
-    if official_okx is not None:
-        return official_okx
+    trusted = trusted_skill_security_decision_for_session_load(original_skill_dir)
+    if trusted is not None:
+        return _decision_with_archive(trusted, archive)
 
-    hosted_merchant = hosted_merchant_skill_security_decision(skill_dir)
-    if hosted_merchant is not None:
-        return hosted_merchant
+    if archive is not None:
+        managed = _managed_skill_reason(skill_dir, archive=archive)
+        if managed is not None:
+            source_label, content_hash = managed
+            return SkillSecurityDecision(
+                True,
+                f"{source_label}; CertiK scan not required",
+                fingerprint=f"managed-sha256:{content_hash}",
+                source="managed",
+                archive=archive,
+            )
 
-    managed = _managed_skill_reason(skill_dir, archive=archive)
-    if managed is not None:
-        source_label, content_hash = managed
-        return SkillSecurityDecision(
-            True,
-            f"{source_label}; CertiK scan not required",
-            fingerprint=f"managed-sha256:{content_hash}",
-            source="managed",
-            archive=archive,
-        )
+    cached = cached_skill_certik_decision_for_session_load(skill_dir)
+    if cached is not None:
+        return _decision_with_archive(cached, archive)
 
     key = _skill_key(skill_dir)
     try:
@@ -521,36 +617,16 @@ def ensure_skill_certik_allowed_for_session_load(
             reason=reason,
             fingerprint="",
         )
-        return SkillSecurityDecision(False, reason, fingerprint="")
+        return SkillSecurityDecision(
+            False,
+            reason,
+            fingerprint="",
+        )
     fp = SkillFingerprint(
         value=scan_archive.fingerprint,
         file_count=scan_archive.file_count,
         byte_count=scan_archive.byte_count,
     )
-
-    with _INDEX_LOCK:
-        record = _read_index().get("skills", {}).get(key)
-    if _allow_record_matches(record, fp.value):
-        return SkillSecurityDecision(
-            True,
-            "Previously verified by CertiK",
-            fingerprint=fp.value,
-            scan_id=record.get("scanId") if isinstance(record, dict) else None,
-            archive=scan_archive,
-        )
-    if _blocked_record_matches(record, fp.value):
-        reason = (
-            record.get("reason")
-            if isinstance(record, dict) and isinstance(record.get("reason"), str)
-            else "CertiK security verification did not allow this skill"
-        )
-        return SkillSecurityDecision(
-            False,
-            reason,
-            fingerprint=fp.value,
-            scan_id=record.get("scanId") if isinstance(record, dict) else None,
-            archive=scan_archive,
-        )
 
     checked_at = datetime.now(timezone.utc).isoformat()
     try:
