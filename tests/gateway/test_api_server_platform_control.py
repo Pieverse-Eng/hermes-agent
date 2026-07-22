@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import OrderedDict
 
@@ -17,6 +18,10 @@ def _make_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
     app.router.add_get("/internal/platform/gateway/status", adapter._handle_internal_gateway_status)
     app.router.add_post("/internal/platform/runtime-sync", adapter._handle_internal_runtime_sync)
+    app.router.add_post(
+        "/internal/platform/skill-security",
+        adapter._handle_internal_skill_security,
+    )
     app.router.add_get(
         "/internal/platform/telegram/approved-users",
         adapter._handle_internal_telegram_approved_users,
@@ -173,6 +178,63 @@ async def test_internal_runtime_sync_rejects_unknown_files_before_writing(tmp_pa
         assert resp.status == 400
 
     assert not (managed / "config.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_internal_skill_security_updates_live_gate(monkeypatch):
+    from tools.skill_security_gate import is_skill_security_gate_enabled
+
+    monkeypatch.delenv("SKILL_SECURITY_GATE_ENABLED", raising=False)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-test"}))
+    app = _make_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        unauthorized = await cli.post(
+            "/internal/platform/skill-security",
+            json={"enabled": True},
+        )
+        assert unauthorized.status == 401
+
+        enabled = await cli.post(
+            "/internal/platform/skill-security",
+            headers=_auth(),
+            json={"enabled": True},
+        )
+        assert enabled.status == 200
+        enabled_data = await enabled.json()
+        assert enabled_data["reloadRecommended"] is False
+        assert enabled_data["skillSecurity"]["certikSkillScanner"]["enabled"] is True
+        assert os.environ["SKILL_SECURITY_GATE_ENABLED"] == "true"
+        assert is_skill_security_gate_enabled() is True
+
+        disabled = await cli.post(
+            "/internal/platform/skill-security",
+            headers=_auth(),
+            json={"certikSkillScanner": {"enabled": False}},
+        )
+        assert disabled.status == 200
+        disabled_data = await disabled.json()
+
+    assert disabled_data["skillSecurity"]["certikSkillScanner"]["enabled"] is False
+    assert os.environ["SKILL_SECURITY_GATE_ENABLED"] == "false"
+    assert is_skill_security_gate_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_internal_skill_security_rejects_non_boolean_enabled(monkeypatch):
+    monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "false")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-test"}))
+    app = _make_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/internal/platform/skill-security",
+            headers=_auth(),
+            json={"skillSecurity": {"certikSkillScanner": {"enabled": "true"}}},
+        )
+        assert resp.status == 400
+
+    assert os.environ["SKILL_SECURITY_GATE_ENABLED"] == "false"
 
 
 @pytest.mark.asyncio
