@@ -1,6 +1,7 @@
 import io
 import json
 import random
+import shutil
 import tarfile
 from hashlib import sha256
 
@@ -374,6 +375,88 @@ def test_skips_matching_platform_managed_source_tree(monkeypatch, tmp_path):
     assert decision.allowed is True
     assert decision.source == "managed"
     assert "Platform-managed skill" in decision.reason
+
+
+def test_skips_matching_hosted_merchant_without_archiving_runtime_state(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MERCHANT_USE_UPSTREAM_SKILL", "true")
+    skill_dir = _write_skill(
+        tmp_path,
+        name="purrfect-merchant-skill",
+        extra_files={
+            "CLAUDE.md": "merchant guidance\n",
+            "platform-entry.js": "export const merchant = true;\n",
+            "data/merchant.db": "live database contents",
+            "node_modules/runtime/index.js": "installed dependency",
+        },
+    )
+    try:
+        (skill_dir / "AGENTS.md").symlink_to("CLAUDE.md")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    source_dir = tmp_path / "merchant-source"
+    shutil.copytree(skill_dir, source_dir, symlinks=True)
+    (source_dir / "data" / "merchant.db").write_text(
+        "image placeholder",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate._HOSTED_MERCHANT_SKILL_SOURCE_DIR",
+        source_dir,
+    )
+
+    def _fail_archive(*_args, **_kwargs):
+        raise AssertionError("hosted merchant skill should not be archived")
+
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("hosted merchant skill should not be scanned")
+
+    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.source == "managed"
+    assert "Hosted merchant skill" in decision.reason
+
+
+def test_blocks_changed_hosted_merchant_without_scanning(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MERCHANT_USE_UPSTREAM_SKILL", "true")
+    skill_dir = _write_skill(
+        tmp_path,
+        name="purrfect-merchant-skill",
+        extra_files={"platform-entry.js": "export const merchant = false;\n"},
+    )
+    source_dir = tmp_path / "merchant-source"
+    shutil.copytree(skill_dir, source_dir)
+    (skill_dir / "platform-entry.js").write_text(
+        "export const merchant = 'tampered';\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate._HOSTED_MERCHANT_SKILL_SOURCE_DIR",
+        source_dir,
+    )
+
+    def _fail_archive(*_args, **_kwargs):
+        raise AssertionError("changed hosted merchant skill should not be archived")
+
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("changed hosted merchant skill should not be scanned")
+
+    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is False
+    assert decision.source == "managed"
+    assert "differs from platform-managed source" in decision.reason
 
 
 def test_changed_platform_managed_skill_scans_external_replacement(monkeypatch, tmp_path):

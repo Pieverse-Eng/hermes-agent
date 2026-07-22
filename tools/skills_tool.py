@@ -720,6 +720,15 @@ def _skill_security_prepare_archive(
     name: str,
 ) -> tuple[Any | None, str | None, str | None]:
     try:
+        from tools.skill_security_gate import hosted_merchant_skill_security_decision
+
+        hosted_merchant = hosted_merchant_skill_security_decision(skill_dir)
+        if hosted_merchant is not None:
+            if not hosted_merchant.allowed:
+                return None, None, f"Skill '{name}' was not loaded: {hosted_merchant.reason}"
+            content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+            return None, content, None
+
         from tools.skill_security_certik import build_skill_security_archive
 
         archive = build_skill_security_archive(skill_dir)

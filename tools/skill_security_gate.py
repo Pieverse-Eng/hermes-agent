@@ -8,6 +8,7 @@ Missing credentials, scanner retry responses, and scanner errors all block load.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import contextvars
@@ -36,7 +37,13 @@ _SCAN_REPORTS: "contextvars.ContextVar[list[SkillSecurityScanReport] | None]" = 
 )
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 _PLATFORM_MANAGED_SKILLS_DIR = Path("/usr/local/lib/hermes-skills")
+_HOSTED_MERCHANT_SKILL_SLUG = "purrfect-merchant-skill"
+_HOSTED_MERCHANT_SKILL_SOURCE_DIR = Path("/app/upstream-merchant-skill")
+_RUNTIME_STATE_DIR_NAMES = frozenset(
+    {".cache", ".git", "cache", "data", "logs", "node_modules", "tmp"}
+)
 _GATE_ENABLED_ENV = "SKILL_SECURITY_GATE_ENABLED"
+_MERCHANT_USE_UPSTREAM_SKILL_ENV = "MERCHANT_USE_UPSTREAM_SKILL"
 
 
 @dataclass(frozen=True)
@@ -233,18 +240,101 @@ def _managed_skill_files_hash(files: Mapping[str, bytes]) -> str:
     return hasher.hexdigest()
 
 
-def _managed_skill_content_hash(skill_dir: Path) -> str | None:
+def _is_runtime_state_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    if any(part in _RUNTIME_STATE_DIR_NAMES for part in parts):
+        return True
+    basename = parts[-1] if parts else ""
+    return (
+        basename == ".env"
+        or basename.startswith(".env.")
+        or bool(re.search(r"\.(?:db|log|sqlite|sqlite3)$", basename, re.IGNORECASE))
+    )
+
+
+def _managed_skill_content_hash(
+    skill_dir: Path,
+    *,
+    exclude_runtime_state: bool = False,
+    allow_symlinks: bool = False,
+) -> str | None:
     try:
         files: dict[str, bytes] = {}
-        for path in sorted(skill_dir.rglob("*")):
-            if path.is_symlink():
-                return None
-            if path.is_file():
+        for root, dirs, names in os.walk(skill_dir, followlinks=False):
+            root_path = Path(root)
+            safe_dirs: list[str] = []
+            for name in sorted(dirs):
+                path = root_path / name
                 rel = path.relative_to(skill_dir).as_posix()
-                files[rel] = path.read_bytes()
+                if exclude_runtime_state and _is_runtime_state_path(rel):
+                    continue
+                if path.is_symlink():
+                    if not allow_symlinks:
+                        return None
+                    files[rel] = b"symlink\0" + os.fsencode(os.readlink(path))
+                    continue
+                safe_dirs.append(name)
+            dirs[:] = safe_dirs
+
+            for name in sorted(names):
+                path = root_path / name
+                rel = path.relative_to(skill_dir).as_posix()
+                if exclude_runtime_state and _is_runtime_state_path(rel):
+                    continue
+                if path.is_symlink():
+                    if not allow_symlinks:
+                        return None
+                    files[rel] = b"symlink\0" + os.fsencode(os.readlink(path))
+                elif path.is_file():
+                    files[rel] = path.read_bytes()
     except OSError:
         return None
     return _managed_skill_files_hash(files)
+
+
+def hosted_merchant_skill_security_decision(
+    skill_dir: Path,
+) -> SkillSecurityDecision | None:
+    if not env_var_enabled(_MERCHANT_USE_UPSTREAM_SKILL_ENV):
+        return None
+
+    try:
+        hosted_skill_dir = get_skills_dir().resolve() / _HOSTED_MERCHANT_SKILL_SLUG
+        if skill_dir.resolve() != hosted_skill_dir:
+            return None
+    except OSError:
+        return None
+
+    current_hash = _managed_skill_content_hash(
+        skill_dir,
+        exclude_runtime_state=True,
+        allow_symlinks=True,
+    )
+    source_hash = _managed_skill_content_hash(
+        _HOSTED_MERCHANT_SKILL_SOURCE_DIR,
+        exclude_runtime_state=True,
+        allow_symlinks=True,
+    )
+    if not current_hash or not source_hash or current_hash != source_hash:
+        reason = "Hosted merchant skill differs from platform-managed source"
+        _record_warning(f'Skill "{skill_dir.name}" was not loaded: {reason}')
+        return SkillSecurityDecision(
+            False,
+            reason,
+            fingerprint=(
+                f"hosted-merchant-sha256:{current_hash}"
+                if current_hash
+                else "hosted-merchant-missing"
+            ),
+            source="managed",
+        )
+
+    return SkillSecurityDecision(
+        True,
+        "Hosted merchant skill; CertiK scan not required",
+        fingerprint=f"hosted-merchant-sha256:{current_hash}",
+        source="managed",
+    )
 
 
 def _bundled_skills_source_dir(skills_root: Path) -> Path | None:
@@ -344,6 +434,10 @@ def ensure_skill_certik_allowed_for_session_load(
             source="disabled",
             archive=archive,
         )
+
+    hosted_merchant = hosted_merchant_skill_security_decision(skill_dir)
+    if hosted_merchant is not None:
+        return hosted_merchant
 
     managed = _managed_skill_reason(skill_dir, archive=archive)
     if managed is not None:

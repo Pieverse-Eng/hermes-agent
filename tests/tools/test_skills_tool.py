@@ -1075,6 +1075,43 @@ class TestSkillViewPrerequisites:
         assert "could not prepare a stable skill snapshot" in result["error"]
         assert result["security_provider"] == "certik"
 
+    def test_hosted_merchant_view_skips_certik_archive(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("MERCHANT_USE_UPSTREAM_SKILL", "true")
+        skills_dir = tmp_path / "skills"
+        skill_dir = _make_skill(skills_dir, "purrfect-merchant-skill")
+        (skill_dir / "data").mkdir()
+        (skill_dir / "data" / "merchant.db").write_bytes(b"runtime database")
+        large_dependency = skill_dir / "node_modules" / "runtime" / "large.js"
+        large_dependency.parent.mkdir(parents=True)
+        large_dependency.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
+        source_dir = tmp_path / "merchant-source"
+        source_dir.mkdir()
+        (source_dir / "SKILL.md").write_text(
+            (skill_dir / "SKILL.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "tools.skill_security_gate._HOSTED_MERCHANT_SKILL_SOURCE_DIR",
+            source_dir,
+        )
+
+        def _fail_archive(_skill_dir):
+            raise AssertionError("hosted merchant skill should not be archived")
+
+        monkeypatch.setattr(
+            "tools.skill_security_certik.build_skill_security_archive",
+            _fail_archive,
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            raw = skill_view("purrfect-merchant-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "purrfect-merchant-skill"
+
     def test_legacy_flat_md_skill_is_blocked_for_runtime_use(self, tmp_path):
         flat_skill = tmp_path / "legacy-skill.md"
         flat_skill.write_text(
