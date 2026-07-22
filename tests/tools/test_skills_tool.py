@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -54,6 +55,20 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     except (OSError, NotImplementedError) as exc:
         pytest.skip(f"symlinks unavailable in test environment: {exc}")
     return external_category
+
+
+@pytest.fixture(autouse=True)
+def _allow_certik_skill_view(monkeypatch):
+    """Most skills_tool tests exercise catalog/view behavior, not CertiK.
+
+    The security gate is covered separately in test_skill_security_gate.py; keep
+    this file focused by treating temporary test skills as already verified.
+    """
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +557,23 @@ class TestSkillView:
         result = json.loads(raw)
         assert result["success"] is True
 
+    def test_view_security_blocked_skill_not_loaded(self, tmp_path, monkeypatch):
+        def _block(_skill_dir, _name, *, archive=None):
+            return SimpleNamespace(allowed=False, reason="unsafe imports", archive=archive)
+
+        monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _block)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "blocked-skill", body="SECRET BODY")
+            raw = skill_view("blocked-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert result["security_provider"] == "certik"
+        assert result["security_status"] == "blocked"
+        assert "unsafe imports" in result["error"]
+        assert "SECRET BODY" not in result.get("content", "")
+
     def test_view_finds_skill_in_symlinked_category_dir(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"
@@ -1024,27 +1056,25 @@ class TestSkillViewPrerequisites:
         assert result["missing_required_environment_variables"] == []
         assert "setup_note" not in result
 
-    def test_skill_view_surfaces_skill_read_errors(self, tmp_path, monkeypatch):
+    def test_skill_view_surfaces_security_snapshot_errors(self, tmp_path, monkeypatch):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "broken-skill")
-            skill_md = tmp_path / "broken-skill" / "SKILL.md"
-            original_read_text = Path.read_text
 
-            def fake_read_text(path_obj, *args, **kwargs):
-                if path_obj == skill_md:
-                    raise UnicodeDecodeError(
-                        "utf-8", b"\xff", 0, 1, "invalid start byte"
-                    )
-                return original_read_text(path_obj, *args, **kwargs)
+            def fake_build_archive(_skill_dir):
+                raise RuntimeError("invalid start byte")
 
-            monkeypatch.setattr(Path, "read_text", fake_read_text)
+            monkeypatch.setattr(
+                "tools.skill_security_certik.build_skill_security_archive",
+                fake_build_archive,
+            )
             raw = skill_view("broken-skill")
 
         result = json.loads(raw)
         assert result["success"] is False
-        assert "Failed to read skill 'broken-skill'" in result["error"]
+        assert "could not prepare a stable skill snapshot" in result["error"]
+        assert result["security_provider"] == "certik"
 
-    def test_legacy_flat_md_skill_preserves_frontmatter_metadata(self, tmp_path):
+    def test_legacy_flat_md_skill_is_blocked_for_runtime_use(self, tmp_path):
         flat_skill = tmp_path / "legacy-skill.md"
         flat_skill.write_text(
             """\
@@ -1070,13 +1100,11 @@ Do the legacy thing.
             raw = skill_view("legacy-skill")
 
         result = json.loads(raw)
-        assert result["success"] is True
-        assert result["name"] == "legacy-flat"
-        assert result["description"] == "Legacy flat skill."
-        assert result["tags"] == ["legacy", "flat"]
-        assert result["required_environment_variables"] == [
-            {"name": "LEGACY_KEY", "prompt": "Legacy key"}
-        ]
+        assert result["success"] is False
+        assert result["security_provider"] == "certik"
+        assert result["security_status"] == "blocked"
+        assert "legacy flat .md" in result["error"]
+        assert "SKILL.md" in result["error"]
 
     def test_successful_secret_capture_reloads_empty_env_placeholder(
         self, tmp_path, monkeypatch

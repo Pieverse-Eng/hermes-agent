@@ -391,9 +391,17 @@ class TestPromptBuilderImports:
 
 class TestBuildSkillsSystemPrompt:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
+    def _clear_skills_cache(self, monkeypatch):
         """Ensure the in-process skills prompt cache doesn't leak between tests."""
-        from agent.prompt_builder import clear_skills_system_prompt_cache
+        prompt_globals = build_skills_system_prompt.__globals__
+        clear_skills_system_prompt_cache = prompt_globals[
+            "clear_skills_system_prompt_cache"
+        ]
+        monkeypatch.setitem(
+            prompt_globals,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: True,
+        )
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -414,6 +422,24 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_excludes_skill_blocked_by_security_gate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "blocked-skill"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: blocked-skill\ndescription: Blocked by CertiK\n---\n"
+        )
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: False,
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "blocked-skill" not in result
+        assert result == ""
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1416,8 +1442,16 @@ class TestSkillShouldShow:
 
 class TestBuildSkillsSystemPromptConditional:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
-        from agent.prompt_builder import clear_skills_system_prompt_cache
+    def _clear_skills_cache(self, monkeypatch):
+        prompt_globals = build_skills_system_prompt.__globals__
+        clear_skills_system_prompt_cache = prompt_globals[
+            "clear_skills_system_prompt_cache"
+        ]
+        monkeypatch.setitem(
+            prompt_globals,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: True,
+        )
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -1644,5 +1678,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

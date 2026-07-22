@@ -11,6 +11,7 @@ import sys
 import threading
 import contextvars
 from collections import OrderedDict
+from hashlib import sha256
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
@@ -1254,7 +1255,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1335,6 +1336,88 @@ def _write_skills_snapshot(
         logger.debug("Could not write skills prompt snapshot: %s", e)
 
 
+def _security_index_stat_marker() -> str:
+    try:
+        from tools.skill_security_gate import security_index_path
+
+        path = security_index_path()
+        if not path.exists():
+            return "missing"
+        st = path.stat()
+        return f"{st.st_mtime_ns}:{st.st_size}"
+    except Exception:
+        return "unknown"
+
+
+def _build_skills_tree_cache_digest(skills_dir: Path, external_dirs: list[Path]) -> str:
+    """Return a light manifest digest for prompt-cache invalidation.
+
+    The disk snapshot validates SKILL.md/DESCRIPTION.md metadata, but the
+    security gate fingerprints the whole skill tree. Include all skill package
+    files here so a script/reference change forces the next session-load path
+    to re-run the gate instead of serving an old in-process prompt.
+    """
+    digest = sha256()
+
+    def _add_path_marker(root: Path, path: Path, kind: bytes) -> None:
+        try:
+            rel = path.relative_to(root).as_posix()
+            st = path.lstat()
+        except OSError:
+            return
+        digest.update(kind)
+        digest.update(b"\0")
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(st.st_mode).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(st.st_mtime_ns).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(st.st_size).encode("ascii"))
+        if path.is_symlink():
+            try:
+                digest.update(b":")
+                digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+            except OSError:
+                pass
+        digest.update(b"\0")
+
+    roots = [skills_dir, *external_dirs]
+    for root in roots:
+        root = Path(root)
+        if not root.exists():
+            digest.update(str(root).encode("utf-8"))
+            digest.update(b"\0missing\0")
+            continue
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            root_resolved = root
+        digest.update(str(root_resolved).encode("utf-8"))
+        digest.update(b"\0")
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_SKILL_DIRS)
+            current_path = Path(current)
+            _add_path_marker(root, current_path, b"dir")
+            for name in dirs:
+                _add_path_marker(root, current_path / name, b"dirent")
+            for name in sorted(files):
+                _add_path_marker(root, current_path / name, b"file")
+    digest.update(b"security-index\0")
+    digest.update(_security_index_stat_marker().encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _skill_security_allows_prompt_include(skill_dir: Path) -> bool:
+    try:
+        from tools.skill_security_gate import ensure_skill_certik_allowed_for_session_load
+
+        return ensure_skill_certik_allowed_for_session_load(skill_dir).allowed
+    except Exception as e:
+        logger.warning("Skill security gate failed for %s: %s", skill_dir, e)
+        return False
+
+
 def _build_snapshot_entry(
     skill_file: Path,
     skills_dir: Path,
@@ -1357,6 +1440,7 @@ def _build_snapshot_entry(
 
     return {
         "skill_name": skill_name,
+        "skill_rel_dir": skill_file.parent.relative_to(skills_dir).as_posix(),
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
@@ -1478,9 +1562,11 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    skills_tree_digest = _build_skills_tree_cache_digest(skills_dir, external_dirs)
     cache_key = (
-        str(skills_dir),
+        str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
+        skills_tree_digest,
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
@@ -1518,6 +1604,11 @@ def build_skills_system_prompt(
                 available_toolsets,
             ):
                 continue
+            skill_rel_dir = entry.get("skill_rel_dir")
+            if not skill_rel_dir:
+                continue
+            if not _skill_security_allows_prompt_include(skills_dir / skill_rel_dir):
+                continue
             skills_by_category.setdefault(category, []).append(
                 (frontmatter_name, entry.get("description", ""))
             )
@@ -1542,6 +1633,8 @@ def build_skills_system_prompt(
                 available_tools,
                 available_toolsets,
             ):
+                continue
+            if not _skill_security_allows_prompt_include(skill_file.parent):
                 continue
             skills_by_category.setdefault(entry["category"], []).append(
                 (entry["frontmatter_name"], entry["description"])
@@ -1597,6 +1690,8 @@ def build_skills_system_prompt(
                     available_tools,
                     available_toolsets,
                 ):
+                    continue
+                if not _skill_security_allows_prompt_include(skill_file.parent):
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(

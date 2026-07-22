@@ -8,8 +8,21 @@ Covers:
 
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
+
+import tools.skills_tool as skills_tool_module
+
+
+@pytest.fixture(autouse=True)
+def _allow_certik_plugin_skill_view(monkeypatch):
+    """Plugin tests focus on plugin dispatch unless a test overrides the gate."""
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
 
 
 # ── Namespace helpers ─────────────────────────────────────────────────────
@@ -311,6 +324,26 @@ class TestSkillViewPluginGuards:
         result = json.loads(skill_view("myplugin:foo"))
         assert result["success"] is False
         assert "not supported on this platform" in result["error"]
+
+    def test_certik_block_blocks_plugin_skill(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\n---\nBody.\n")
+
+        def _block(_skill_dir, _name, *, archive=None):
+            return SimpleNamespace(
+                allowed=False,
+                reason="unsafe plugin skill",
+                archive=archive,
+            )
+
+        monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _block)
+
+        result = json.loads(skill_view("myplugin:foo"))
+        assert result["success"] is False
+        assert result["security_provider"] == "certik"
+        assert result["security_status"] == "blocked"
+        assert "unsafe plugin skill" in result["error"]
 
     def test_injection_logged_but_served(self, tmp_path, caplog):
         from tools.skills_tool import skill_view

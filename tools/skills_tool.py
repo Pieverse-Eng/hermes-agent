@@ -89,13 +89,12 @@ logger = logging.getLogger(__name__)
 
 # Per-session skill discovery cache.  _find_all_skills() re-reads every
 # SKILL.md on every call; with hundreds of skills this is wasteful.
-# Cache validation (mirrors hermes_cli/profiles.py::_count_skills, d5eee133e):
-#   - signature = per-dir max mtime of the dir AND its immediate children
-#     (one scandir per dir; catches skill add/remove inside categories,
-#     which does NOT bump the root dir's mtime), plus the disabled-set
-#     (config-driven — changes with no filesystem mtime bump at all)
-#   - a short TTL bounds staleness from in-place SKILL.md edits, which
-#     bump only the file's mtime, invisible to any directory signature.
+# Cache validation:
+#   - signature = a stat manifest for the skill directory tree and SKILL.md
+#     files, plus the disabled-set (config-driven — changes with no
+#     filesystem mtime bump at all)
+#   - a short TTL remains as a backstop for unusual filesystems with coarse
+#     or unreliable stat metadata.
 # skip_disabled True/False are cached separately.
 _SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_list)}
 _SKILLS_CACHE_TTL_SECONDS = 30.0
@@ -106,33 +105,40 @@ _SKILLS_CACHE_KEY_FILTERED = "filtered"
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
-    O(#dirs + #categories) stat calls, not a recursive walk. Includes the
-    platform the scan's ``skill_matches_platform`` filter will use (read
-    from ``agent.skill_utils``'s ``sys`` so test patches of that module
-    are honored) — the scan result is platform-dependent.
+    Includes the platform the scan's ``skill_matches_platform`` filter will
+    use (read from ``agent.skill_utils``'s ``sys`` so test patches of that
+    module are honored) — the scan result is platform-dependent.
     """
     from agent import skill_utils as _skill_utils
 
     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
     sig = []
     for d in dirs_to_scan:
-        try:
-            m = d.stat().st_mtime
-        except OSError:
+        root = Path(d)
+        markers = []
+        if not root.exists():
+            sig.append((str(root), (("missing",),)))
             continue
-        try:
-            with os.scandir(d) as it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            em = entry.stat(follow_symlinks=False).st_mtime
-                            if em > m:
-                                m = em
-                    except OSError:
-                        continue
-        except OSError:
-            pass
-        sig.append((str(d), m))
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = sorted(part for part in dirs if part not in _EXCLUDED_SKILL_DIRS)
+            current_path = Path(current)
+            try:
+                rel = current_path.relative_to(root).as_posix()
+                st = current_path.lstat()
+                markers.append(("dir", rel, st.st_mtime_ns, st.st_size))
+            except OSError:
+                continue
+            for filename in sorted(files):
+                if filename != "SKILL.md":
+                    continue
+                file_path = current_path / filename
+                try:
+                    rel = file_path.relative_to(root).as_posix()
+                    st = file_path.lstat()
+                    markers.append(("file", rel, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    continue
+        sig.append((str(root), tuple(markers)))
     return (tuple(sig), frozenset(disabled), platform)
 
 
@@ -666,6 +672,89 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
+def _skill_security_allows_view(
+    skill_dir: Path,
+    name: str,
+    *,
+    archive: Any = None,
+) -> Any:
+    """Return the CertiK decision for a directory-backed skill_view load."""
+    try:
+        from tools.skill_security_gate import ensure_skill_certik_allowed_for_session_load
+
+        return ensure_skill_certik_allowed_for_session_load(skill_dir, archive=archive)
+    except Exception as exc:
+        logger.warning("Skill security gate failed for %s: %s", skill_dir, exc)
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            allowed=False,
+            reason=f"CertiK security verification could not run: {exc}",
+            archive=None,
+        )
+
+
+def _skill_security_blocked_response(name: str, reason: str) -> str:
+    return json.dumps(
+        {
+            "success": False,
+            "error": reason,
+            "security_provider": "certik",
+            "security_status": "blocked",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _skill_security_prepare_archive(
+    skill_dir: Path,
+    name: str,
+) -> tuple[Any | None, str | None, str | None]:
+    try:
+        from tools.skill_security_certik import build_skill_security_archive
+
+        archive = build_skill_security_archive(skill_dir)
+        return archive, archive.read_text("SKILL.md"), None
+    except Exception as exc:
+        return (
+            None,
+            None,
+            (
+                f"Skill '{name}' was not loaded because "
+                f"CertiK security verification could not prepare "
+                f"a stable skill snapshot: {exc}"
+            ),
+        )
+
+
+def _skill_security_verified_archive(
+    skill_dir: Path,
+    name: str,
+    *,
+    archive: Any = None,
+) -> tuple[Any | None, str | None]:
+    security_decision = _skill_security_allows_view(
+        skill_dir,
+        name,
+        archive=archive,
+    )
+    security_allowed = bool(getattr(security_decision, "allowed", False))
+    security_reason = (
+        getattr(security_decision, "reason", "")
+        or f"Skill '{name}' was not allowed by CertiK"
+    )
+    if not security_allowed:
+        return (
+            getattr(security_decision, "archive", None) or archive,
+            (
+                f"Skill '{name}' was not loaded because "
+                f"CertiK security verification did not allow it: "
+                f"{security_reason}"
+            ),
+        )
+    return getattr(security_decision, "archive", None) or archive, None
+
+
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
@@ -877,13 +966,24 @@ def _serve_plugin_skill(
             ensure_ascii=False,
         )
 
-    try:
-        content = skill_md.read_text(encoding="utf-8")
-    except Exception as e:
-        return json.dumps(
-            {"success": False, "error": f"Failed to read skill '{namespace}:{bare}': {e}"},
-            ensure_ascii=False,
+    qualified_name = f"{namespace}:{bare}"
+    if skill_md.name != "SKILL.md" or not skill_md.parent.is_dir():
+        return _skill_security_blocked_response(
+            qualified_name,
+            (
+                f"Skill '{qualified_name}' was not loaded because plugin skills "
+                "must be directory-backed packages with a SKILL.md file before "
+                "CertiK security verification can run."
+            ),
         )
+
+    security_archive, content, prepare_error = _skill_security_prepare_archive(
+        skill_md.parent,
+        qualified_name,
+    )
+    if prepare_error:
+        return _skill_security_blocked_response(qualified_name, prepare_error)
+    assert content is not None
 
     parsed_frontmatter: Dict[str, Any] = {}
     try:
@@ -900,6 +1000,14 @@ def _serve_plugin_skill(
             },
             ensure_ascii=False,
         )
+
+    security_archive, security_error = _skill_security_verified_archive(
+        skill_md.parent,
+        qualified_name,
+        archive=security_archive,
+    )
+    if security_error:
+        return _skill_security_blocked_response(qualified_name, security_error)
 
     # Injection scan — log but still serve (matches local-skill behaviour)
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
@@ -1218,16 +1326,53 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Read the file once — reused for platform check and main content below
-        try:
-            content = skill_md.read_text(encoding="utf-8")
-        except Exception as e:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": f"Failed to read skill '{name}': {e}",
-                },
-                ensure_ascii=False,
+        security_archive = None
+        target_file = None
+        if file_path and skill_dir:
+            from tools.path_security import validate_within_dir, has_traversal_component
+
+            # Security: reject path traversal before any expensive security scan.
+            if has_traversal_component(file_path):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "Path traversal ('..') is not allowed.",
+                        "hint": "Use a relative path within the skill directory",
+                    },
+                    ensure_ascii=False,
+                )
+
+            target_file = skill_dir / file_path
+
+            # Security: verify resolved path is still within skill directory.
+            traversal_error = validate_within_dir(target_file, skill_dir)
+            if traversal_error:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": traversal_error,
+                        "hint": "Use a relative path within the skill directory",
+                    },
+                    ensure_ascii=False,
+                )
+
+        if skill_dir:
+            security_archive, content, prepare_error = _skill_security_prepare_archive(
+                skill_dir,
+                name,
+            )
+            if prepare_error:
+                return _skill_security_blocked_response(name, prepare_error)
+            assert content is not None
+        else:
+            return _skill_security_blocked_response(
+                name,
+                (
+                    f"Skill '{name}' was not loaded because legacy flat .md "
+                    "skills are not directory-backed packages and cannot be "
+                    "CertiK scanned for runtime use. Move it into a directory "
+                    "containing SKILL.md."
+                )
             )
 
         # Security: warn if skill is loaded from outside trusted directories
@@ -1289,35 +1434,27 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        security_archive, security_error = _skill_security_verified_archive(
+            skill_dir,
+            str(resolved_name or name),
+            archive=security_archive,
+        )
+        if security_error:
+            return _skill_security_blocked_response(
+                str(resolved_name or name),
+                security_error,
+            )
+
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:
-            from tools.path_security import validate_within_dir, has_traversal_component
-
-            # Security: Prevent path traversal attacks
-            if has_traversal_component(file_path):
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": "Path traversal ('..') is not allowed.",
-                        "hint": "Use a relative path within the skill directory",
-                    },
-                    ensure_ascii=False,
-                )
-
-            target_file = skill_dir / file_path
-
-            # Security: Verify resolved path is still within skill directory
-            traversal_error = validate_within_dir(target_file, skill_dir)
-            if traversal_error:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": traversal_error,
-                        "hint": "Use a relative path within the skill directory",
-                    },
-                    ensure_ascii=False,
-                )
-            if not target_file.exists():
+            assert target_file is not None
+            snapshot_rel_path = Path(file_path).as_posix()
+            snapshot_file = (
+                security_archive.get_bytes(snapshot_rel_path)
+                if security_archive is not None
+                else None
+            )
+            if snapshot_file is None:
                 # List available files in the skill directory, organized by type
                 available_files = {
                     "references": [],
@@ -1327,28 +1464,37 @@ def skill_view(
                     "other": [],
                 }
 
+                if security_archive is not None:
+                    candidate_files = sorted(
+                        rel for rel in security_archive.files if rel != "SKILL.md"
+                    )
+                else:
+                    candidate_files = []
+                    for f in skill_dir.rglob("*"):
+                        if f.is_file() and f.name != "SKILL.md":
+                            candidate_files.append(str(f.relative_to(skill_dir)))
+
                 # Scan for all readable files
-                for f in skill_dir.rglob("*"):
-                    if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
-                        if rel.startswith("references/"):
-                            available_files["references"].append(rel)
-                        elif rel.startswith("templates/"):
-                            available_files["templates"].append(rel)
-                        elif rel.startswith("assets/"):
-                            available_files["assets"].append(rel)
-                        elif rel.startswith("scripts/"):
-                            available_files["scripts"].append(rel)
-                        elif f.suffix in {
-                            ".md",
-                            ".py",
-                            ".yaml",
-                            ".yml",
-                            ".json",
-                            ".tex",
-                            ".sh",
-                        }:
-                            available_files["other"].append(rel)
+                for rel in candidate_files:
+                    rel_path = PurePosixPath(rel)
+                    if rel.startswith("references/"):
+                        available_files["references"].append(rel)
+                    elif rel.startswith("templates/"):
+                        available_files["templates"].append(rel)
+                    elif rel.startswith("assets/"):
+                        available_files["assets"].append(rel)
+                    elif rel.startswith("scripts/"):
+                        available_files["scripts"].append(rel)
+                    elif rel_path.suffix in {
+                        ".md",
+                        ".py",
+                        ".yaml",
+                        ".yml",
+                        ".json",
+                        ".tex",
+                        ".sh",
+                    }:
+                        available_files["other"].append(rel)
 
                 # Remove empty categories
                 available_files = {k: v for k, v in available_files.items() if v}
@@ -1365,15 +1511,23 @@ def skill_view(
 
             # Read the file content
             try:
-                content = target_file.read_text(encoding="utf-8")
+                if snapshot_file is not None:
+                    content = snapshot_file.decode("utf-8")
+                else:
+                    content = target_file.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
+                size = (
+                    len(snapshot_file)
+                    if snapshot_file is not None
+                    else target_file.stat().st_size
+                )
                 return json.dumps(
                     {
                         "success": True,
                         "name": name,
                         "file": file_path,
-                        "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
+                        "content": f"[Binary file: {target_file.name}, size: {size} bytes]",
                         "is_binary": True,
                     },
                     ensure_ascii=False,

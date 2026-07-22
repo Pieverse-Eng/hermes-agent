@@ -37,6 +37,8 @@ from agent.model_metadata import (
 
 logger = logging.getLogger(__name__)
 
+_SKILL_TOOL_NAMES = frozenset({"skills_list", "skill_view", "skill_manage"})
+
 
 def _compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
@@ -114,6 +116,57 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+
+
+def _emit_pre_turn_skill_security_scan(agent) -> None:
+    """Preload the live skills index so ordinary turns surface CertiK scans.
+
+    Continuing gateway sessions often reuse a stored system prompt for prefix
+    caching, so newly installed skills would otherwise wait for /new,
+    /reload-skills, or skill_view before they are scanned. This keeps the
+    cached prompt untouched: build_skills_system_prompt may refresh its own
+    metadata cache and trigger the load gate, but we only emit the resulting
+    status report.
+    """
+    valid_tool_names = set(getattr(agent, "valid_tool_names", None) or ())
+    if not valid_tool_names.intersection(_SKILL_TOOL_NAMES):
+        return
+
+    try:
+        from agent.coding_context import coding_compact_skill_categories
+        from agent.prompt_builder import build_skills_system_prompt
+        from agent.runtime_cwd import resolve_context_cwd
+        from model_tools import get_toolset_for_tool
+        from tools.skill_security_gate import (
+            drain_skill_security_scan_reports,
+            format_skill_security_scan_report,
+        )
+
+        available_toolsets = {
+            toolset
+            for toolset in (get_toolset_for_tool(tool_name) for tool_name in valid_tool_names)
+            if toolset
+        }
+        try:
+            compact_categories = coding_compact_skill_categories(
+                platform=getattr(agent, "platform", None),
+                cwd=resolve_context_cwd(),
+            )
+        except Exception:
+            compact_categories = frozenset()
+
+        existing_reports = drain_skill_security_scan_reports()
+        build_skills_system_prompt(
+            available_tools=valid_tool_names,
+            available_toolsets=available_toolsets,
+            compact_categories=compact_categories or None,
+        )
+        scan_reports = [*existing_reports, *drain_skill_security_scan_reports()]
+        report = format_skill_security_scan_report(scan_reports)
+        if report:
+            agent._emit_status(report)
+    except Exception:
+        logger.debug("pre-turn skill security scan skipped", exc_info=True)
 
 
 def build_turn_context(
@@ -360,6 +413,8 @@ def build_turn_context(
             agent.session_id or "none",
             exc_info=True,
         )
+
+    _emit_pre_turn_skill_security_scan(agent)
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.

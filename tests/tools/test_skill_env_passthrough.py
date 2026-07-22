@@ -1,12 +1,24 @@
 """Test that skill_view registers required env vars in the passthrough registry."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+import tools.skills_tool as skills_tool_module
 import tools.env_passthrough as _ep_mod
 from tools.env_passthrough import clear_env_passthrough, is_env_passthrough
+
+
+@pytest.fixture(autouse=True)
+def _allow_certik_skill_view(monkeypatch):
+    """Env passthrough tests exercise setup behavior, not CertiK decisions."""
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
 
 
 @pytest.fixture(autouse=True)

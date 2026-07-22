@@ -5,10 +5,22 @@ reading arbitrary files (e.g., ~/.hermes/.env) via path traversal.
 """
 
 import json
+from types import SimpleNamespace
 import pytest
 from unittest.mock import patch
 
+import tools.skills_tool as skills_tool_module
 from tools.skills_tool import skill_view
+
+
+@pytest.fixture(autouse=True)
+def _allow_certik_skill_view(monkeypatch):
+    """Traversal tests exercise path guards, not CertiK decisions."""
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
 
 
 @pytest.fixture()
@@ -72,8 +84,14 @@ class TestPathTraversalBlocked:
         result = json.loads(skill_view("test-skill"))
         assert result["success"] is True
 
-    def test_dotdot_in_file_path(self, fake_skills):
+    def test_dotdot_in_file_path(self, fake_skills, monkeypatch):
         """Direct .. traversal should be rejected."""
+
+        def _fail_gate(*_args, **_kwargs):
+            raise AssertionError("CertiK gate should not run for invalid file_path")
+
+        monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _fail_gate)
+
         result = json.loads(skill_view("test-skill", file_path="../../.env"))
         assert result["success"] is False
         assert "traversal" in result["error"].lower()

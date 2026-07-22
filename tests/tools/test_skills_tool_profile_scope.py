@@ -3,6 +3,7 @@
 import importlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _write_skill(root: Path, category: str, name: str, description: str) -> Path:
@@ -24,7 +25,13 @@ def _reload_skills_tool(import_home: Path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(import_home))
     import tools.skills_tool as skills_tool
 
-    return importlib.reload(skills_tool)
+    skills_tool = importlib.reload(skills_tool)
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool, "_skill_security_allows_view", _allow)
+    return skills_tool
 
 
 def test_skill_view_uses_live_profile_home_after_module_import(tmp_path, monkeypatch):
