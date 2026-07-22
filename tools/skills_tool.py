@@ -694,6 +694,15 @@ def _skill_security_allows_view(
         )
 
 
+def _skill_security_enabled() -> bool:
+    try:
+        from tools.skill_security_gate import is_skill_security_gate_enabled
+
+        return is_skill_security_gate_enabled()
+    except Exception:
+        return True
+
+
 def _skill_security_blocked_response(name: str, reason: str) -> str:
     return json.dumps(
         {
@@ -967,7 +976,8 @@ def _serve_plugin_skill(
         )
 
     qualified_name = f"{namespace}:{bare}"
-    if skill_md.name != "SKILL.md" or not skill_md.parent.is_dir():
+    security_enabled = _skill_security_enabled()
+    if security_enabled and (skill_md.name != "SKILL.md" or not skill_md.parent.is_dir()):
         return _skill_security_blocked_response(
             qualified_name,
             (
@@ -977,13 +987,17 @@ def _serve_plugin_skill(
             ),
         )
 
-    security_archive, content, prepare_error = _skill_security_prepare_archive(
-        skill_md.parent,
-        qualified_name,
-    )
-    if prepare_error:
-        return _skill_security_blocked_response(qualified_name, prepare_error)
-    assert content is not None
+    security_archive = None
+    if security_enabled:
+        security_archive, content, prepare_error = _skill_security_prepare_archive(
+            skill_md.parent,
+            qualified_name,
+        )
+        if prepare_error:
+            return _skill_security_blocked_response(qualified_name, prepare_error)
+        assert content is not None
+    else:
+        content = skill_md.read_text(encoding="utf-8")
 
     parsed_frontmatter: Dict[str, Any] = {}
     try:
@@ -1001,13 +1015,14 @@ def _serve_plugin_skill(
             ensure_ascii=False,
         )
 
-    security_archive, security_error = _skill_security_verified_archive(
-        skill_md.parent,
-        qualified_name,
-        archive=security_archive,
-    )
-    if security_error:
-        return _skill_security_blocked_response(qualified_name, security_error)
+    if security_enabled:
+        security_archive, security_error = _skill_security_verified_archive(
+            skill_md.parent,
+            qualified_name,
+            archive=security_archive,
+        )
+        if security_error:
+            return _skill_security_blocked_response(qualified_name, security_error)
 
     # Injection scan — log but still serve (matches local-skill behaviour)
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
@@ -1356,7 +1371,8 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-        if skill_dir:
+        security_enabled = _skill_security_enabled()
+        if skill_dir and security_enabled:
             security_archive, content, prepare_error = _skill_security_prepare_archive(
                 skill_dir,
                 name,
@@ -1364,7 +1380,9 @@ def skill_view(
             if prepare_error:
                 return _skill_security_blocked_response(name, prepare_error)
             assert content is not None
-        else:
+        elif skill_dir:
+            content = skill_md.read_text(encoding="utf-8")
+        elif security_enabled:
             return _skill_security_blocked_response(
                 name,
                 (
@@ -1374,6 +1392,8 @@ def skill_view(
                     "containing SKILL.md."
                 )
             )
+        else:
+            content = skill_md.read_text(encoding="utf-8")
 
         # Security: warn if skill is loaded from outside trusted directories
         # (local skills dir + configured external_dirs are all trusted)
@@ -1421,7 +1441,10 @@ def skill_view(
             )
 
         # Check if the skill is disabled by the user
-        resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
+        resolved_name = parsed_frontmatter.get(
+            "name",
+            skill_md.parent.name if skill_dir else skill_md.stem,
+        )
         if _is_skill_disabled(resolved_name):
             return json.dumps(
                 {
@@ -1434,16 +1457,17 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        security_archive, security_error = _skill_security_verified_archive(
-            skill_dir,
-            str(resolved_name or name),
-            archive=security_archive,
-        )
-        if security_error:
-            return _skill_security_blocked_response(
+        if security_enabled and skill_dir:
+            security_archive, security_error = _skill_security_verified_archive(
+                skill_dir,
                 str(resolved_name or name),
-                security_error,
+                archive=security_archive,
             )
+            if security_error:
+                return _skill_security_blocked_response(
+                    str(resolved_name or name),
+                    security_error,
+                )
 
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:

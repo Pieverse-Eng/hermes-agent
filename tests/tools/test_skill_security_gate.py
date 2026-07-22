@@ -29,7 +29,8 @@ from tools.skill_security_gate import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_skill_security_queues():
+def _clear_skill_security_queues(monkeypatch):
+    monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "true")
     drain_skill_security_warnings()
     drain_skill_security_scan_reports()
     yield
@@ -66,6 +67,28 @@ def _write_index_record(key, record):
         json.dumps({"version": 1, "skills": {key: record}}),
         encoding="utf-8",
     )
+
+
+def test_gate_disabled_allows_without_scanning_or_fingerprinting(monkeypatch, tmp_path):
+    monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(tmp_path)
+
+    def _fail_archive(*_args, **_kwargs):
+        raise AssertionError("archive should not be built when the gate is disabled")
+
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("scanner should not run when the gate is disabled")
+
+    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.source == "disabled"
+    assert decision.fingerprint == ""
+    assert drain_skill_security_scan_reports() == []
 
 
 def _managed_hash(skill_dir):

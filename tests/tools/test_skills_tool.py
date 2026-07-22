@@ -64,6 +64,7 @@ def _allow_certik_skill_view(monkeypatch):
     The security gate is covered separately in test_skill_security_gate.py; keep
     this file focused by treating temporary test skills as already verified.
     """
+    monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "true")
 
     def _allow(_skill_dir, _name, *, archive=None):
         return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
@@ -1105,6 +1106,34 @@ Do the legacy thing.
         assert result["security_status"] == "blocked"
         assert "legacy flat .md" in result["error"]
         assert "SKILL.md" in result["error"]
+
+    def test_legacy_flat_markdown_skill_loads_when_security_gate_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_tool import skill_view
+
+        monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "false")
+        (tmp_path / "legacy-skill.md").write_text(
+            """\
+---
+name: legacy-flat
+description: Legacy flat skill.
+---
+
+# Legacy Flat
+
+Do the legacy thing.
+""",
+            encoding="utf-8",
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            raw = skill_view("legacy-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "legacy-flat"
+        assert "Do the legacy thing." in result["content"]
 
     def test_successful_secret_capture_reloads_empty_env_placeholder(
         self, tmp_path, monkeypatch

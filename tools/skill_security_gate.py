@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from hermes_constants import get_skills_dir
-from utils import atomic_json_write
+from utils import atomic_json_write, env_var_enabled
 
 from tools.skill_security_certik import (
     SkillSecurityArchive,
@@ -36,6 +36,7 @@ _SCAN_REPORTS: "contextvars.ContextVar[list[SkillSecurityScanReport] | None]" = 
 )
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 _PLATFORM_MANAGED_SKILLS_DIR = Path("/usr/local/lib/hermes-skills")
+_GATE_ENABLED_ENV = "SKILL_SECURITY_GATE_ENABLED"
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,10 @@ class SkillSecurityScanReport:
 
 class SkillFingerprintError(RuntimeError):
     """Raised when a skill directory cannot be fingerprinted safely."""
+
+
+def is_skill_security_gate_enabled() -> bool:
+    return env_var_enabled(_GATE_ENABLED_ENV)
 
 
 def drain_skill_security_warnings() -> list[str]:
@@ -331,6 +336,15 @@ def ensure_skill_certik_allowed_for_session_load(
 ) -> SkillSecurityDecision:
     """Return whether *skill_dir* may be included in a freshly loaded session."""
     skill_dir = skill_dir.resolve()
+    if not is_skill_security_gate_enabled():
+        return SkillSecurityDecision(
+            True,
+            "Skill security gate disabled",
+            fingerprint="",
+            source="disabled",
+            archive=archive,
+        )
+
     managed = _managed_skill_reason(skill_dir, archive=archive)
     if managed is not None:
         source_label, content_hash = managed

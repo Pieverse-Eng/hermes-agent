@@ -18,6 +18,7 @@ import tools.skills_tool as skills_tool_module
 @pytest.fixture(autouse=True)
 def _allow_certik_plugin_skill_view(monkeypatch):
     """Plugin tests focus on plugin dispatch unless a test overrides the gate."""
+    monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "true")
 
     def _allow(_skill_dir, _name, *, archive=None):
         return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
