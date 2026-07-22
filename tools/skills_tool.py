@@ -1478,7 +1478,12 @@ def skill_view(
                 if security_archive is not None
                 else None
             )
-            if snapshot_file is None:
+            file_missing = (
+                snapshot_file is None
+                if security_archive is not None
+                else not target_file.is_file()
+            )
+            if file_missing:
                 # List available files in the skill directory, organized by type
                 available_files = {
                     "references": [],
