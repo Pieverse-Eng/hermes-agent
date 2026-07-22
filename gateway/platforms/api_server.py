@@ -103,7 +103,6 @@ PLATFORM_RUNTIME_SYNC_FILES = frozenset({
     "platform-builtin-skills.env",
     "merchant.env",
 })
-SKILL_SECURITY_GATE_ENABLED_ENV = "SKILL_SECURITY_GATE_ENABLED"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1567,23 +1566,6 @@ class APIServerAdapter(BasePlatformAdapter):
         return files
 
     @staticmethod
-    def _skill_security_enabled_from_body(body: Dict[str, Any]) -> bool:
-        raw = body.get("enabled")
-        if raw is None:
-            certik = body.get("certikSkillScanner")
-            if isinstance(certik, dict):
-                raw = certik.get("enabled")
-        if raw is None:
-            skill_security = body.get("skillSecurity")
-            if isinstance(skill_security, dict):
-                certik = skill_security.get("certikSkillScanner")
-                if isinstance(certik, dict):
-                    raw = certik.get("enabled")
-        if not isinstance(raw, bool):
-            raise ValueError("enabled must be a boolean")
-        return raw
-
-    @staticmethod
     def _approved_users_from_body(body: Dict[str, Any]) -> list:
         raw = body.get("users")
         if raw is None:
@@ -1915,31 +1897,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "ok": True,
             "written": written,
             "reloadRecommended": bool(written),
-        })
-
-    async def _handle_internal_skill_security(self, request: "web.Request") -> "web.Response":
-        """POST /internal/platform/skill-security — update live skill security flags."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-
-        try:
-            enabled = self._skill_security_enabled_from_body(body)
-        except ValueError as exc:
-            return web.json_response(_openai_error(str(exc)), status=400)
-
-        os.environ[SKILL_SECURITY_GATE_ENABLED_ENV] = "true" if enabled else "false"
-        return web.json_response({
-            "ok": True,
-            "reloadRecommended": False,
-            "skillSecurity": {
-                "certikSkillScanner": {
-                    "enabled": enabled,
-                },
-            },
         })
 
     async def _handle_internal_telegram_approved_users(self, request: "web.Request") -> "web.Response":
@@ -5412,7 +5369,6 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/internal/platform/gateway/status", self._handle_internal_gateway_status)
             self._app.router.add_post("/internal/platform/runtime-sync", self._handle_internal_runtime_sync)
-            self._app.router.add_post("/internal/platform/skill-security", self._handle_internal_skill_security)
             self._app.router.add_get("/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users)
             self._app.router.add_post("/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users)
             self._app.router.add_post("/internal/platform/gateway/reload", self._handle_internal_gateway_reload)
