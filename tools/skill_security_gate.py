@@ -39,6 +39,7 @@ _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 _PLATFORM_MANAGED_SKILLS_DIR = Path("/usr/local/lib/hermes-skills")
 _HOSTED_MERCHANT_SKILL_SLUG = "purrfect-merchant-skill"
 _HOSTED_MERCHANT_SKILL_SOURCE_DIR = Path("/app/upstream-merchant-skill")
+_OFFICIAL_OKX_SKILL_RE = re.compile(r"^okx-[a-z0-9][a-z0-9-]*$")
 _RUNTIME_STATE_DIR_NAMES = frozenset(
     {".cache", ".git", "cache", "data", "logs", "node_modules", "tmp"}
 )
@@ -292,6 +293,56 @@ def _managed_skill_content_hash(
     return _managed_skill_files_hash(files)
 
 
+def _direct_child_name(parent: Path, child: Path) -> str | None:
+    try:
+        rel = child.relative_to(parent)
+    except ValueError:
+        return None
+    return rel.name if len(rel.parts) == 1 and rel.name else None
+
+
+def _official_okx_onchainos_skills_dir() -> Path:
+    return get_skills_dir().parent / ".openclaw" / "onchainos-skills" / "skills"
+
+
+def _official_okx_onchainos_skill_security_decision(
+    original_skill_dir: Path,
+    resolved_skill_dir: Path,
+) -> SkillSecurityDecision | None:
+    try:
+        official_skills_dir = _official_okx_onchainos_skills_dir().resolve()
+    except OSError:
+        return None
+
+    official_name = _direct_child_name(official_skills_dir, resolved_skill_dir)
+    if official_name is None or not _OFFICIAL_OKX_SKILL_RE.fullmatch(official_name):
+        return None
+
+    try:
+        active_name = _direct_child_name(
+            get_skills_dir().resolve(),
+            original_skill_dir.absolute(),
+        )
+    except OSError:
+        active_name = None
+    if active_name is not None and active_name != official_name:
+        return None
+
+    if not (resolved_skill_dir / "SKILL.md").is_file():
+        return None
+
+    fingerprint = (
+        "official-okx-onchainos:"
+        + sha256(str(resolved_skill_dir).encode("utf-8")).hexdigest()
+    )
+    return SkillSecurityDecision(
+        True,
+        "Official OKX onchainos skill; CertiK scan not required",
+        fingerprint=fingerprint,
+        source="managed",
+    )
+
+
 def hosted_merchant_skill_security_decision(
     skill_dir: Path,
 ) -> SkillSecurityDecision | None:
@@ -425,6 +476,7 @@ def ensure_skill_certik_allowed_for_session_load(
     archive: SkillSecurityArchive | None = None,
 ) -> SkillSecurityDecision:
     """Return whether *skill_dir* may be included in a freshly loaded session."""
+    original_skill_dir = skill_dir
     skill_dir = skill_dir.resolve()
     if not is_skill_security_gate_enabled():
         return SkillSecurityDecision(
@@ -434,6 +486,13 @@ def ensure_skill_certik_allowed_for_session_load(
             source="disabled",
             archive=archive,
         )
+
+    official_okx = _official_okx_onchainos_skill_security_decision(
+        original_skill_dir,
+        skill_dir,
+    )
+    if official_okx is not None:
+        return official_okx
 
     hosted_merchant = hosted_merchant_skill_security_decision(skill_dir)
     if hosted_merchant is not None:

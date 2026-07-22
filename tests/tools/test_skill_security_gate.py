@@ -81,8 +81,14 @@ def test_gate_disabled_allows_without_scanning_or_fingerprinting(monkeypatch, tm
     def _fail_scan(*_args, **_kwargs):
         raise AssertionError("scanner should not run when the gate is disabled")
 
-    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
-    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+    monkeypatch.setattr(
+        "tools.skill_security_gate.build_skill_security_archive",
+        _fail_archive,
+    )
+    monkeypatch.setattr(
+        "tools.skill_security_gate.scan_skill_dir_with_platform",
+        _fail_scan,
+    )
 
     decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
 
@@ -375,6 +381,74 @@ def test_skips_matching_platform_managed_source_tree(monkeypatch, tmp_path):
     assert decision.allowed is True
     assert decision.source == "managed"
     assert "Platform-managed skill" in decision.reason
+
+
+def test_skips_official_okx_onchainos_skill_symlink_without_scanning(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    official_skill_dir = (
+        tmp_path / ".openclaw" / "onchainos-skills" / "skills" / "okx-dex-swap"
+    )
+    official_skill_dir.mkdir(parents=True)
+    (official_skill_dir / "SKILL.md").write_text(
+        "---\nname: okx-dex-swap\ndescription: OKX skill\n---\n",
+        encoding="utf-8",
+    )
+    for index in range(MAX_ARCHIVE_FILE_COUNT + 1):
+        (official_skill_dir / f"file-{index}.txt").write_text("", encoding="utf-8")
+
+    active_skill_dir = tmp_path / "skills" / "okx-dex-swap"
+    active_skill_dir.parent.mkdir(parents=True)
+    try:
+        active_skill_dir.symlink_to(official_skill_dir, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    def _fail_archive(*_args, **_kwargs):
+        raise AssertionError("official OKX skill should not be archived")
+
+    def _fail_scan(*_args, **_kwargs):
+        raise AssertionError("official OKX skill should not be scanned")
+
+    monkeypatch.setattr("tools.skill_security_gate.build_skill_security_archive", _fail_archive)
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _fail_scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(active_skill_dir)
+
+    assert decision.allowed is True
+    assert decision.source == "managed"
+    assert "OKX" in decision.reason
+    assert decision.fingerprint.startswith("official-okx-onchainos:")
+    assert drain_skill_security_scan_reports() == []
+
+
+def test_okx_named_workspace_skill_still_scans_when_not_official(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = _write_skill(
+        tmp_path,
+        name="okx-dex-swap",
+        extra_files={"tool.py": "print('user installed')\n"},
+    )
+    calls = []
+
+    def _scan(_skill_dir_arg, *, skill_slug, archive):
+        calls.append((skill_slug, archive.fingerprint))
+        return SkillSecurityScanResult(
+            decision="allow",
+            reason="clean user skill",
+            scan_id="scan-user-okx",
+        )
+
+    monkeypatch.setattr("tools.skill_security_gate.scan_skill_dir_with_platform", _scan)
+
+    decision = ensure_skill_certik_allowed_for_session_load(skill_dir)
+
+    assert decision.allowed is True
+    assert decision.scan_id == "scan-user-okx"
+    assert len(calls) == 1
 
 
 def test_skips_matching_hosted_merchant_without_archiving_runtime_state(
