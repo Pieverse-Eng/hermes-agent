@@ -36,6 +36,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import socket as _socket
 import re
@@ -96,6 +97,8 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+STRUCTURED_OUTPUT_CONTRACT_VERSION = "devops-structured-v1"
+MAX_STRUCTURED_REASONING_BYTES = 48 * 1024
 PLATFORM_RUNTIME_SYNC_FILES = frozenset({
     "config.yaml",
     ".env",
@@ -103,6 +106,62 @@ PLATFORM_RUNTIME_SYNC_FILES = frozenset({
     "platform-builtin-skills.env",
     "merchant.env",
 })
+
+
+def _chat_completion_request_controls(
+    request: "web.Request", body: Dict[str, Any], stream: bool
+):
+    """Validate and construct fresh request-local generation controls."""
+    contract = request.headers.get("X-Hermes-Structured-Output")
+    if contract is not None and contract != STRUCTURED_OUTPUT_CONTRACT_VERSION:
+        return None, None, False, web.json_response(
+            _openai_error("Unsupported Hermes structured-output contract"), status=400
+        )
+
+    temperature_present = "temperature" in body
+    temperature = body.get("temperature")
+    if temperature_present and (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not math.isfinite(temperature)
+        or temperature < 0
+        or temperature > 2
+    ):
+        return None, None, False, web.json_response(
+            _openai_error("temperature must be a finite number between 0 and 2"), status=400
+        )
+
+    thinking_present = "thinking" in body
+    thinking = body.get("thinking")
+    if thinking_present and thinking not in ({"type": "adaptive"}, {"type": "disabled"}):
+        return None, None, False, web.json_response(
+            _openai_error('thinking must be exactly {"type":"adaptive"} or {"type":"disabled"}'),
+            status=400,
+        )
+
+    structured_output = contract == STRUCTURED_OUTPUT_CONTRACT_VERSION
+    if structured_output and (
+        stream or temperature != 0.1 or thinking != {"type": "disabled"}
+    ):
+        return None, None, False, web.json_response(
+            _openai_error(
+                "Structured-output requests require stream=false, temperature=0.1, "
+                'and thinking={"type":"disabled"}'
+            ),
+            status=400,
+        )
+
+    request_overrides = {}
+    if temperature_present:
+        request_overrides["temperature"] = temperature
+    if thinking_present:
+        request_overrides["extra_body"] = {"thinking": dict(thinking)}
+    reasoning_config_override = (
+        {"enabled": thinking["type"] == "adaptive"} if thinking_present else None
+    )
+
+    # These fresh dictionaries are passed only to this request's fresh AIAgent.
+    return request_overrides or None, reasoning_config_override, structured_output, None
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1282,6 +1341,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
+        reasoning_config_override: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1374,6 +1435,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key or session_id,
             )
 
+        runtime_request_overrides = runtime_kwargs.pop("request_overrides", None)
+        if request_overrides is not None:
+            merged_request_overrides = dict(runtime_request_overrides or {})
+            runtime_extra_body = merged_request_overrides.get("extra_body")
+            request_extra_body = request_overrides.get("extra_body")
+            if isinstance(runtime_extra_body, dict) or isinstance(request_extra_body, dict):
+                merged_extra_body = dict(
+                    runtime_extra_body if isinstance(runtime_extra_body, dict) else {}
+                )
+                if isinstance(request_extra_body, dict):
+                    merged_extra_body.update(request_extra_body)
+                merged_request_overrides["extra_body"] = merged_extra_body
+            merged_request_overrides.update(
+                {key: value for key, value in request_overrides.items() if key != "extra_body"}
+            )
+            runtime_request_overrides = merged_request_overrides
+        elif isinstance(runtime_request_overrides, dict):
+            runtime_request_overrides = dict(runtime_request_overrides)
+
+        reasoning_config = (
+            dict(reasoning_config_override)
+            if reasoning_config_override is not None
+            else dict(reasoning_config) if isinstance(reasoning_config, dict) else reasoning_config
+        )
+
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
@@ -1400,6 +1486,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            request_overrides=runtime_request_overrides,
             gateway_session_key=gateway_session_key,
         )
         return agent
@@ -2647,6 +2734,11 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        request_overrides, reasoning_config_override, structured_output, structured_error = (
+            _chat_completion_request_controls(request, body, stream)
+        )
+        if structured_error is not None:
+            return structured_error
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -2843,6 +2935,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                request_overrides=request_overrides,
+                reasoning_config_override=reasoning_config_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2863,11 +2957,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                request_overrides=request_overrides,
+                reasoning_config_override=reasoning_config_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(
+                body,
+                keys=["model", "messages", "tools", "tool_choice", "stream", "temperature", "thinking"],
+            )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
@@ -2930,6 +3029,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # Soft-partial path: we have *some* text but the run did not complete
         # (e.g. truncation with partial buffered output). Still 200 but signal
         # truncation via finish_reason="length" + Hermes-specific extras.
+        response_message = {"role": "assistant", "content": final_response}
+        if structured_output:
+            reasoning_content = result.get("last_reasoning")
+            if (
+                isinstance(reasoning_content, str)
+                and len(reasoning_content.encode("utf-8")) <= MAX_STRUCTURED_REASONING_BYTES
+            ):
+                response_message["reasoning_content"] = reasoning_content
+
         response_data = {
             "id": completion_id,
             "object": "chat.completion",
@@ -2938,10 +3046,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_response,
-                    },
+                    "message": response_message,
                     "finish_reason": finish_reason,
                 }
             ],
@@ -4599,6 +4704,8 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
+        reasoning_config_override: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4635,6 +4742,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    request_overrides=request_overrides,
+                    reasoning_config_override=reasoning_config_override,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
