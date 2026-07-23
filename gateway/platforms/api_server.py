@@ -108,6 +108,10 @@ PLATFORM_RUNTIME_SYNC_FILES = frozenset({
 })
 
 
+def _json_dumps_utf8(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _chat_completion_request_controls(request: "web.Request", body: Dict[str, Any]):
     """Validate and construct fresh request-local generation controls."""
     contract = request.headers.get("X-Hermes-Structured-Output")
@@ -3087,7 +3091,11 @@ class APIServerAdapter(BasePlatformAdapter):
             if err_msg:
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
 
-        return web.json_response(response_data, headers=response_headers)
+        return web.json_response(
+            response_data,
+            headers=response_headers,
+            dumps=_json_dumps_utf8 if structured_output else json.dumps,
+        )
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,

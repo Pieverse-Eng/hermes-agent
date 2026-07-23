@@ -323,6 +323,30 @@ async def test_structured_response_omits_oversized_reasoning_content():
     assert "reasoning_content" not in payload["choices"][0]["message"]
 
 
+@pytest.mark.asyncio
+async def test_structured_response_does_not_ascii_expand_bounded_unicode_reasoning():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    reasoning = "思" * 11_000
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+        run_agent.return_value = _result(reasoning=reasoning)
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Structured-Output": "devops-structured-v1"},
+                json={
+                    "stream": False,
+                    "temperature": 1.0,
+                    "thinking": {"type": "adaptive"},
+                    "messages": [{"role": "user", "content": "Return JSON."}],
+                },
+            )
+            raw_response = await response.read()
+
+    assert response.status == 200
+    assert len(raw_response) < 64 * 1024
+    assert json.loads(raw_response)["choices"][0]["message"]["reasoning_content"] == reasoning
+
+
 def test_create_agent_keeps_structured_controls_on_one_fresh_agent(monkeypatch):
     captured = []
 
