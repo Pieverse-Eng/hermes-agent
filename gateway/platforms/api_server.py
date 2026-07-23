@@ -108,9 +108,7 @@ PLATFORM_RUNTIME_SYNC_FILES = frozenset({
 })
 
 
-def _chat_completion_request_controls(
-    request: "web.Request", body: Dict[str, Any], stream: bool
-):
+def _chat_completion_request_controls(request: "web.Request", body: Dict[str, Any]):
     """Validate and construct fresh request-local generation controls."""
     contract = request.headers.get("X-Hermes-Structured-Output")
     if contract is not None and contract != STRUCTURED_OUTPUT_CONTRACT_VERSION:
@@ -133,15 +131,33 @@ def _chat_completion_request_controls(
 
     thinking_present = "thinking" in body
     thinking = body.get("thinking")
-    if thinking_present and thinking not in ({"type": "adaptive"}, {"type": "disabled"}):
-        return None, None, False, web.json_response(
-            _openai_error('thinking must be exactly {"type":"adaptive"} or {"type":"disabled"}'),
-            status=400,
-        )
+    thinking_value: Optional[Dict[str, str]] = None
+    if thinking_present:
+        if not isinstance(thinking, dict) or set(thinking) != {"type"}:
+            return None, None, False, web.json_response(
+                _openai_error(
+                    'thinking must be exactly {"type":"adaptive"} or {"type":"disabled"}'
+                ),
+                status=400,
+            )
+        thinking_type = thinking.get("type")
+        if not isinstance(thinking_type, str) or thinking_type not in (
+            "adaptive",
+            "disabled",
+        ):
+            return None, None, False, web.json_response(
+                _openai_error(
+                    'thinking must be exactly {"type":"adaptive"} or {"type":"disabled"}'
+                ),
+                status=400,
+            )
+        thinking_value = {"type": thinking_type}
 
     structured_output = contract == STRUCTURED_OUTPUT_CONTRACT_VERSION
     if structured_output and (
-        stream or temperature != 0.1 or thinking != {"type": "disabled"}
+        ("stream" in body and body["stream"] is not False)
+        or temperature != 0.1
+        or thinking_value != {"type": "disabled"}
     ):
         return None, None, False, web.json_response(
             _openai_error(
@@ -154,10 +170,12 @@ def _chat_completion_request_controls(
     request_overrides = {}
     if temperature_present:
         request_overrides["temperature"] = temperature
-    if thinking_present:
-        request_overrides["extra_body"] = {"thinking": dict(thinking)}
+    if thinking_value is not None:
+        request_overrides["extra_body"] = {"thinking": thinking_value}
     reasoning_config_override = (
-        {"enabled": thinking["type"] == "adaptive"} if thinking_present else None
+        {"enabled": thinking_value["type"] == "adaptive"}
+        if thinking_value is not None
+        else None
     )
 
     # These fresh dictionaries are passed only to this request's fresh AIAgent.
@@ -2735,7 +2753,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         request_overrides, reasoning_config_override, structured_output, structured_error = (
-            _chat_completion_request_controls(request, body, stream)
+            _chat_completion_request_controls(request, body)
         )
         if structured_error is not None:
             return structured_error

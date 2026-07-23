@@ -75,6 +75,11 @@ async def test_structured_contract_is_strict_and_passed_request_locally():
         {"temperature": 0.2, "thinking": {"type": "disabled"}},
         {"temperature": 0.1, "thinking": {"type": "enabled"}},
         {"temperature": 0.1, "thinking": {"type": "disabled", "extra": True}},
+        {"stream": "garbage", "temperature": 0.1, "thinking": {"type": "disabled"}},
+        {"stream": [], "temperature": 0.1, "thinking": {"type": "disabled"}},
+        {"stream": {}, "temperature": 0.1, "thinking": {"type": "disabled"}},
+        {"stream": 0, "temperature": 0.1, "thinking": {"type": "disabled"}},
+        {"stream": None, "temperature": 0.1, "thinking": {"type": "disabled"}},
     ],
 )
 async def test_structured_contract_rejects_any_non_exact_controls(body):
