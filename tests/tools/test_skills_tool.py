@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -54,6 +55,21 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     except (OSError, NotImplementedError) as exc:
         pytest.skip(f"symlinks unavailable in test environment: {exc}")
     return external_category
+
+
+@pytest.fixture(autouse=True)
+def _allow_certik_skill_view(monkeypatch):
+    """Most skills_tool tests exercise catalog/view behavior, not CertiK.
+
+    The security gate is covered separately in test_skill_security_gate.py; keep
+    this file focused by treating temporary test skills as already verified.
+    """
+    monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "true")
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +558,23 @@ class TestSkillView:
         result = json.loads(raw)
         assert result["success"] is True
 
+    def test_view_security_blocked_skill_not_loaded(self, tmp_path, monkeypatch):
+        def _block(_skill_dir, _name, *, archive=None):
+            return SimpleNamespace(allowed=False, reason="unsafe imports", archive=archive)
+
+        monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _block)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "blocked-skill", body="SECRET BODY")
+            raw = skill_view("blocked-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert result["security_provider"] == "certik"
+        assert result["security_status"] == "blocked"
+        assert "unsafe imports" in result["error"]
+        assert "SECRET BODY" not in result.get("content", "")
+
     def test_view_finds_skill_in_symlinked_category_dir(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"
@@ -1024,27 +1057,116 @@ class TestSkillViewPrerequisites:
         assert result["missing_required_environment_variables"] == []
         assert "setup_note" not in result
 
-    def test_skill_view_surfaces_skill_read_errors(self, tmp_path, monkeypatch):
+    def test_skill_view_surfaces_security_snapshot_errors(self, tmp_path, monkeypatch):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "broken-skill")
-            skill_md = tmp_path / "broken-skill" / "SKILL.md"
-            original_read_text = Path.read_text
 
-            def fake_read_text(path_obj, *args, **kwargs):
-                if path_obj == skill_md:
-                    raise UnicodeDecodeError(
-                        "utf-8", b"\xff", 0, 1, "invalid start byte"
-                    )
-                return original_read_text(path_obj, *args, **kwargs)
+            def fake_build_archive(_skill_dir):
+                raise RuntimeError("invalid start byte")
 
-            monkeypatch.setattr(Path, "read_text", fake_read_text)
+            monkeypatch.setattr(
+                "tools.skill_security_certik.build_skill_security_archive",
+                fake_build_archive,
+            )
             raw = skill_view("broken-skill")
 
         result = json.loads(raw)
         assert result["success"] is False
-        assert "Failed to read skill 'broken-skill'" in result["error"]
+        assert "could not prepare a stable skill snapshot" in result["error"]
+        assert result["security_provider"] == "certik"
 
-    def test_legacy_flat_md_skill_preserves_frontmatter_metadata(self, tmp_path):
+    def test_hosted_merchant_view_skips_certik_archive(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("MERCHANT_USE_UPSTREAM_SKILL", "true")
+        skills_dir = tmp_path / "skills"
+        skill_dir = _make_skill(skills_dir, "purrfect-merchant-skill")
+        (skill_dir / "data").mkdir()
+        (skill_dir / "data" / "merchant.db").write_bytes(b"runtime database")
+        large_dependency = skill_dir / "node_modules" / "runtime" / "large.js"
+        large_dependency.parent.mkdir(parents=True)
+        large_dependency.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
+        source_dir = tmp_path / "merchant-source"
+        source_dir.mkdir()
+        (source_dir / "SKILL.md").write_text(
+            (skill_dir / "SKILL.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "tools.skill_security_gate._HOSTED_MERCHANT_SKILL_SOURCE_DIR",
+            source_dir,
+        )
+
+        def _fail_archive(_skill_dir):
+            raise AssertionError("hosted merchant skill should not be archived")
+
+        monkeypatch.setattr(
+            "tools.skill_security_certik.build_skill_security_archive",
+            _fail_archive,
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            raw = skill_view("purrfect-merchant-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "purrfect-merchant-skill"
+
+    def test_platform_managed_view_ignores_stale_certik_block_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills"
+        skill_dir = _make_skill(skills_dir, "okx")
+        platform_source = tmp_path / "platform-source"
+        source_skill = platform_source / "okx"
+        source_skill.mkdir(parents=True)
+        (source_skill / "SKILL.md").write_text(
+            (skill_dir / "SKILL.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "tools.skill_security_gate._PLATFORM_MANAGED_SKILLS_DIR",
+            platform_source,
+        )
+
+        from tools.skill_security_gate import security_index_path
+
+        index_path = security_index_path()
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "skills": {
+                        "local:okx": {
+                            "provider": "certik",
+                            "decision": "block",
+                            "fingerprint": "archive-sha256:old",
+                            "reason": "old user-skill block",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def _fail_archive(_skill_dir):
+            raise AssertionError("platform-managed skill should not be archived")
+
+        monkeypatch.setattr(
+            "tools.skill_security_certik.build_skill_security_archive",
+            _fail_archive,
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            raw = skill_view("okx")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "okx"
+
+    def test_legacy_flat_md_skill_is_blocked_for_runtime_use(self, tmp_path):
         flat_skill = tmp_path / "legacy-skill.md"
         flat_skill.write_text(
             """\
@@ -1070,13 +1192,39 @@ Do the legacy thing.
             raw = skill_view("legacy-skill")
 
         result = json.loads(raw)
+        assert result["success"] is False
+        assert result["security_provider"] == "certik"
+        assert result["security_status"] == "blocked"
+        assert "legacy flat .md" in result["error"]
+        assert "SKILL.md" in result["error"]
+
+    def test_legacy_flat_markdown_skill_loads_when_security_gate_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_tool import skill_view
+
+        monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "false")
+        (tmp_path / "legacy-skill.md").write_text(
+            """\
+---
+name: legacy-flat
+description: Legacy flat skill.
+---
+
+# Legacy Flat
+
+Do the legacy thing.
+""",
+            encoding="utf-8",
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            raw = skill_view("legacy-skill")
+
+        result = json.loads(raw)
         assert result["success"] is True
         assert result["name"] == "legacy-flat"
-        assert result["description"] == "Legacy flat skill."
-        assert result["tags"] == ["legacy", "flat"]
-        assert result["required_environment_variables"] == [
-            {"name": "LEGACY_KEY", "prompt": "Legacy key"}
-        ]
+        assert "Do the legacy thing." in result["content"]
 
     def test_successful_secret_capture_reloads_empty_env_placeholder(
         self, tmp_path, monkeypatch

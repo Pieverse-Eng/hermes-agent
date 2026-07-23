@@ -3544,6 +3544,19 @@ def ensure_hub_dirs() -> None:
         taps_file.write_text('{"taps": []}\n')
 
 
+def _forget_certik_skill_security_decision(skill_dir: Path) -> None:
+    try:
+        from tools.skill_security_gate import forget_skill_certik_decision
+
+        forget_skill_certik_decision(skill_dir)
+    except Exception:
+        logger.debug(
+            "Could not clear CertiK skill security stamp for %s",
+            skill_dir,
+            exc_info=True,
+        )
+
+
 def quarantine_bundle(bundle: SkillBundle) -> Path:
     """Write a skill bundle to the quarantine directory for scanning."""
     ensure_hub_dirs()
@@ -3595,6 +3608,7 @@ def install_from_quarantine(
     # path can never refer to a redirected target.
     install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
 
+    _forget_certik_skill_security_decision(install_dir)
     if install_dir.exists():
         shutil.rmtree(install_dir)
 
@@ -3677,6 +3691,7 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     except ValueError as exc:
         return False, f"Refusing to uninstall '{skill_name}': {exc}"
 
+    _forget_certik_skill_security_decision(install_path)
     if install_path.exists():
         shutil.rmtree(install_path)
 

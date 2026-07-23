@@ -3,10 +3,12 @@
 import json
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+import tools.skills_tool as skills_tool_module
 from tools.skill_manager_tool import (
     _validate_name,
     _validate_category,
@@ -21,6 +23,16 @@ from tools.skill_manager_tool import (
     skill_manage,
     MAX_NAME_LENGTH,
 )
+
+
+@pytest.fixture(autouse=True)
+def _allow_certik_skill_view(monkeypatch):
+    """Skill manager tests exercise write guards and mutations, not CertiK."""
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
 
 
 @contextmanager

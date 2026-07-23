@@ -92,23 +92,23 @@ def test_disabled_set_change_invalidates(tmp_path, monkeypatch):
 
 
 def test_ttl_expiry_forces_rescan(tmp_path, monkeypatch):
-    """In-place SKILL.md edits are invisible to any directory signature;
-    the TTL bounds that staleness."""
+    """The TTL backstops filesystems that preserve coarse stat metadata."""
     skill_dir = _write_skill(tmp_path, "cat-a", "skill-one", "old description")
+    skill_file = skill_dir / "SKILL.md"
     first = st._find_all_skills()
     assert first[0]["description"] == "old description"
 
-    # Edit the file in place; keep every directory mtime identical.
+    # Edit the file in place; keep directory and file stat metadata identical.
     import os
     cat = tmp_path / "skills" / "cat-a"
     root = tmp_path / "skills"
-    stats = {p: p.stat() for p in (root, cat, skill_dir)}
-    (skill_dir / "SKILL.md").write_text(
+    stats = {p: p.stat() for p in (root, cat, skill_dir, skill_file)}
+    skill_file.write_text(
         "---\nname: skill-one\ndescription: new description\n---\n# skill-one\n",
         encoding="utf-8",
     )
     for p, s in stats.items():
-        os.utime(p, (s.st_atime, s.st_mtime))
+        os.utime(p, ns=(s.st_atime_ns, s.st_mtime_ns))
 
     # Within TTL: stale (documented trade-off).
     assert st._find_all_skills()[0]["description"] == "old description"

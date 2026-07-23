@@ -2395,6 +2395,50 @@ class TestInstallPathSafety:
         assert not (skills_dir / "bad-skill" / "leak.txt").exists()
         assert secret.read_text() == "data exfiltration payload\n"
 
+    def test_install_and_uninstall_forget_certik_stamp(
+        self, isolated_skills_dir, monkeypatch
+    ):
+        import tools.skills_hub as hub
+        from tools.skills_guard import ScanResult
+
+        quarantine_root = isolated_skills_dir / ".hub" / "quarantine"
+        quarantine_root.mkdir(parents=True)
+        q_dir = quarantine_root / "pending"
+        q_dir.mkdir()
+        (q_dir / "SKILL.md").write_text("---\nname: demo-skill\n---\n")
+
+        bundle = hub.SkillBundle(
+            name="demo-skill",
+            files={"SKILL.md": "---\nname: demo-skill\n---\n"},
+            source="community",
+            identifier="x",
+            trust_level="community",
+        )
+        scan_result = ScanResult(
+            skill_name="demo-skill",
+            source="community",
+            trust_level="community",
+            verdict="safe",
+        )
+        forgotten = []
+        monkeypatch.setattr(
+            hub,
+            "_forget_certik_skill_security_decision",
+            lambda skill_dir: forgotten.append(skill_dir),
+        )
+
+        install_dir = hub.install_from_quarantine(
+            q_dir, "demo-skill", "", bundle, scan_result,
+        )
+        ok, _msg = hub.uninstall_skill("demo-skill")
+
+        assert install_dir == isolated_skills_dir / "demo-skill"
+        assert ok is True
+        assert forgotten == [
+            isolated_skills_dir / "demo-skill",
+            isolated_skills_dir / "demo-skill",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # parallel_search_sources — overall_timeout must be honoured even when a

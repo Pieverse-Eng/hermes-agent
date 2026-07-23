@@ -102,6 +102,148 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    async def _scan_skills_for_session_refresh(
+        self,
+        source: SessionSource,
+        session_entry: Any,
+    ) -> str:
+        report, _reports, _rejected_commands = await (
+            self._scan_skill_security_for_session_refresh_details(
+                source,
+                session_entry,
+            )
+        )
+        return report
+
+    async def _scan_skill_security_for_session_refresh_details(
+        self,
+        source: SessionSource,
+        session_entry: Any,
+        *,
+        include_skill_command_decisions: bool = False,
+    ) -> tuple[str, list[Any], dict[str, str]]:
+        """Preload the session's skill index so commands surface scan results."""
+        enabled = getattr(
+            self,
+            "_skill_security_scan_on_session_refresh",
+            getattr(self, "_skill_security_scan_on_reset", False),
+        )
+        if not enabled:
+            return "", [], {}
+        if source is None or session_entry is None:
+            return "", [], {}
+
+        def _scan() -> tuple[str, list[Any], dict[str, str]]:
+            from agent.prompt_builder import build_skills_system_prompt
+            from agent.skill_commands import snapshot_skill_commands
+            from tools.skill_security_gate import (
+                drain_skill_security_scan_reports,
+                ensure_skill_certik_allowed_for_session_load,
+                format_skill_security_scan_report,
+            )
+
+            default_reason = "CertiK security verification did not allow this skill"
+
+            def _add_rejection(
+                rejected: dict[str, str],
+                identifiers: set[str],
+                reason: str,
+            ) -> None:
+                clean_reason = str(reason or default_reason)
+                for identifier in identifiers:
+                    if identifier:
+                        rejected.setdefault(identifier, clean_reason)
+
+            def _report_identifiers(report: Any) -> set[str]:
+                name = str(getattr(report, "skill_name", "") or "").strip().lower()
+                return {name} if name else set()
+
+            def _command_identifiers(command: str, info: dict[str, Any]) -> set[str]:
+                skill_dir = str((info or {}).get("skill_dir") or "")
+                dir_name = Path(skill_dir).name if skill_dir else ""
+                return {
+                    item
+                    for item in {
+                        str(command or "").lstrip("/").lower(),
+                        str((info or {}).get("name") or "").lower(),
+                        dir_name.lower(),
+                    }
+                    if item
+                }
+
+            drain_skill_security_scan_reports()
+            build_skills_system_prompt()
+            reports = drain_skill_security_scan_reports()
+            rejected: dict[str, str] = {}
+            for report in reports:
+                if getattr(report, "decision", "") == "allow":
+                    continue
+                _add_rejection(
+                    rejected,
+                    _report_identifiers(report),
+                    str(getattr(report, "reason", "") or default_reason),
+                )
+
+            checked_command_security = False
+            if include_skill_command_decisions:
+                for command, info in snapshot_skill_commands().items():
+                    identifiers = _command_identifiers(command, info)
+                    if not identifiers or identifiers & rejected.keys():
+                        continue
+                    skill_dir = str((info or {}).get("skill_dir") or "").strip()
+                    if not skill_dir:
+                        continue
+                    checked_command_security = True
+                    try:
+                        decision = ensure_skill_certik_allowed_for_session_load(
+                            Path(skill_dir)
+                        )
+                    except Exception as exc:
+                        _add_rejection(rejected, identifiers, str(exc) or default_reason)
+                        continue
+                    if not getattr(decision, "allowed", False):
+                        _add_rejection(
+                            rejected,
+                            identifiers,
+                            str(getattr(decision, "reason", "") or default_reason),
+                        )
+
+            if checked_command_security:
+                command_reports = drain_skill_security_scan_reports()
+                if command_reports:
+                    reports.extend(command_reports)
+                    for report in command_reports:
+                        if getattr(report, "decision", "") == "allow":
+                            continue
+                        _add_rejection(
+                            rejected,
+                            _report_identifiers(report),
+                            str(getattr(report, "reason", "") or default_reason),
+                        )
+
+            return format_skill_security_scan_report(reports), reports, rejected
+
+        tokens = None
+        try:
+            from gateway.session import build_session_context
+
+            context = build_session_context(source, self.config, session_entry)
+            set_env = getattr(self, "_set_session_env", None)
+            if callable(set_env):
+                tokens = set_env(context)
+            return await asyncio.to_thread(_scan)
+        except Exception:
+            logger.debug("skill security session refresh scan failed", exc_info=True)
+            return "", [], {}
+        finally:
+            if tokens:
+                try:
+                    clear_env = getattr(self, "_clear_session_env", None)
+                    if callable(clear_env):
+                        clear_env(tokens)
+                except Exception:
+                    logger.debug("skill security session env cleanup failed", exc_info=True)
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
@@ -325,9 +467,12 @@ class GatewaySlashCommandsMixin:
         except Exception:
             _tip_line = ""
 
+        scan_report = await self._scan_skills_for_session_refresh(source, new_entry)
+        report_suffix = f"\n\n{scan_report}" if scan_report else ""
+
         if session_info:
-            return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
-        return EphemeralReply(f"{header}{_tip_line}")
+            return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}{report_suffix}")
+        return EphemeralReply(f"{header}{_tip_line}{report_suffix}")
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile — show active profile name and home directory."""
@@ -4219,12 +4364,112 @@ class GatewaySlashCommandsMixin:
         """
         loop = asyncio.get_running_loop()
         try:
-            from agent.skill_commands import reload_skills
+            from agent.skill_commands import (
+                reload_skills,
+                unregister_skill_commands_for_security,
+            )
 
             result = await loop.run_in_executor(None, reload_skills)
             added = result.get("added", [])      # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)
+            scan_report = ""
+            scan_reports: list[Any] = []
+            rejected_reason_by_name: dict[str, str] = {}
+            if getattr(self, "session_store", None) is not None:
+                session_entry = await self.async_session_store.get_or_create_session(
+                    event.source
+                )
+                scan_report, scan_reports, rejected_reason_by_name = await (
+                    self._scan_skill_security_for_session_refresh_details(
+                        event.source,
+                        session_entry,
+                        include_skill_command_decisions=True,
+                    )
+                )
+            security_rejected = [
+                report
+                for report in scan_reports
+                if getattr(report, "decision", "") != "allow"
+            ]
+            rejected_reason_by_name = dict(rejected_reason_by_name or {})
+            for report in security_rejected:
+                skill_name = str(getattr(report, "skill_name", "")).strip().lower()
+                if not skill_name:
+                    continue
+                rejected_reason_by_name.setdefault(
+                    skill_name,
+                    str(
+                        getattr(report, "reason", "")
+                        or "CertiK security verification did not allow this skill"
+                    ),
+                )
+            pruned_security_commands = unregister_skill_commands_for_security(
+                rejected_reason_by_name.keys()
+            )
+            if pruned_security_commands:
+                try:
+                    total = max(0, int(total or 0) - len(pruned_security_commands))
+                except Exception:
+                    pass
+
+            def _security_reason_for(item: dict) -> str:
+                matched = str(item.get("matched") or "").lower()
+                name = str(item.get("name") or "").lower()
+                return (
+                    rejected_reason_by_name.get(matched)
+                    or rejected_reason_by_name.get(name)
+                    or "CertiK security verification did not allow this skill"
+                )
+
+            security_blocked_by_name: dict[str, dict[str, str]] = {}
+            for item in pruned_security_commands:
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                security_blocked_by_name[name] = {
+                    "name": name,
+                    "description": str(item.get("description") or ""),
+                    "reason": _security_reason_for(item),
+                }
+
+            rejected_display_names = {
+                str(item.get("name") or "").lower()
+                for item in pruned_security_commands
+                if str(item.get("name") or "").strip()
+            }
+            rejected_display_names.update(rejected_reason_by_name.keys())
+
+            def _is_security_rejected_added(item: dict) -> bool:
+                return str(item.get("name") or "").lower() in rejected_display_names
+
+            visible_added = [
+                item for item in added if not _is_security_rejected_added(item)
+            ]
+            for item in added:
+                if not _is_security_rejected_added(item):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                existing = security_blocked_by_name.setdefault(
+                    name,
+                    {
+                        "name": name,
+                        "description": "",
+                        "reason": rejected_reason_by_name.get(
+                            name.lower(),
+                            "CertiK security verification did not allow this skill",
+                        ),
+                    },
+                )
+                if item.get("description"):
+                    existing["description"] = str(item.get("description") or "")
+
+            security_blocked = sorted(
+                security_blocked_by_name.values(),
+                key=lambda item: item.get("name", ""),
+            )
 
             # Let each connected adapter refresh any platform-side state
             # that cached the skill list at startup. Today that's the
@@ -4248,12 +4493,6 @@ class GatewaySlashCommandsMixin:
                         getattr(adapter, "name", adapter), exc,
                     )
 
-            lines = [t("gateway.reload_skills.header")]
-            if not added and not removed:
-                lines.append(t("gateway.reload_skills.no_new"))
-                lines.append(t("gateway.reload_skills.total", count=total))
-                return "\n".join(lines)
-
             def _fmt_line(item: dict) -> str:
                 nm = item.get("name", "")
                 desc = item.get("description", "")
@@ -4261,31 +4500,62 @@ class GatewaySlashCommandsMixin:
                     return t("gateway.reload_skills.item_with_desc", name=nm, desc=desc)
                 return t("gateway.reload_skills.item_no_desc", name=nm)
 
-            if added:
+            def _fmt_security_blocked_line(item: dict) -> str:
+                name = str(item.get("name") or "skill")
+                reason = str(
+                    item.get("reason")
+                    or "CertiK security verification did not allow this skill"
+                )
+                return f"- {name}: {reason}"
+
+            lines = [t("gateway.reload_skills.header")]
+            if not visible_added and not removed and not security_blocked:
+                lines.append(t("gateway.reload_skills.no_new"))
+                lines.append(t("gateway.reload_skills.total", count=total))
+                if scan_report:
+                    lines.extend(["", scan_report])
+                return "\n".join(lines)
+
+            if visible_added:
                 lines.append(t("gateway.reload_skills.added_header"))
-                for item in added:
+                for item in visible_added:
                     lines.append(_fmt_line(item))
             if removed:
                 lines.append(t("gateway.reload_skills.removed_header"))
                 for item in removed:
                     lines.append(_fmt_line(item))
+            if security_blocked:
+                lines.append("Blocked Skills:")
+                for item in security_blocked:
+                    lines.append(_fmt_security_blocked_line(item))
             lines.append(t("gateway.reload_skills.total", count=total))
+            if scan_report:
+                lines.extend(["", scan_report])
 
             # Queue the one-shot note for the next user turn in this session.
             # Format matches how the system prompt renders pre-existing
             # skills (``    - name: description``) so the model reads the
             # diff in the same shape as its original skill catalog.
             sections = ["[USER INITIATED SKILLS RELOAD:"]
-            if added:
+            if visible_added:
                 sections.append("")
                 sections.append("Added Skills:")
-                for item in added:
+                for item in visible_added:
                     sections.append(_fmt_line(item))
             if removed:
                 sections.append("")
                 sections.append("Removed Skills:")
                 for item in removed:
                     sections.append(_fmt_line(item))
+            if security_blocked:
+                sections.append("")
+                sections.append("Blocked Skills:")
+                for item in security_blocked:
+                    sections.append(_fmt_security_blocked_line(item))
+            if scan_report:
+                sections.append("")
+                sections.append("Skill Security Scan:")
+                sections.extend(scan_report.splitlines())
             sections.append("")
             sections.append("Use skills_list to see the updated catalog.]")
             note = "\n".join(sections)

@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from hermes_constants import display_hermes_home
 from agent.skill_preprocessing import (
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_security_blocked: set[str] = set()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -134,6 +135,28 @@ def _resolve_skill_commands_platform() -> Optional[str]:
     except Exception:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
+
+
+def _normalize_skill_security_identifier(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _skill_command_identifiers(
+    cmd: str,
+    info: Dict[str, Any],
+) -> set[str]:
+    name = str((info or {}).get("name") or "")
+    skill_dir = str((info or {}).get("skill_dir") or "")
+    dir_name = Path(skill_dir).name if skill_dir else ""
+    return {
+        item
+        for item in {
+            _normalize_skill_security_identifier(cmd.lstrip("/")),
+            _normalize_skill_security_identifier(name),
+            _normalize_skill_security_identifier(dir_name),
+        }
+        if item
+    }
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
@@ -374,12 +397,20 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
                     if not cmd_name:
                         continue
-                    _skill_commands[f"/{cmd_name}"] = {
+                    cmd_key = f"/{cmd_name}"
+                    command_info = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
                     }
+                    if (
+                        _skill_commands_security_blocked
+                        and _skill_command_identifiers(cmd_key, command_info)
+                        & _skill_commands_security_blocked
+                    ):
+                        continue
+                    _skill_commands[cmd_key] = command_info
                 except Exception:
                     continue
     except Exception:
@@ -400,6 +431,55 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     ):
         scan_skill_commands()
     return _skill_commands
+
+
+def snapshot_skill_commands() -> Dict[str, Dict[str, Any]]:
+    """Return a shallow copy of the current slash-skill cache without rescanning."""
+    return {cmd: dict(info or {}) for cmd, info in _skill_commands.items()}
+
+
+def unregister_skill_commands_for_security(
+    rejected_identifiers: Iterable[str],
+) -> list[dict[str, str]]:
+    """Remove security-rejected skills from the in-process slash map.
+
+    ``rejected_identifiers`` usually contains skill directory names from the
+    CertiK scan report. Match those against the command slug, frontmatter name,
+    and visible skill directory name so a rejected skill cannot remain
+    invokable just because its frontmatter name differs from the directory.
+    """
+    global _skill_commands_security_blocked
+    rejected = {
+        _normalize_skill_security_identifier(item)
+        for item in rejected_identifiers
+        if _normalize_skill_security_identifier(item)
+    }
+    if not rejected:
+        return []
+
+    _skill_commands_security_blocked.update(rejected)
+    removed: list[dict[str, str]] = []
+    for cmd, info in list(_skill_commands.items()):
+        name = str((info or {}).get("name") or "")
+        description = str((info or {}).get("description") or "")
+        skill_dir = str((info or {}).get("skill_dir") or "")
+        dir_name = Path(skill_dir).name if skill_dir else ""
+        identifiers = _skill_command_identifiers(cmd, info or {})
+        matched = sorted(identifiers & rejected)
+        if not matched:
+            continue
+        _skill_commands_security_blocked.update(identifiers)
+        _skill_commands.pop(cmd, None)
+        removed.append(
+            {
+                "name": name or dir_name or cmd.lstrip("/"),
+                "description": description,
+                "skill_dir": skill_dir,
+                "command": cmd,
+                "matched": matched[0],
+            }
+        )
+    return removed
 
 
 def reload_skills() -> Dict[str, Any]:
@@ -441,10 +521,13 @@ def reload_skills() -> Dict[str, Any]:
             out[bare] = (info or {}).get("description") or ""
         return out
 
+    global _skill_commands_security_blocked
+
     before = _snapshot(_skill_commands)
 
     # Rescan the skills dir. ``scan_skill_commands`` resets
     # ``_skill_commands = {}`` internally and repopulates it.
+    _skill_commands_security_blocked = set()
     new_commands = scan_skill_commands()
 
     after = _snapshot(new_commands)

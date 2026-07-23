@@ -2,13 +2,15 @@
 
 Agent writes (create/edit/patch/write_file) are constrained to
 MAX_SKILL_CONTENT_CHARS (100k) and MAX_SKILL_FILE_BYTES (1 MiB).
-Hand-placed and hub-installed skills have no hard limit.
+Runtime CertiK archive preparation applies separate package-size limits.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+import tools.skills_tool as skills_tool_module
 from tools.skill_manager_tool import (
     MAX_SKILL_CONTENT_CHARS,
     _validate_content_size,
@@ -24,6 +26,11 @@ def isolate_skills(tmp_path, monkeypatch):
     monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
     monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
     return skills_dir
 
 
@@ -192,8 +199,8 @@ class TestWriteFileSizeLimit:
         assert result["success"] is True
 
 
-class TestHandPlacedSkillsNoLimit:
-    """Skills dropped directly on disk are not constrained."""
+class TestHandPlacedSkillsWithinScanLimit:
+    """Hand-placed skills can load when they fit the runtime scan archive budget."""
 
     def test_oversized_handplaced_skill_loads(self, isolate_skills, tmp_path):
         """A hand-placed 200k skill can still be read via skill_view."""

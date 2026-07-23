@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +13,7 @@ from agent.skill_commands import (
     build_skill_invocation_message,
     resolve_skill_command_key,
     scan_skill_commands,
+    unregister_skill_commands_for_security,
 )
 
 
@@ -50,6 +52,16 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     return external_category
 
 
+@pytest.fixture(autouse=True)
+def _allow_certik_skill_view(monkeypatch):
+    """Slash-command tests exercise invocation wrapping, not CertiK decisions."""
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
+
+
 class TestScanSkillCommands:
     def test_finds_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -57,6 +69,17 @@ class TestScanSkillCommands:
             result = scan_skill_commands()
         assert "/my-skill" in result
         assert result["/my-skill"]["name"] == "my-skill"
+
+    def test_unregister_security_rejected_skill_removes_slash_command(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "blocked-skill")
+            scan_skill_commands()
+            removed = unregister_skill_commands_for_security(["blocked-skill"])
+            message = build_skill_invocation_message("/blocked-skill")
+
+        assert [item["name"] for item in removed] == ["blocked-skill"]
+        assert removed[0]["command"] == "/blocked-skill"
+        assert message is None
 
     def test_empty_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

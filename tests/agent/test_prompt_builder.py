@@ -391,9 +391,17 @@ class TestPromptBuilderImports:
 
 class TestBuildSkillsSystemPrompt:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
+    def _clear_skills_cache(self, monkeypatch):
         """Ensure the in-process skills prompt cache doesn't leak between tests."""
-        from agent.prompt_builder import clear_skills_system_prompt_cache
+        prompt_globals = build_skills_system_prompt.__globals__
+        clear_skills_system_prompt_cache = prompt_globals[
+            "clear_skills_system_prompt_cache"
+        ]
+        monkeypatch.setitem(
+            prompt_globals,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: True,
+        )
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -414,6 +422,24 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_excludes_skill_blocked_by_security_gate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "blocked-skill"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: blocked-skill\ndescription: Blocked by CertiK\n---\n"
+        )
+        monkeypatch.setitem(
+            build_skills_system_prompt.__globals__,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: False,
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "blocked-skill" not in result
+        assert result == ""
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -521,6 +547,78 @@ class TestBuildSkillsSystemPrompt:
 
         assert "imessage" in result
         assert "Send iMessages" in result
+
+    def test_snapshot_fast_path_excludes_inactive_environment_skills(
+        self, monkeypatch, tmp_path
+    ):
+        """Disk snapshots must preserve and apply the environments filter."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("agent.skill_utils._detect_environment", lambda _env: False)
+
+        general_skill = tmp_path / "skills" / "general" / "always-on"
+        general_skill.mkdir(parents=True)
+        (general_skill / "SKILL.md").write_text(
+            "---\nname: always-on\ndescription: Always visible\n---\n"
+        )
+
+        kanban_skill = tmp_path / "skills" / "devops" / "kanban-worker"
+        kanban_skill.mkdir(parents=True)
+        (kanban_skill / "SKILL.md").write_text(
+            "---\n"
+            "name: kanban-worker\n"
+            "description: Handle kanban work\n"
+            "environments: [kanban]\n"
+            "---\n"
+        )
+
+        first = build_skills_system_prompt()
+        assert "always-on" in first
+        assert "kanban-worker" not in first
+
+        prompt_globals = build_skills_system_prompt.__globals__
+        prompt_globals["clear_skills_system_prompt_cache"](clear_snapshot=False)
+        monkeypatch.setitem(
+            prompt_globals,
+            "_parse_skill_file",
+            lambda _skill_file: pytest.fail("snapshot fast path should be used"),
+        )
+
+        second = build_skills_system_prompt()
+        assert "always-on" in second
+        assert "kanban-worker" not in second
+
+    def test_snapshot_keeps_environment_skill_description_for_later_activation(
+        self, monkeypatch, tmp_path
+    ):
+        """An inactive environment should not write a lossy snapshot entry."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("agent.skill_utils._detect_environment", lambda _env: False)
+
+        skill_dir = tmp_path / "skills" / "devops" / "kanban-worker"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: kanban-worker\n"
+            "description: Handle kanban work\n"
+            "environments: [kanban]\n"
+            "---\n"
+        )
+
+        first = build_skills_system_prompt()
+        assert "kanban-worker" not in first
+
+        prompt_globals = build_skills_system_prompt.__globals__
+        prompt_globals["clear_skills_system_prompt_cache"](clear_snapshot=False)
+        monkeypatch.setattr("agent.skill_utils._detect_environment", lambda _env: True)
+        monkeypatch.setitem(
+            prompt_globals,
+            "_parse_skill_file",
+            lambda _skill_file: pytest.fail("snapshot fast path should be used"),
+        )
+
+        second = build_skills_system_prompt()
+        assert "kanban-worker" in second
+        assert "Handle kanban work" in second
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""
@@ -1416,8 +1514,16 @@ class TestSkillShouldShow:
 
 class TestBuildSkillsSystemPromptConditional:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
-        from agent.prompt_builder import clear_skills_system_prompt_cache
+    def _clear_skills_cache(self, monkeypatch):
+        prompt_globals = build_skills_system_prompt.__globals__
+        clear_skills_system_prompt_cache = prompt_globals[
+            "clear_skills_system_prompt_cache"
+        ]
+        monkeypatch.setitem(
+            prompt_globals,
+            "_skill_security_allows_prompt_include",
+            lambda _skill_dir: True,
+        )
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -1644,5 +1750,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
