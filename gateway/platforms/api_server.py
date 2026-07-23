@@ -156,13 +156,13 @@ def _chat_completion_request_controls(request: "web.Request", body: Dict[str, An
     structured_output = contract == STRUCTURED_OUTPUT_CONTRACT_VERSION
     if structured_output and (
         ("stream" in body and body["stream"] is not False)
-        or temperature != 0.1
-        or thinking_value != {"type": "disabled"}
+        or temperature != 1.0
+        or thinking_value != {"type": "adaptive"}
     ):
         return None, None, False, web.json_response(
             _openai_error(
-                "Structured-output requests require stream=false, temperature=0.1, "
-                'and thinking={"type":"disabled"}'
+                "Structured-output requests require stream=false, temperature=1.0, "
+                'and thinking={"type":"adaptive"}'
             ),
             status=400,
         )

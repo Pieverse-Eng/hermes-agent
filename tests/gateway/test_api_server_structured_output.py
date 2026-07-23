@@ -46,8 +46,8 @@ async def test_structured_contract_is_strict_and_passed_request_locally():
                 json={
                     "model": "MiniMax-M3",
                     "stream": False,
-                    "temperature": 0.1,
-                    "thinking": {"type": "disabled"},
+                    "temperature": 1.0,
+                    "thinking": {"type": "adaptive"},
                     "messages": [{"role": "user", "content": "Return JSON."}],
                 },
             )
@@ -56,10 +56,10 @@ async def test_structured_contract_is_strict_and_passed_request_locally():
         assert response.status == 200
         kwargs = run_agent.await_args.kwargs
         assert kwargs["request_overrides"] == {
-            "temperature": 0.1,
-            "extra_body": {"thinking": {"type": "disabled"}},
+            "temperature": 1.0,
+            "extra_body": {"thinking": {"type": "adaptive"}},
         }
-        assert kwargs["reasoning_config_override"] == {"enabled": False}
+        assert kwargs["reasoning_config_override"] == {"enabled": True}
         assert payload["choices"][0]["message"]["reasoning_content"] == (
             'analysis\n{"status":"ok"}'
         )
@@ -69,17 +69,18 @@ async def test_structured_contract_is_strict_and_passed_request_locally():
 @pytest.mark.parametrize(
     "body",
     [
-        {"temperature": 0.1},
-        {"thinking": {"type": "disabled"}},
-        {"temperature": True, "thinking": {"type": "disabled"}},
-        {"temperature": 0.2, "thinking": {"type": "disabled"}},
-        {"temperature": 0.1, "thinking": {"type": "enabled"}},
-        {"temperature": 0.1, "thinking": {"type": "disabled", "extra": True}},
-        {"stream": "garbage", "temperature": 0.1, "thinking": {"type": "disabled"}},
-        {"stream": [], "temperature": 0.1, "thinking": {"type": "disabled"}},
-        {"stream": {}, "temperature": 0.1, "thinking": {"type": "disabled"}},
-        {"stream": 0, "temperature": 0.1, "thinking": {"type": "disabled"}},
-        {"stream": None, "temperature": 0.1, "thinking": {"type": "disabled"}},
+        {"temperature": 1.0},
+        {"thinking": {"type": "adaptive"}},
+        {"temperature": True, "thinking": {"type": "adaptive"}},
+        {"temperature": 0.2, "thinking": {"type": "adaptive"}},
+        {"temperature": 1.0, "thinking": {"type": "disabled"}},
+        {"temperature": 1.0, "thinking": {"type": "enabled"}},
+        {"temperature": 1.0, "thinking": {"type": "adaptive", "extra": True}},
+        {"stream": "garbage", "temperature": 1.0, "thinking": {"type": "adaptive"}},
+        {"stream": [], "temperature": 1.0, "thinking": {"type": "adaptive"}},
+        {"stream": {}, "temperature": 1.0, "thinking": {"type": "adaptive"}},
+        {"stream": 0, "temperature": 1.0, "thinking": {"type": "adaptive"}},
+        {"stream": None, "temperature": 1.0, "thinking": {"type": "adaptive"}},
     ],
 )
 async def test_structured_contract_rejects_any_non_exact_controls(body):
@@ -217,8 +218,8 @@ async def test_structured_controls_do_not_leak_to_subsequent_or_concurrent_reque
                     "/v1/chat/completions",
                     headers={"X-Hermes-Structured-Output": "devops-structured-v1"},
                     json={
-                        "temperature": 0.1,
-                        "thinking": {"type": "disabled"},
+                        "temperature": 1.0,
+                        "thinking": {"type": "adaptive"},
                         "messages": [{"role": "user", "content": "structured"}],
                     },
                 )
@@ -236,10 +237,10 @@ async def test_structured_controls_do_not_leak_to_subsequent_or_concurrent_reque
         assert [response.status for response in responses] == [200, 200]
         assert seen["structured"] == {
             "request_overrides": {
-                "temperature": 0.1,
-                "extra_body": {"thinking": {"type": "disabled"}},
+                "temperature": 1.0,
+                "extra_body": {"thinking": {"type": "adaptive"}},
             },
-            "reasoning_config_override": {"enabled": False},
+            "reasoning_config_override": {"enabled": True},
         }
         assert seen["unrelated"] == {
             "request_overrides": None,
@@ -311,8 +312,8 @@ async def test_structured_response_omits_oversized_reasoning_content():
                 headers={"X-Hermes-Structured-Output": "devops-structured-v1"},
                 json={
                     "stream": False,
-                    "temperature": 0.1,
-                    "thinking": {"type": "disabled"},
+                    "temperature": 1.0,
+                    "thinking": {"type": "adaptive"},
                     "messages": [{"role": "user", "content": "Return JSON."}],
                 },
             )
@@ -353,24 +354,24 @@ def test_create_agent_keeps_structured_controls_on_one_fresh_agent(monkeypatch):
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
     structured_overrides = {
-        "temperature": 0.1,
-        "extra_body": {"thinking": {"type": "disabled"}},
+        "temperature": 1.0,
+        "extra_body": {"thinking": {"type": "adaptive"}},
     }
 
     adapter._create_agent(
         session_id="structured",
         request_overrides=structured_overrides,
-        reasoning_config_override={"enabled": False},
+        reasoning_config_override={"enabled": True},
     )
     adapter._create_agent(session_id="unrelated")
 
     assert captured[0]["request_overrides"] == structured_overrides
-    assert captured[0]["reasoning_config"] == {"enabled": False}
+    assert captured[0]["reasoning_config"] == {"enabled": True}
     assert captured[1].get("request_overrides") in (None, {})
     assert captured[1]["reasoning_config"] == {"enabled": True, "effort": "medium"}
     assert structured_overrides == {
-        "temperature": 0.1,
-        "extra_body": {"thinking": {"type": "disabled"}},
+        "temperature": 1.0,
+        "extra_body": {"thinking": {"type": "adaptive"}},
     }
 
 
@@ -382,12 +383,12 @@ def test_minimax_provider_wire_kwargs_keep_exact_structured_controls():
         messages=[{"role": "user", "content": "Return JSON."}],
         provider_profile=profile,
         base_url="https://api.minimax.io/v1",
-        reasoning_config={"enabled": False},
+        reasoning_config={"enabled": True},
         request_overrides={
-            "temperature": 0.1,
-            "extra_body": {"thinking": {"type": "disabled"}},
+            "temperature": 1.0,
+            "extra_body": {"thinking": {"type": "adaptive"}},
         },
     )
 
-    assert kwargs["temperature"] == 0.1
-    assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+    assert kwargs["temperature"] == 1.0
+    assert kwargs["extra_body"]["thinking"] == {"type": "adaptive"}
