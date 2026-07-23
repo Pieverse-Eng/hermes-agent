@@ -548,6 +548,78 @@ class TestBuildSkillsSystemPrompt:
         assert "imessage" in result
         assert "Send iMessages" in result
 
+    def test_snapshot_fast_path_excludes_inactive_environment_skills(
+        self, monkeypatch, tmp_path
+    ):
+        """Disk snapshots must preserve and apply the environments filter."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("agent.skill_utils._detect_environment", lambda _env: False)
+
+        general_skill = tmp_path / "skills" / "general" / "always-on"
+        general_skill.mkdir(parents=True)
+        (general_skill / "SKILL.md").write_text(
+            "---\nname: always-on\ndescription: Always visible\n---\n"
+        )
+
+        kanban_skill = tmp_path / "skills" / "devops" / "kanban-worker"
+        kanban_skill.mkdir(parents=True)
+        (kanban_skill / "SKILL.md").write_text(
+            "---\n"
+            "name: kanban-worker\n"
+            "description: Handle kanban work\n"
+            "environments: [kanban]\n"
+            "---\n"
+        )
+
+        first = build_skills_system_prompt()
+        assert "always-on" in first
+        assert "kanban-worker" not in first
+
+        prompt_globals = build_skills_system_prompt.__globals__
+        prompt_globals["clear_skills_system_prompt_cache"](clear_snapshot=False)
+        monkeypatch.setitem(
+            prompt_globals,
+            "_parse_skill_file",
+            lambda _skill_file: pytest.fail("snapshot fast path should be used"),
+        )
+
+        second = build_skills_system_prompt()
+        assert "always-on" in second
+        assert "kanban-worker" not in second
+
+    def test_snapshot_keeps_environment_skill_description_for_later_activation(
+        self, monkeypatch, tmp_path
+    ):
+        """An inactive environment should not write a lossy snapshot entry."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("agent.skill_utils._detect_environment", lambda _env: False)
+
+        skill_dir = tmp_path / "skills" / "devops" / "kanban-worker"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: kanban-worker\n"
+            "description: Handle kanban work\n"
+            "environments: [kanban]\n"
+            "---\n"
+        )
+
+        first = build_skills_system_prompt()
+        assert "kanban-worker" not in first
+
+        prompt_globals = build_skills_system_prompt.__globals__
+        prompt_globals["clear_skills_system_prompt_cache"](clear_snapshot=False)
+        monkeypatch.setattr("agent.skill_utils._detect_environment", lambda _env: True)
+        monkeypatch.setitem(
+            prompt_globals,
+            "_parse_skill_file",
+            lambda _skill_file: pytest.fail("snapshot fast path should be used"),
+        )
+
+        second = build_skills_system_prompt()
+        assert "kanban-worker" in second
+        assert "Handle kanban work" in second
+
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

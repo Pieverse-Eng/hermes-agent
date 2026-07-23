@@ -15,7 +15,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
+from typing import Any, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -1255,7 +1255,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 2
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1418,6 +1418,15 @@ def _skill_security_allows_prompt_include(skill_dir: Path) -> bool:
         return False
 
 
+def _frontmatter_string_list(value: Any) -> list[str]:
+    """Normalize scalar/list frontmatter fields stored in skill snapshots."""
+    if not value:
+        return []
+    if not isinstance(value, list):
+        value = [value]
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 def _build_snapshot_entry(
     skill_file: Path,
     skills_dir: Path,
@@ -1434,17 +1443,14 @@ def _build_snapshot_entry(
         category = "general"
         skill_name = skill_file.parent.name
 
-    platforms = frontmatter.get("platforms") or []
-    if isinstance(platforms, str):
-        platforms = [platforms]
-
     return {
         "skill_name": skill_name,
         "skill_rel_dir": skill_file.parent.relative_to(skills_dir).as_posix(),
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
-        "platforms": [str(p).strip() for p in platforms if str(p).strip()],
+        "platforms": _frontmatter_string_list(frontmatter.get("platforms")),
+        "environments": _frontmatter_string_list(frontmatter.get("environments")),
         "conditions": extract_skill_conditions(frontmatter),
     }
 
@@ -1462,18 +1468,19 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     try:
         raw = skill_file.read_text(encoding="utf-8")
         frontmatter, _ = parse_frontmatter(raw)
+        description = extract_skill_description(frontmatter)
 
         if not skill_matches_platform(frontmatter):
-            return False, frontmatter, ""
+            return False, frontmatter, description
 
         # Environment relevance gate (offer-time only): hide skills tagged for
         # a runtime environment that isn't active (e.g. kanban-only skills for
         # non-kanban users, s6-only skills outside the container). Explicit
         # loads (skill_view / --skills) bypass this — see skill_matches_environment.
         if not skill_matches_environment(frontmatter):
-            return False, frontmatter, ""
+            return False, frontmatter, description
 
-        return True, frontmatter, extract_skill_description(frontmatter)
+        return True, frontmatter, description
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
         return True, {}, ""
@@ -1595,6 +1602,10 @@ def build_skills_system_prompt(
             frontmatter_name = entry.get("frontmatter_name") or skill_name
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
+                continue
+            if not skill_matches_environment(
+                {"environments": entry.get("environments") or []}
+            ):
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
