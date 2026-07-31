@@ -1,9 +1,9 @@
 """Channel Gateway-managed WhatsApp adapter for hosted Hermes runtimes.
 
-This adapter deliberately contains no Meta Cloud API or WhatsApp Web logic.
-Channel Gateway owns Meta webhook verification, pairing, deduplication, and
-Graph API credentials. Hermes receives a versioned internal event over an
-authenticated in-cluster webhook and sends replies through a tenant-scoped
+This adapter deliberately contains no linked-device session logic. The platform
+session gateway owns QR linking, encrypted session state, deduplication, and the
+persistent WhatsApp connection. Hermes receives a versioned internal event over
+an authenticated in-cluster webhook and sends replies through a tenant-scoped
 Channel Gateway endpoint.
 """
 
@@ -65,7 +65,7 @@ def _normalize_gateway_url(value: str) -> str:
 
 
 def validate_config(config: PlatformConfig) -> bool:
-    """Require only the per-instance bridge identity, never Meta credentials."""
+    """Require only the per-instance Channel Gateway bridge identity."""
     return bool(
         _resolve_tenant_token(config)
         and _resolve_instance_id(config)
@@ -169,7 +169,37 @@ class WhatsAppGatewayAdapter(BasePlatformAdapter):
         self._runner = None
         self._site = None
         self._client = None
-        self._seen_message_ids: dict[str, None] = {}
+        self._seen_message_ids: dict[str, Optional[asyncio.Task[None]]] = {}
+
+    def _finish_inbound_task(
+        self,
+        message_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = asyncio.CancelledError()
+        if self._seen_message_ids.get(message_id) is not task:
+            return
+        if error is None:
+            self._seen_message_ids[message_id] = None
+        else:
+            self._seen_message_ids.pop(message_id, None)
+
+    async def _wait_for_inbound_task(
+        self,
+        message_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            if task.done() and self._seen_message_ids.get(message_id) is task:
+                self._seen_message_ids.pop(message_id, None)
+            raise
+        if self._seen_message_ids.get(message_id) is task:
+            self._seen_message_ids[message_id] = None
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -256,12 +286,18 @@ class WhatsAppGatewayAdapter(BasePlatformAdapter):
         message = envelope["message"]
         message_id = message["id"]
         if message_id in self._seen_message_ids:
+            in_flight = self._seen_message_ids[message_id]
+            if in_flight is not None:
+                await self._wait_for_inbound_task(message_id, in_flight)
             return web.json_response({"ok": True, "duplicate": True})
         if len(self._seen_message_ids) >= MAX_SEEN_MESSAGE_IDS:
-            self._seen_message_ids.pop(next(iter(self._seen_message_ids)))
-        self._seen_message_ids[message_id] = None
+            for completed_id, in_flight in self._seen_message_ids.items():
+                if in_flight is None:
+                    self._seen_message_ids.pop(completed_id)
+                    break
 
         if message["type"] != "text" or not message.get("text"):
+            self._seen_message_ids[message_id] = None
             return web.json_response({"ok": True, "ignored": True})
 
         timestamp = message.get("timestampMs")
@@ -289,11 +325,15 @@ class WhatsAppGatewayAdapter(BasePlatformAdapter):
             ),
             metadata={"central_gateway": True},
         )
-        try:
-            await self.handle_message(event)
-        except BaseException:
-            self._seen_message_ids.pop(message_id, None)
-            raise
+        task = asyncio.create_task(self.handle_message(event))
+        self._seen_message_ids[message_id] = task
+        task.add_done_callback(
+            lambda completed, claimed_id=message_id: self._finish_inbound_task(
+                claimed_id,
+                completed,
+            )
+        )
+        await self._wait_for_inbound_task(message_id, task)
         return web.json_response({"ok": True})
 
     async def send(
@@ -411,7 +451,7 @@ class WhatsAppGatewayAdapter(BasePlatformAdapter):
                     )
         except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError) as exc:
             # The connection was never established, so Channel Gateway could
-            # not have forwarded this chunk to Meta.
+            # not have forwarded this chunk to the linked-device session worker.
             return SendResult(success=False, error=str(exc), retryable=True)
         except (
             aiohttp.SocketTimeoutError,
@@ -420,7 +460,7 @@ class WhatsAppGatewayAdapter(BasePlatformAdapter):
             TimeoutError,
         ) as exc:
             # Once a connection exists, timeout/disconnect errors leave the
-            # Meta result unknown. Retrying could duplicate a delivered chunk.
+            # delivery result unknown. Retrying could duplicate a delivered chunk.
             return SendResult(success=False, error=str(exc), retryable=False)
         except Exception as exc:
             # Unknown transport failures are fail-closed for delivery: prefer

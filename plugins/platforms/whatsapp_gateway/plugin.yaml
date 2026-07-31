@@ -3,10 +3,10 @@ label: WhatsApp (Channel Gateway-managed)
 kind: platform
 version: 1.0.0
 description: >
-  Thin platform adapter for Channel Gateway-managed WhatsApp delivery. Receives
-  authenticated normalized events from Pieverse Channel Gateway and sends
-  replies through its tenant-scoped endpoint. Meta credentials never enter
-  the Hermes tenant.
+  Thin platform adapter for Channel Gateway-managed WhatsApp linked-device
+  delivery. Receives authenticated normalized events from Pieverse Channel
+  Gateway and sends replies through its tenant-scoped endpoint. Linked-device
+  session state remains in the platform session gateway.
 author: Pieverse Platform
 optional_env:
   - name: CHANNEL_GATEWAY_TENANT_TOKEN

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 from types import SimpleNamespace
@@ -207,6 +208,95 @@ async def test_failed_gateway_delivery_can_be_retried():
     assert retry.status == 200
     assert duplicate.status == 200
     assert adapter.handle_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_repeated_gateway_delivery_waits_for_in_flight_dispatch():
+    adapter = _whatsapp_gateway.WhatsAppGatewayAdapter(_config())
+    dispatch_started = asyncio.Event()
+    release_dispatch = asyncio.Event()
+
+    async def handle_message(_event):
+        dispatch_started.set()
+        await release_dispatch.wait()
+
+    adapter.handle_message = AsyncMock(side_effect=handle_message)
+    payload = {
+        "version": 1,
+        "channel": "whatsapp",
+        "event": "message",
+        "message": {
+            "id": "wamid.in-flight",
+            "chatId": "15551234567",
+            "senderId": "15551234567",
+            "type": "text",
+            "text": "hello",
+        },
+    }
+    request = MagicMock()
+    request.headers = {_whatsapp_gateway.TENANT_TOKEN_HEADER: "tenant-token"}
+    request.content_length = None
+    request.read = AsyncMock(return_value=json.dumps(payload).encode())
+
+    first = asyncio.create_task(adapter._handle_webhook(request))
+    await dispatch_started.wait()
+    duplicate = asyncio.create_task(adapter._handle_webhook(request))
+    await asyncio.sleep(0)
+
+    assert first.done() is False
+    assert duplicate.done() is False
+    adapter.handle_message.assert_awaited_once()
+
+    release_dispatch.set()
+    first_response, duplicate_response = await asyncio.gather(first, duplicate)
+
+    assert first_response.status == 200
+    assert duplicate_response.status == 200
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_in_flight_failure_is_returned_to_every_duplicate_waiter():
+    adapter = _whatsapp_gateway.WhatsAppGatewayAdapter(_config())
+    dispatch_started = asyncio.Event()
+    release_dispatch = asyncio.Event()
+
+    async def handle_message(_event):
+        dispatch_started.set()
+        await release_dispatch.wait()
+        raise RuntimeError("dispatch failed")
+
+    adapter.handle_message = AsyncMock(side_effect=handle_message)
+    payload = {
+        "version": 1,
+        "channel": "whatsapp",
+        "event": "message",
+        "message": {
+            "id": "wamid.in-flight-failure",
+            "chatId": "15551234567",
+            "senderId": "15551234567",
+            "type": "text",
+            "text": "hello",
+        },
+    }
+    request = MagicMock()
+    request.headers = {_whatsapp_gateway.TENANT_TOKEN_HEADER: "tenant-token"}
+    request.content_length = None
+    request.read = AsyncMock(return_value=json.dumps(payload).encode())
+
+    first = asyncio.create_task(adapter._handle_webhook(request))
+    await dispatch_started.wait()
+    duplicate = asyncio.create_task(adapter._handle_webhook(request))
+    await asyncio.sleep(0)
+    release_dispatch.set()
+
+    results = await asyncio.gather(first, duplicate, return_exceptions=True)
+
+    assert all(
+        isinstance(result, RuntimeError) and str(result) == "dispatch failed"
+        for result in results
+    )
+    adapter.handle_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
