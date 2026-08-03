@@ -42,6 +42,7 @@ MAX_TIMESTAMP_MS = 253_402_300_799_000
 MAX_SEEN_MESSAGE_IDS = 10_000
 MAX_CHUNK_SEND_ATTEMPTS = 3
 SAFE_RETRY_DELAYS_SECONDS = (0.25, 0.75)
+GATEWAY_SEND_TIMEOUT_SECONDS = 20
 
 
 def _extra_string(config: PlatformConfig, key: str, default: str = "") -> str:
@@ -219,7 +220,9 @@ class WhatsAppGatewayAdapter(BasePlatformAdapter):
         if self._runner is not None:
             return True
 
-        self._client = ClientSession(timeout=ClientTimeout(total=10))
+        self._client = ClientSession(
+            timeout=ClientTimeout(total=GATEWAY_SEND_TIMEOUT_SECONDS)
+        )
         app = web.Application(client_max_size=MAX_WEBHOOK_BODY_BYTES)
         app.router.add_post(self._path, self._handle_webhook)
         app.router.add_get("/", self._handle_health)

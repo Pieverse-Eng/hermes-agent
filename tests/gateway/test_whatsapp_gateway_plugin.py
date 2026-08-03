@@ -91,6 +91,10 @@ def test_dynamic_platform_identity_and_config_contract():
     assert _whatsapp_gateway.validate_config(PlatformConfig(enabled=True)) is False
 
 
+def test_outbound_timeout_outlives_channel_gateway_worker_timeout():
+    assert _whatsapp_gateway.GATEWAY_SEND_TIMEOUT_SECONDS == 20
+
+
 def test_normalized_envelope_validation():
     valid = {
         "version": 1,
