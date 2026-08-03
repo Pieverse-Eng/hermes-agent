@@ -295,13 +295,13 @@ gateway:
       extra:
         allow_from: ["111", "222", "333"]
         allow_admin_from: ["111"]                    # admins → all slash commands
-        user_allowed_commands: [status, usage]       # user-role commands non-admins may run
+        user_allowed_commands: [status, usage]       # optional narrowing list for non-admins
         # Optional: separate group/channel scope
         group_allow_admin_from: ["111"]
         group_user_allowed_commands: [status]
 ```
 
-**Fail-closed migration:** if `allow_admin_from` is missing, empty, or malformed for a scope, nobody receives admin authority in that scope. Plain chat, `/help`, and `/whoami` still work. Every built-in has an explicit minimum role, and `user_allowed_commands` cannot downgrade admin-role commands such as `/model`, `/skills`, `/plugins`, `/restart`, or `/update`. Unknown/plugin commands default to admin.
+**Fail-closed migration:** if `allow_admin_from` is missing, empty, or malformed for a scope, nobody receives admin authority in that scope. Plain chat and explicit user-role commands still work. Omitting `user_allowed_commands` exposes all user-role built-ins; setting it narrows that surface, and an empty list leaves `/help` plus `/whoami`. A narrowing list cannot downgrade admin-role commands such as `/model`, `/skills`, `/plugins`, `/restart`, or `/update`. Unknown/plugin commands default to admin.
 
 #### Inspecting your access
 

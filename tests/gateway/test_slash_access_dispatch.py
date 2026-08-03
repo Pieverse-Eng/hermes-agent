@@ -8,9 +8,9 @@ construction pattern as test_status_command.py.
 Coverage targets:
   - Missing/empty admin lists fail closed for privileged commands.
   - Admin path: user in ``allow_admin_from`` runs anything.
-  - User path: user not in admin list, but command in
-    ``user_allowed_commands`` → allowed.
-  - User denied: command not in either list → returns the ⛔ denial.
+  - User path: explicit user-role commands are available by default, with
+    ``user_allowed_commands`` available as an optional narrowing list.
+  - User denied: command excluded by an explicit narrowing list → ⛔.
   - Always-allowed floor: /help and /whoami reachable for non-admins
     even with empty user_allowed_commands.
   - DM vs group scope isolation.
@@ -122,6 +122,7 @@ async def test_whoami_reports_user_when_no_admin_list():
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
     assert "Tier: user" in result
     assert "unrestricted" not in result
+    assert "/status" in result
 
 
 @pytest.mark.asyncio
@@ -179,7 +180,7 @@ async def test_non_admin_with_empty_user_commands_gets_floor_only():
     # /stop denied
     result = await runner._handle_message(_make_event("/stop", _make_source(user_id="999")))
     assert "⛔" in result
-    assert "No slash commands are enabled" in result
+    assert "You can run: /help, /whoami" in result
     # /whoami still works (always-allowed floor)
     whoami_result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
     assert "Tier: user" in whoami_result

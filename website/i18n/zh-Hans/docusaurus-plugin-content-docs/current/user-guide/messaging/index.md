@@ -255,13 +255,13 @@ gateway:
       extra:
         allow_from: ["111", "222", "333"]
         allow_admin_from: ["111"]                    # 管理员 → 所有斜杠命令
-        user_allowed_commands: [status, usage]       # 非管理员可运行的用户级命令
+        user_allowed_commands: [status, usage]       # 可选：缩小非管理员的命令范围
         # 可选：单独配置群组/频道范围
         group_allow_admin_from: ["111"]
         group_user_allowed_commands: [status]
 ```
 
-**默认拒绝迁移：** 如果某个范围的 `allow_admin_from` 缺失、为空或格式错误，该范围内无人获得管理员权限。普通聊天以及 `/help`、`/whoami` 仍可使用。每个内置命令都有明确的最低角色，`user_allowed_commands` 不能降低 `/model`、`/skills`、`/plugins`、`/restart`、`/update` 等管理员命令的权限；未知命令和插件命令默认需要管理员权限。
+**默认拒绝迁移：** 如果某个范围的 `allow_admin_from` 缺失、为空或格式错误，该范围内无人获得管理员权限。普通聊天和明确的用户级命令仍可使用。省略 `user_allowed_commands` 表示全部用户级内置命令；设置该字段会缩小范围，空列表只保留 `/help` 与 `/whoami`。缩小列表不能降低 `/model`、`/skills`、`/plugins`、`/restart`、`/update` 等管理员命令的权限；未知命令和插件命令默认需要管理员权限。
 
 #### 查看你的权限
 

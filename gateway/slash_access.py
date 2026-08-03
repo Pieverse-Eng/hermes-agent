@@ -9,20 +9,20 @@ Two lists per platform scope (DM vs group, mirroring ``allow_from`` vs
 
   - ``allow_admin_from``      — user IDs that get every registered slash
                                 command (built-in + plugin-registered).
-  - ``user_allowed_commands`` — slash command names non-admin users may
-                                run. Empty / unset → non-admins get no
-                                slash commands.
+  - ``user_allowed_commands`` — optional narrowing list for non-admin users.
+                                Unset → every explicit user-role command;
+                                present but empty → only the safety floor.
 
 Missing, empty, or malformed admin lists fail closed for privileged commands.
 The explicit built-in role inventory in ``hermes_cli.commands`` is an upper
-bound: ``user_allowed_commands`` may narrow/enable ordinary user commands but
-can never downgrade an admin command. Unknown/plugin commands default to admin.
+bound: ``user_allowed_commands`` may narrow ordinary user commands but can
+never downgrade an admin command. Unknown/plugin commands default to admin.
 
 The gate is applied at the slash command dispatch site in
 ``gateway/run.py`` so it covers BOTH built-in and plugin-registered
 commands via the live registry. Gating slash commands does not affect
-plain chat — non-admin users can still talk to the agent normally,
-they just can't trigger commands outside ``user_allowed_commands``.
+plain chat — non-admin users can still talk to the agent normally and run
+explicit user-role commands unless an operator narrows that surface.
 
 Authored as a slimmed-down salvage of PR #4443's permission tiers
 (co-authored by @ReqX). The full tier system, audit log, usage
@@ -35,7 +35,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Iterable, Optional, Tuple
 
-from hermes_cli.commands import minimum_role_for_command
+from hermes_cli.commands import (
+    BUILTIN_COMMAND_MINIMUM_ROLES,
+    minimum_role_for_command,
+)
 
 
 # Slash commands that MUST stay reachable for any allowed user, even when
@@ -50,6 +53,12 @@ _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
     "whoami",
 })
 
+_USER_ROLE_BUILTINS: FrozenSet[str] = frozenset(
+    command
+    for command, minimum_role in BUILTIN_COMMAND_MINIMUM_ROLES.items()
+    if minimum_role == "user"
+)
+
 
 @dataclass(frozen=True)
 class SlashAccessPolicy:
@@ -63,6 +72,7 @@ class SlashAccessPolicy:
     enabled: bool                      # retained for API compatibility; always true
     admin_user_ids: FrozenSet[str]
     user_allowed_commands: FrozenSet[str]
+    user_command_filter_configured: bool
 
     def is_admin(self, user_id: Optional[str]) -> bool:
         if not user_id:
@@ -78,7 +88,21 @@ class SlashAccessPolicy:
             return False
         if canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS:
             return True
+        if not self.user_command_filter_configured:
+            return True
         return canonical_cmd in self.user_allowed_commands
+
+    def runnable_user_commands(self) -> FrozenSet[str]:
+        """Return the built-in user-role commands exposed on this scope."""
+        if self.user_command_filter_configured:
+            commands = frozenset(
+                command
+                for command in self.user_allowed_commands
+                if minimum_role_for_command(command) == "user"
+            )
+        else:
+            commands = _USER_ROLE_BUILTINS
+        return commands | _ALWAYS_ALLOWED_FOR_USERS
 
 
 _DM_CHAT_TYPES = frozenset({"dm", "direct", "private", ""})
@@ -174,17 +198,25 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     """
     admin_key, cmd_key = _keys_for_scope(scope)
     admin_ids = _coerce_id_list(extra.get(admin_key))
-    cmds = _coerce_command_list(extra.get(cmd_key))
+    user_filter_configured = cmd_key in extra
+    cmds = _coerce_command_list(extra.get(cmd_key)) if user_filter_configured else frozenset()
 
-    if scope == "dm" and not cmds:
+    if (
+        scope == "dm"
+        and not user_filter_configured
+        and "group_user_allowed_commands" in extra
+    ):
         # DM didn't specify — let group's user_allowed_commands fall through
-        # so operators only need to list it once if it's the same.
+        # so operators only need to list it once if it's the same. An explicit
+        # empty DM list remains an explicit floor-only policy.
         cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
+        user_filter_configured = True
 
     return SlashAccessPolicy(
         enabled=True,
         admin_user_ids=admin_ids,
         user_allowed_commands=cmds,
+        user_command_filter_configured=user_filter_configured,
     )
 
 
@@ -202,6 +234,7 @@ def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
             enabled=True,
             admin_user_ids=frozenset(),
             user_allowed_commands=frozenset(),
+            user_command_filter_configured=False,
         )
     platforms = getattr(gateway_config, "platforms", None)
     platform_config = None

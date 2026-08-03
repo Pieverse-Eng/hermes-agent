@@ -514,20 +514,9 @@ class GatewaySlashCommandsMixin:
                 f"Slash commands: all available"
             )
 
-        # Non-admin user. Show what's actually reachable.
-        floor = ["help", "whoami"]  # mirrors slash_access._ALWAYS_ALLOWED_FOR_USERS
-        configured = sorted(
-            command
-            for command in policy.user_allowed_commands
-            if policy.can_run(None, command)
-        )
-        # Combine + dedupe, preserve order: floor first, then operator additions.
-        seen: set[str] = set()
-        runnable: list[str] = []
-        for c in floor + configured:
-            if c not in seen:
-                seen.add(c)
-                runnable.append(c)
+        # Non-admin user. Show the resolved user-role surface: all explicit
+        # user-role commands by default, or the operator's narrowing list.
+        runnable = sorted(policy.runnable_user_commands())
         runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else "(none)"
         return (
             f"**You** — {platform} ({scope})\n"

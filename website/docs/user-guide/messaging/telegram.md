@@ -1077,7 +1077,7 @@ DMs and allowlisted groups behave exactly as before.
 
 ## Slash Command Access Control
 
-Every allowed user may chat, but privileged slash commands require an explicit admin. Configure **admins** (full slash command access) and **regular users** (only user-role commands you explicitly enable) with `allow_admin_from` and `user_allowed_commands` in the platform's `extra` block:
+Every allowed user may chat and run explicit user-role commands, but privileged slash commands require an explicit admin. Configure **admins** (full slash command access) with `allow_admin_from`. Optionally use `user_allowed_commands` to narrow the regular-user command surface:
 
 ```yaml
 gateway:
@@ -1094,8 +1094,8 @@ gateway:
         allow_admin_from:
           - "123456789"
 
-        # NEW — non-admin allowed users can only run these slash commands.
-        # /help and /whoami are always allowed so users can see their access.
+        # Optional — narrow non-admin users to these user-role commands.
+        # Omit for all user-role commands; [] leaves /help and /whoami only.
         user_allowed_commands:
           - status
           - usage
@@ -1111,8 +1111,8 @@ gateway:
 **Behavior:**
 
 - A user listed in `allow_admin_from` for a scope (DM or group) can run **every** registered slash command — built-in commands AND plugin-registered ones — through the live registry.
-- A user in `allow_from` but **not** in `allow_admin_from` can only run user-role commands listed in `user_allowed_commands`, plus the always-allowed floor: `/help` and `/whoami`.
-- Every built-in has an explicit minimum role. `user_allowed_commands` cannot downgrade admin-role commands, and unknown/plugin commands default to admin.
+- A user in `allow_from` but **not** in `allow_admin_from` can run every explicit user-role command by default. `user_allowed_commands` optionally narrows that set; an explicitly empty list leaves `/help` and `/whoami` only.
+- Every built-in has an explicit minimum role. A regular-user narrowing list cannot downgrade admin-role commands, and unknown/plugin commands default to admin.
 - Plain chat (non-slash messages) is unaffected. Non-admin users can still talk to the agent normally, they just can't trigger arbitrary commands.
 - If `allow_admin_from` is missing, empty, or malformed for a scope, privileged commands fail closed for that scope.
 - DM admin status does not imply group admin status. Each scope has its own admin list.

@@ -15,9 +15,9 @@ Hermes 有两个斜杠命令入口，均由 `hermes_cli/commands.py` 中的中�
 
 ## 权限与管理员/用户分级
 
-每个支持按用户白名单的消息平台（Telegram、Discord、Slack、Matrix、Mattermost、Signal 等）都支持两级斜杠命令分级：**管理员**可使用所有已注册命令，**普通用户**只能使用你在 `user_allowed_commands` 中列出的用户级命令（以及始终允许的 `/help` 和 `/whoami`）。在 `~/.hermes/gateway-config.yaml` 中对应平台的 `extra:` 块内配置 `allow_admin_from` 和 `user_allowed_commands`（以及群组等效项 `group_allow_admin_from` / `group_user_allowed_commands`）。
+每个支持按用户白名单的消息平台（Telegram、Discord、Slack、Matrix、Mattermost、Signal 等）都支持两级斜杠命令分级：**管理员**可使用所有已注册命令，**普通用户**默认可使用最低角色明确为 `user` 的全部内置命令。在 `~/.hermes/gateway-config.yaml` 中对应平台的 `extra:` 块内配置 `allow_admin_from`（群组使用 `group_allow_admin_from`）。如需缩小普通用户的命令范围，可设置 `user_allowed_commands` 或 `group_user_allowed_commands`；显式空列表只保留 `/help` 和 `/whoami`。
 
-每个内置命令都有明确的最低角色。持久配置、凭据、钱包/计费、插件/工具、审批、更新、重启和平台生命周期命令需要管理员权限；`user_allowed_commands` 不能降低它们的权限。未知命令和插件注册命令也默认需要管理员权限。
+每个内置命令都有明确的最低角色。持久配置、凭据、钱包/计费、插件/工具、审批、更新、重启和平台生命周期命令需要管理员权限；普通用户的缩小列表不能降低它们的权限。未知命令和插件注册命令也默认需要管理员权限。
 
 各平台文档中有示例——结构在各平台间完全一致：
 
@@ -28,7 +28,7 @@ Hermes 有两个斜杠命令入口，均由 `hermes_cli/commands.py` 中的中�
 - [Mattermost](../user-guide/messaging/mattermost.md)
 - [Signal](../user-guide/messaging/signal.md)
 
-如果某个作用域的 `allow_admin_from` 缺失、为空或格式错误，特权命令将默认拒绝。普通聊天以及 `/help`、`/whoami` 仍可使用。升级自旧版不受限回退行为的管理员必须显式配置管理员。
+如果某个作用域的 `allow_admin_from` 缺失、为空或格式错误，特权命令将默认拒绝。普通聊天和明确的用户级命令仍对平台预期用户范围可用。升级自旧版不受限回退行为的管理员必须显式配置管理员。
 
 ## 交互式 CLI 斜杠命令
 

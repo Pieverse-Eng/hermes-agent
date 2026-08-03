@@ -12613,24 +12613,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.user_id,
             minimum_role,
         )
-        allowed_preview = sorted(
-            command
-            for command in policy.user_allowed_commands
-            if policy.can_run(None, command)
+        allowed_preview = sorted(policy.runnable_user_commands())
+        suffix = (
+            "You can run: "
+            + ", ".join(f"/{c}" for c in allowed_preview[:12])
+            + ("…" if len(allowed_preview) > 12 else "")
+            + ". Use /whoami for the full list."
         )
-        if allowed_preview:
-            suffix = (
-                "You can run: "
-                + ", ".join(f"/{c}" for c in allowed_preview[:12])
-                + ("…" if len(allowed_preview) > 12 else "")
-                + ". Use /whoami for the full list."
-            )
-        else:
-            suffix = (
-                "No slash commands are enabled for non-admins on this "
-                "platform. Ask an admin to add you to allow_admin_from "
-                "or to set user_allowed_commands."
-            )
         if minimum_role == "admin":
             return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
         return f"⛔ /{canonical_cmd} is not enabled for users here. {suffix}"

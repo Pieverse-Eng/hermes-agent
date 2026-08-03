@@ -14,6 +14,8 @@ class TestPolicyFromExtra:
         assert policy.is_admin("anyone") is False
         assert policy.can_run("anyone", "stop") is False
         assert policy.can_run("anyone", "help") is True
+        assert policy.can_run("anyone", "status") is True
+        assert policy.user_command_filter_configured is False
 
     def test_empty_admin_list_fails_closed_for_privileged_command(self):
         policy = policy_from_extra({"allow_admin_from": []}, "dm")
@@ -106,6 +108,18 @@ class TestPolicyFromExtra:
         assert policy.can_run("999", "status") is True
         assert policy.can_run("999", "model") is False
 
+    def test_explicit_empty_dm_user_filter_does_not_fall_back_to_group(self):
+        policy = policy_from_extra(
+            {
+                "user_allowed_commands": [],
+                "group_user_allowed_commands": ["status"],
+            },
+            "dm",
+        )
+        assert policy.user_command_filter_configured is True
+        assert policy.can_run("999", "help") is True
+        assert policy.can_run("999", "status") is False
+
 
 class TestPolicyForSource:
     def test_missing_config_is_active_and_fail_closed(self):
@@ -114,6 +128,7 @@ class TestPolicyForSource:
         assert policy.is_admin("anyone") is False
         assert policy.can_run("anyone", "restart") is False
         assert policy.can_run("anyone", "whoami") is True
+        assert policy.can_run("anyone", "status") is True
 
     def test_missing_platform_config_is_active_and_fail_closed(self):
         config = GatewayConfig(platforms={})

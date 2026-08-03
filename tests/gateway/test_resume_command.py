@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, build_session_key
 
@@ -32,23 +32,12 @@ def _session_key_for_event(event):
 
 
 def _make_runner(session_db=None, current_session_id="current_session_001",
-                 event=None, *, is_admin=True):
+                 event=None):
     """Create a bare GatewayRunner with a mock session_store and optional session_db."""
     from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
-    runner.config = GatewayConfig(
-        platforms={
-            Platform.TELEGRAM: PlatformConfig(
-                enabled=True,
-                token="***",
-                extra={
-                    "allow_admin_from": ["12345"] if is_admin else [],
-                    "group_allow_admin_from": ["12345"] if is_admin else [],
-                },
-            )
-        }
-    )
+    runner.config = SimpleNamespace(platforms={})
     runner._voice_mode = {}
     # Gateway holds the async facade; the slash handlers await it.
     if session_db is not None:
@@ -479,7 +468,7 @@ class TestHandleSessionsCommand:
         db.append_message("discord_unnamed", "user", "discord first prompt")
 
         event = _make_event(text="/sessions all full")
-        runner = _make_runner(session_db=db, event=event, is_admin=False)
+        runner = _make_runner(session_db=db, event=event)
 
         result = await runner._handle_sessions_command(event)
 
