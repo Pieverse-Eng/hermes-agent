@@ -15,7 +15,9 @@ Installed skills are also exposed as dynamic slash commands on both surfaces. Th
 
 ## Permissions and admin/user split
 
-Every messaging platform that supports a per-user allowlist (Telegram, Discord, Slack, Matrix, Mattermost, Signal, …) also supports a two-tier slash command split: **admins** get every registered command, **regular users** only get the names you list in `user_allowed_commands` (plus the always-allowed floor `/help` and `/whoami`). Configure `allow_admin_from` and `user_allowed_commands` (and the per-group equivalents `group_allow_admin_from` / `group_user_allowed_commands`) inside the platform's `extra:` block in `~/.hermes/gateway-config.yaml`.
+Every messaging platform that supports a per-user allowlist (Telegram, Discord, Slack, Matrix, Mattermost, Signal, …) also supports a two-tier slash command split: **admins** get every registered command, **regular users** only get user-role commands you list in `user_allowed_commands` (plus the always-allowed floor `/help` and `/whoami`). Configure `allow_admin_from` and `user_allowed_commands` (and the per-group equivalents `group_allow_admin_from` / `group_user_allowed_commands`) inside the platform's `extra:` block in `~/.hermes/gateway-config.yaml`.
+
+Every built-in command has an explicit minimum role. Durable configuration, credential, wallet/billing, plugin/tool, approval, update, restart, and platform-lifecycle commands require admin. `user_allowed_commands` cannot downgrade them. Unknown and plugin-registered commands also default to admin.
 
 See the per-platform docs for examples — the structure is identical across platforms:
 
@@ -26,7 +28,7 @@ See the per-platform docs for examples — the structure is identical across pla
 - [Mattermost](../user-guide/messaging/mattermost.md)
 - [Signal](../user-guide/messaging/signal.md)
 
-If `allow_admin_from` is unset for a scope, that scope stays in unrestricted backward-compat mode — every allowed user can run every command.
+If `allow_admin_from` is missing, empty, or malformed for a scope, privileged commands fail closed for that scope. Plain chat remains available and `/help` plus `/whoami` remain reachable. Operators upgrading from the older unrestricted fallback must configure explicit admins before relying on privileged slash commands.
 
 ## Interactive CLI slash commands
 

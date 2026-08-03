@@ -13,12 +13,10 @@ Two lists per platform scope (DM vs group, mirroring ``allow_from`` vs
                                 run. Empty / unset → non-admins get no
                                 slash commands.
 
-Backward compatibility:
-
-  If ``allow_admin_from`` is not set for a scope, slash command gating
-  is disabled entirely for that scope. Every allowed user can run every
-  slash command, exactly like before. This means existing installs are
-  unaffected until an operator opts in by listing at least one admin.
+Missing, empty, or malformed admin lists fail closed for privileged commands.
+The explicit built-in role inventory in ``hermes_cli.commands`` is an upper
+bound: ``user_allowed_commands`` may narrow/enable ordinary user commands but
+can never downgrade an admin command. Unknown/plugin commands default to admin.
 
 The gate is applied at the slash command dispatch site in
 ``gateway/run.py`` so it covers BOTH built-in and plugin-registered
@@ -37,16 +35,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Iterable, Optional, Tuple
 
+from hermes_cli.commands import minimum_role_for_command
+
 
 # Slash commands that MUST stay reachable for any allowed user, even when
 # slash gating is enabled and the user has no commands listed. Without this
 # carve-out, a non-admin user has no way to discover what they can or
-# can't do (``/help``, ``/whoami``) and no way to see what state the agent
-# is in (``/status``). These mirror the smallest set of read-only commands
+# can't do (``/help``, ``/whoami``). These mirror the smallest set of read-only commands
 # we'd hand to a guest. Operators can still narrow this further by writing
-# their own ``user_allowed_commands`` (this set is only the implicit
-# fallback floor — anything in ``user_allowed_commands`` overrides it
-# additively, never restrictively).
+# their own ``user_allowed_commands``.  That list is additive only within the
+# commands whose explicit minimum role is already ``user``.
 _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
     "help",
     "whoami",
@@ -62,26 +60,21 @@ class SlashAccessPolicy:
     SessionSource.chat_type → scope happens in ``policy_for_source``.
     """
 
-    enabled: bool                      # gating active for this scope?
+    enabled: bool                      # retained for API compatibility; always true
     admin_user_ids: FrozenSet[str]
     user_allowed_commands: FrozenSet[str]
 
     def is_admin(self, user_id: Optional[str]) -> bool:
-        if not self.enabled:
-            # Gating disabled → treat every allowed user as admin so
-            # downstream code can keep using ``is_admin`` / ``can_run``
-            # uniformly.
-            return True
         if not user_id:
             return False
         return str(user_id) in self.admin_user_ids
 
     def can_run(self, user_id: Optional[str], canonical_cmd: str) -> bool:
-        if not self.enabled:
-            return True
         if self.is_admin(user_id):
             return True
         if not canonical_cmd:
+            return False
+        if minimum_role_for_command(canonical_cmd) != "user":
             return False
         if canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS:
             return True
@@ -103,11 +96,14 @@ def _coerce_id_list(raw: Any) -> FrozenSet[str]:
         items: Iterable[Any] = raw
     elif isinstance(raw, str):
         items = (s for s in raw.split(",") if s.strip())
-    else:
-        # single scalar (int user id, etc.)
+    elif isinstance(raw, int) and not isinstance(raw, bool):
         items = (raw,)
+    else:
+        return frozenset()
     out: list[str] = []
     for it in items:
+        if isinstance(it, bool) or not isinstance(it, (str, int)):
+            continue
         s = str(it).strip()
         if s:
             out.append(s)
@@ -185,9 +181,8 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
         # so operators only need to list it once if it's the same.
         cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
 
-    enabled = bool(admin_ids)
     return SlashAccessPolicy(
-        enabled=enabled,
+        enabled=True,
         admin_user_ids=admin_ids,
         user_allowed_commands=cmds,
     )
@@ -196,17 +191,15 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
 def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
     """Resolve the access policy for a SessionSource.
 
-    Returns a "disabled" policy (gating off, allow everything) when:
-      - gateway_config is None
-      - the platform has no PlatformConfig
-      - the platform's PlatformConfig has no admin list set for the scope
+    Missing configuration resolves to an active policy with no admins.  This
+    preserves ordinary chat while privileged slash commands fail closed.
 
     Callers should treat the returned policy as authoritative for slash
     command gating only. It does not gate plain chat messages.
     """
     if gateway_config is None or source is None:
         return SlashAccessPolicy(
-            enabled=False,
+            enabled=True,
             admin_user_ids=frozenset(),
             user_allowed_commands=frozenset(),
         )

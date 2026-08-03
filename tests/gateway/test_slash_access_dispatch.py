@@ -6,8 +6,7 @@ re-implementation in the test). Uses the same ``object.__new__`` runner
 construction pattern as test_status_command.py.
 
 Coverage targets:
-  - Backward compat: no ``allow_admin_from`` set → behaves exactly as before
-    (no denial messages, dispatch reaches the real handler).
+  - Missing/empty admin lists fail closed for privileged commands.
   - Admin path: user in ``allow_admin_from`` runs anything.
   - User path: user not in admin list, but command in
     ``user_allowed_commands`` → allowed.
@@ -118,11 +117,11 @@ def _make_runner(*, platform_extra: dict | None = None,
 
 
 @pytest.mark.asyncio
-async def test_whoami_unrestricted_when_no_admin_list():
+async def test_whoami_reports_user_when_no_admin_list():
     runner = _make_runner(platform_extra={})  # no admin list
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
-    assert "Tier: unrestricted" in result
-    assert "no admin list configured" in result
+    assert "Tier: user" in result
+    assert "unrestricted" not in result
 
 
 @pytest.mark.asyncio
@@ -145,7 +144,7 @@ async def test_whoami_non_admin_lists_runnable_commands():
     assert "/help" in result      # always-allowed floor
     assert "/whoami" in result    # always-allowed floor
     assert "/status" in result
-    assert "/model" in result
+    assert "/model" not in result  # explicit admin role cannot be downgraded
 
 
 # ---------------------------------------------------------------------------
@@ -221,18 +220,21 @@ async def test_user_runs_listed_command():
 
 
 # ---------------------------------------------------------------------------
-# Backward compatibility — no admin list set means no gating at all
+# Missing admin configuration — privileged commands fail closed
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_backward_compat_no_admin_list_means_no_gate():
+async def test_no_admin_list_keeps_whoami_but_denies_privileged_command():
     runner = _make_runner(platform_extra={})  # nothing configured
-    # Random non-listed user runs /whoami; should return unrestricted profile,
-    # never a denial.
+    # /whoami remains available, but the caller is an ordinary user.
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="anyone")))
     assert "⛔" not in result
-    assert "Tier: unrestricted" in result
+    assert "Tier: user" in result
+    denied = await runner._handle_message(
+        _make_event("/stop", _make_source(user_id="anyone"))
+    )
+    assert "/stop is admin-only here" in denied
 
 
 # ---------------------------------------------------------------------------
@@ -258,15 +260,15 @@ async def test_dm_admin_is_not_group_admin():
 
 
 @pytest.mark.asyncio
-async def test_group_only_gating_leaves_dm_unrestricted():
+async def test_group_only_admin_list_leaves_dm_fail_closed_for_privileged_commands():
     runner = _make_runner(
         platform_extra={
-            # Only group has an admin list → DM scope stays in backward-compat mode
+            # A group admin list must not promote anybody in DM scope.
             "group_allow_admin_from": ["222"],
         }
     )
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="anyone", chat_type="dm")))
-    assert "Tier: unrestricted" in result
+    assert "Tier: user" in result
 
 
 # ---------------------------------------------------------------------------
@@ -342,9 +344,8 @@ async def test_non_admin_denied_for_unlisted_quick_command_exec():
 
 
 @pytest.mark.asyncio
-async def test_listed_quick_command_runs_for_non_admin():
-    """When the operator lists the quick command in user_allowed_commands, a
-    non-admin can run it — the gate must allow, not blanket-deny."""
+async def test_listed_quick_command_remains_admin_only_for_non_admin():
+    """Unknown/quick commands default to admin even when listed."""
     runner = _make_runner(
         platform_extra={
             "allow_admin_from": ["111"],
@@ -359,7 +360,8 @@ async def test_listed_quick_command_runs_for_non_admin():
         _make_event("/limits", _make_source(user_id="999"))
     )
 
-    assert result == "quick-command-allowed"
+    assert "/limits is admin-only here" in result
+    assert "quick-command-allowed" not in result
 
 
 @pytest.mark.asyncio
@@ -441,12 +443,11 @@ async def test_running_agent_fastpath_allows_admin_command():
 
 @pytest.mark.asyncio
 async def test_running_agent_fastpath_status_always_works():
-    """/status is intentionally pre-gate on the fast-path so users can
-    always see session state, even non-admins."""
+    """A listed user-role /status works on the running-agent fast path."""
     runner = _make_runner(
         platform_extra={
             "allow_admin_from": ["111"],
-            "user_allowed_commands": [],
+            "user_allowed_commands": ["status"],
         }
     )
     src = _make_source(user_id="999")  # non-admin
@@ -463,7 +464,7 @@ async def test_running_agent_fastpath_status_always_works():
 @pytest.mark.asyncio
 async def test_running_agent_fastpath_dispatches_plugin_command(monkeypatch):
     """A recognized plugin command executes instead of interrupting the run."""
-    runner = _make_runner()
+    runner = _make_runner(platform_extra={"allow_admin_from": ["111"]})
     src = _make_source(user_id="111")
     sk = build_session_key(src)
     running_agent = MagicMock()
@@ -635,8 +636,7 @@ async def test_dm_admin_blocked_in_group_with_separate_admin_list():
 
 @pytest.mark.asyncio
 async def test_gating_isolated_per_platform():
-    """When Discord is gated and Telegram isn't, the same user_id on
-    Telegram must be unrestricted."""
+    """A configured Discord admin must not inherit admin on Telegram."""
     from gateway.run import GatewayRunner
     from gateway.config import GatewayConfig, Platform, PlatformConfig
 
@@ -702,7 +702,7 @@ async def test_gating_isolated_per_platform():
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
 
-    # Same user_id on Telegram → must be unrestricted (Telegram has no admin list).
+    # Telegram has no admin list, so the same ID remains an ordinary user.
     tg_src = _make_source(platform=Platform.TELEGRAM, user_id="999", chat_id="t1")
     result = await runner._handle_message(_make_event("/whoami", tg_src))
-    assert "Tier: unrestricted" in result
+    assert "Tier: user" in result

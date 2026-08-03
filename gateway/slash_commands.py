@@ -494,7 +494,7 @@ class GatewaySlashCommandsMixin:
 
         Always works (it's in the always-allowed floor of slash_access).
         Reports: platform, scope (DM vs group), the user's tier
-        (admin / user / unrestricted), and the slash commands they can
+        (admin / user), and the slash commands they can
         actually run on this scope.
         """
         from gateway.slash_access import policy_for_source as _policy_for_source
@@ -506,14 +506,6 @@ class GatewaySlashCommandsMixin:
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
         user_id = (source.user_id if source else None) or "?"
 
-        if not policy.enabled:
-            return (
-                f"**You** — {platform} ({scope})\n"
-                f"User ID: `{user_id}`\n"
-                f"Tier: unrestricted (no admin list configured for this scope)\n"
-                f"Slash commands: all available"
-            )
-
         if policy.is_admin(user_id):
             return (
                 f"**You** — {platform} ({scope})\n"
@@ -524,7 +516,11 @@ class GatewaySlashCommandsMixin:
 
         # Non-admin user. Show what's actually reachable.
         floor = ["help", "whoami"]  # mirrors slash_access._ALWAYS_ALLOWED_FOR_USERS
-        configured = sorted(policy.user_allowed_commands)
+        configured = sorted(
+            command
+            for command in policy.user_allowed_commands
+            if policy.can_run(None, command)
+        )
         # Combine + dedupe, preserve order: floor first, then operator additions.
         seen: set[str] = set()
         runnable: list[str] = []
@@ -923,12 +919,8 @@ class GatewaySlashCommandsMixin:
         """Whether *source* is an EXPLICITLY-configured admin allowed to make a
         cross-origin /resume or /sessions listing.
 
-        Deliberately stricter than ``SlashAccessPolicy.is_admin()``: that returns
-        True for every allowed caller when slash gating is DISABLED (so commands
-        stay runnable by default), but cross-ORIGIN DATA ACCESS must require a
-        real, configured admin. Otherwise the default (no admin list) config
-        would treat every gateway caller as cross-origin-capable and re-open the
-        enumeration IDOR.
+        Cross-origin data access always requires a real configured admin; a
+        missing admin list is not an authority grant.
         """
         try:
             from gateway.slash_access import policy_for_source

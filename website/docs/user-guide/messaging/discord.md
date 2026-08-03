@@ -535,7 +535,7 @@ display:
 
 ## Slash Command Access Control
 
-By default, every allowed user can run every slash command. To split your allowlist into **admins** (full slash command access) and **regular users** (only commands you explicitly enable), add `allow_admin_from` and `user_allowed_commands` to the Discord platform's `extra` block:
+Every allowed user may chat, but privileged slash commands require an explicit admin. Configure **admins** (full slash command access) and **regular users** (only user-role commands you explicitly enable) with `allow_admin_from` and `user_allowed_commands` in the Discord platform's `extra` block:
 
 ```yaml
 gateway:
@@ -555,8 +555,8 @@ gateway:
         # /help and /whoami are always allowed so users can see their access.
         user_allowed_commands:
           - status
-          - model
-          - history
+          - usage
+          - insights
 
         # Optional: separate admin / command lists for server channels
         group_allow_admin_from:
@@ -568,12 +568,13 @@ gateway:
 **Behavior:**
 
 - A user in `allow_admin_from` for a scope (DM or server channel) can run **every** registered slash command — built-in AND plugin-registered — through the live command registry.
-- A user not in `allow_admin_from` can only run commands listed in `user_allowed_commands`, plus the always-allowed floor: `/help` and `/whoami`.
+- A user not in `allow_admin_from` can only run user-role commands listed in `user_allowed_commands`, plus the always-allowed floor: `/help` and `/whoami`.
+- Every built-in has an explicit minimum role. `user_allowed_commands` cannot downgrade admin-role commands, and unknown/plugin commands default to admin.
 - Plain chat (non-slash messages) is unaffected. Non-admin users can still talk to the agent normally; they just can't trigger arbitrary commands.
-- **Backward compat:** if `allow_admin_from` is not set for a scope, slash command gating is disabled for that scope. Existing installs keep working with no changes.
+- If `allow_admin_from` is missing, empty, or malformed for a scope, privileged commands fail closed for that scope.
 - DM admin status does not imply server-channel admin status. Each scope has its own admin list.
 
-Use `/whoami` to see the active scope, your tier (admin / user / unrestricted), and which slash commands you can run.
+Use `/whoami` to see the active scope, your tier (admin / user), and which slash commands you can run.
 
 ## Interactive Model Picker
 
@@ -862,5 +863,3 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
-

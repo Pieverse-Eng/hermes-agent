@@ -9317,9 +9317,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
-            if event.get_command() == "status":
-                return await self._handle_status_command(event)
-
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
                 ACTIVE_SESSION_BYPASS_COMMANDS as _DEDICATED_HANDLERS,
@@ -9344,9 +9341,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
             # can't bypass gating just because an agent happens to be busy.
-            # /status above is intentionally pre-gate so users always see
-            # session state. /help and /whoami fall under the always-allowed
-            # floor inside _check_slash_access.
+            # /help and /whoami are the only always-allowed floor inside
+            # _check_slash_access.
             _access_cmd_inner = (
                 _cmd_def_inner.name if _cmd_def_inner else _plugin_cmd_inner
             )
@@ -9354,6 +9350,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _denied = self._check_slash_access(source, _access_cmd_inner)
                 if _denied is not None:
                     return _denied
+
+            if _evt_cmd == "status":
+                return await self._handle_status_command(event)
 
             # Plugin commands bypass the adapter's active-session guard just
             # like built-ins, so they must also execute in the runner's
@@ -9777,12 +9776,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _cmd_def = _resolve_cmd(command) if command else None
                         canonical = _cmd_def.name if _cmd_def else command
 
-        # Per-platform slash command access control. Only kicks in when the
-        # operator has set ``allow_admin_from`` for the source's scope (DM
-        # vs group). When unset → backward-compat: every allowed user can
-        # run every command. When set → non-admins can run only commands in
-        # ``user_allowed_commands`` (plus the always-allowed floor: /help,
-        # /whoami). Plain chat is unaffected — only slash commands gate.
+        # Per-platform slash command access control. Missing admin data fails
+        # closed for privileged commands. Non-admins can run explicitly listed
+        # user-role commands plus the /help and /whoami floor. Plain chat is
+        # unaffected.
         if command and canonical and is_gateway_known_command(canonical):
             _denied = self._check_slash_access(source, canonical)
             if _denied is not None:
@@ -12596,25 +12593,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         in ``_handle_message`` so admin/user gating can't be bypassed by
         an in-flight agent.
 
-        Backward-compat semantics live in
-        :func:`gateway.slash_access.policy_for_source` — when the operator
-        hasn't set ``allow_admin_from`` for the scope, the policy returns
-        ``enabled=False`` and this method always returns None.
+        Missing/empty/malformed admin configuration is intentionally not a
+        bypass: privileged commands fail closed while ordinary chat remains
+        unaffected.
         """
         from gateway.slash_access import policy_for_source as _policy_for_source
+        from hermes_cli.commands import minimum_role_for_command
 
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
-        if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
+        if policy.can_run(source.user_id, canonical_cmd):
             return None
+        minimum_role = minimum_role_for_command(canonical_cmd)
         logger.info(
-            "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
+            "Slash command /%s denied for %s:%s (minimum_role=%s)",
             canonical_cmd,
             source.platform.value if source.platform else "?",
             source.user_id,
+            minimum_role,
         )
-        allowed_preview = sorted(policy.user_allowed_commands)
+        allowed_preview = sorted(
+            command
+            for command in policy.user_allowed_commands
+            if policy.can_run(None, command)
+        )
         if allowed_preview:
             suffix = (
                 "You can run: "
@@ -12628,7 +12631,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "platform. Ask an admin to add you to allow_admin_from "
                 "or to set user_allowed_commands."
             )
-        return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+        if minimum_role == "admin":
+            return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+        return f"⛔ /{canonical_cmd} is not enabled for users here. {suffix}"
 
 
 

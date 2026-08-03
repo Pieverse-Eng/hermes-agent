@@ -528,7 +528,7 @@ display:
 
 ## 斜杠命令访问控制
 
-默认情况下，每个允许的用户都可以运行每个斜杠命令。要将你的允许列表分为**管理员**（完整斜杠命令访问权限）和**普通用户**（仅你明确启用的命令），请在 Discord 平台的 `extra` 块中添加 `allow_admin_from` 和 `user_allowed_commands`：
+每个允许的用户都可以聊天，但特权斜杠命令需要显式管理员。请在 Discord 平台的 `extra` 块中使用 `allow_admin_from` 和 `user_allowed_commands` 配置**管理员**（完整斜杠命令访问权限）和**普通用户**（仅你明确启用的用户级命令）：
 
 ```yaml
 gateway:
@@ -548,8 +548,8 @@ gateway:
         # /help 和 /whoami 始终允许，以便用户查看其访问权限。
         user_allowed_commands:
           - status
-          - model
-          - history
+          - usage
+          - insights
 
         # 可选：为服务器频道设置单独的管理员/命令列表
         group_allow_admin_from:
@@ -561,12 +561,13 @@ gateway:
 **行为：**
 
 - 在某个范围（私信或服务器频道）的 `allow_admin_from` 中的用户可以通过实时命令注册表运行**每个**已注册的斜杠命令——内置的和插件注册的都包括。
-- 不在 `allow_admin_from` 中的用户只能运行 `user_allowed_commands` 中列出的命令，加上始终允许的基础命令：`/help` 和 `/whoami`。
+- 不在 `allow_admin_from` 中的用户只能运行 `user_allowed_commands` 中列出的用户级命令，加上始终允许的基础命令：`/help` 和 `/whoami`。
+- 每个内置命令都有明确的最低角色；`user_allowed_commands` 不能降低管理员命令的权限，未知命令和插件命令默认需要管理员权限。
 - 普通聊天（非斜杠消息）不受影响。非管理员用户仍然可以正常与 agent 对话；他们只是无法触发任意命令。
-- **向后兼容：** 如果某个范围未设置 `allow_admin_from`，则该范围的斜杠命令门控被禁用。现有安装无需任何更改即可继续工作。
+- 如果某个范围的 `allow_admin_from` 缺失、为空或格式错误，该范围的特权命令将默认拒绝。
 - 私信管理员状态不意味着服务器频道管理员状态。每个范围有自己的管理员列表。
 
-使用 `/whoami` 查看当前范围、你的级别（管理员 / 用户 / 无限制）以及你可以运行的斜杠命令。
+使用 `/whoami` 查看当前范围、你的级别（管理员 / 用户）以及你可以运行的斜杠命令。
 
 ## 交互式模型选择器
 

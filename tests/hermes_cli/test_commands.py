@@ -4,6 +4,7 @@ from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
 from hermes_cli.commands import (
+    BUILTIN_COMMAND_MINIMUM_ROLES,
     COMMAND_REGISTRY,
     COMMANDS,
     COMMANDS_BY_CATEGORY,
@@ -21,6 +22,7 @@ from hermes_cli.commands import (
     _sanitize_telegram_name,
     discord_skill_commands,
     gateway_help_lines,
+    minimum_role_for_command,
     resolve_command,
     slack_app_manifest,
     slack_native_slashes,
@@ -90,6 +92,31 @@ class TestCommandRegistry:
         for cmd in COMMAND_REGISTRY:
             assert not (cmd.cli_only and cmd.gateway_only), \
                 f"{cmd.name} cannot be both cli_only and gateway_only"
+
+    def test_every_builtin_has_an_explicit_minimum_role(self):
+        registry_names = {command.name for command in COMMAND_REGISTRY}
+        assert set(BUILTIN_COMMAND_MINIMUM_ROLES) == registry_names
+        assert set(BUILTIN_COMMAND_MINIMUM_ROLES.values()) == {"user", "admin"}
+
+    def test_admin_inventory_covers_durable_and_lifecycle_commands(self):
+        for command in (
+            "config",
+            "model",
+            "skills",
+            "plugins",
+            "restart",
+            "update",
+            "platform",
+        ):
+            assert minimum_role_for_command(command) == "admin"
+
+    def test_unknown_and_plugin_commands_default_to_admin(self):
+        assert minimum_role_for_command("pieverse-byok") == "admin"
+        assert minimum_role_for_command("future-plugin-command") == "admin"
+
+    def test_alias_inherits_canonical_role(self):
+        assert minimum_role_for_command("reset") == minimum_role_for_command("new")
+        assert minimum_role_for_command("reload_mcp") == "admin"
 
 
 # ---------------------------------------------------------------------------

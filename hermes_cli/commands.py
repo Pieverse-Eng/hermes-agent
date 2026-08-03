@@ -18,7 +18,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from utils import is_truthy_value
 
@@ -255,6 +255,98 @@ COMMAND_REGISTRY: list[CommandDef] = [
 ]
 
 
+# Minimum gateway role for every built-in command.  This is intentionally an
+# explicit inventory rather than a category-derived rule: categories are UI
+# labels, not authorization boundaries.  Unknown/plugin commands are handled
+# separately and default to ``admin``.
+CommandMinimumRole = Literal["user", "admin"]
+
+BUILTIN_COMMAND_MINIMUM_ROLES: dict[str, CommandMinimumRole] = {
+    "start": "user",
+    "new": "user",
+    "topic": "admin",
+    "clear": "user",
+    "redraw": "user",
+    "history": "user",
+    "save": "user",
+    "retry": "user",
+    "prompt": "user",
+    "undo": "user",
+    "title": "user",
+    "handoff": "admin",
+    "branch": "user",
+    "compress": "user",
+    "rollback": "admin",
+    "snapshot": "admin",
+    "stop": "admin",
+    "approve": "admin",
+    "deny": "admin",
+    "background": "user",
+    "agents": "user",
+    "journey": "user",
+    "queue": "user",
+    "steer": "user",
+    "goal": "user",
+    "moa": "user",
+    "subgoal": "user",
+    "status": "user",
+    "whoami": "user",
+    "profile": "user",
+    "sethome": "admin",
+    "resume": "user",
+    "sessions": "user",
+    "config": "admin",
+    "model": "admin",
+    "codex-runtime": "admin",
+    "personality": "admin",
+    "statusbar": "admin",
+    "timestamps": "admin",
+    "verbose": "admin",
+    "footer": "admin",
+    "yolo": "admin",
+    "reasoning": "admin",
+    "fast": "admin",
+    "skin": "admin",
+    "indicator": "admin",
+    "voice": "admin",
+    "busy": "admin",
+    "tools": "admin",
+    "toolsets": "admin",
+    "skills": "admin",
+    "memory": "admin",
+    "bundles": "admin",
+    "pet": "admin",
+    "hatch": "admin",
+    "learn": "admin",
+    "cron": "admin",
+    "suggestions": "admin",
+    "blueprint": "admin",
+    "curator": "admin",
+    "kanban": "admin",
+    "reload": "admin",
+    "reload-mcp": "admin",
+    "reload-skills": "admin",
+    "browser": "admin",
+    "plugins": "admin",
+    "commands": "user",
+    "help": "user",
+    "restart": "admin",
+    "usage": "user",
+    "credits": "admin",
+    "billing": "admin",
+    "insights": "user",
+    "platforms": "user",
+    "platform": "admin",
+    "copy": "user",
+    "paste": "user",
+    "image": "user",
+    "update": "admin",
+    "version": "user",
+    "debug": "admin",
+    "quit": "admin",
+}
+
+
 # ---------------------------------------------------------------------------
 # Derived lookups -- rebuilt once at import time, refreshed by rebuild_lookups()
 # ---------------------------------------------------------------------------
@@ -278,6 +370,22 @@ def resolve_command(name: str) -> CommandDef | None:
     Accepts names with or without the leading slash.
     """
     return _COMMAND_LOOKUP.get(name.lower().lstrip("/"))
+
+
+def minimum_role_for_command(name: str | None) -> CommandMinimumRole:
+    """Return the minimum gateway role for a command token.
+
+    Built-in aliases inherit the canonical command's explicit role.  Anything
+    not present in the built-in registry (including plugin-provided commands)
+    is privileged by default, so extending the command surface cannot silently
+    grant durable authority to ordinary channel users.
+    """
+    if not name:
+        return "admin"
+    command = resolve_command(name)
+    if command is None:
+        return "admin"
+    return BUILTIN_COMMAND_MINIMUM_ROLES.get(command.name, "admin")
 
 
 def _build_description(cmd: CommandDef) -> str:

@@ -135,7 +135,7 @@ hermes gateway status --system         # 仅 Linux：显式检查系统服务
 | `/retry` | 重试上一条消息 |
 | `/undo` | 删除上一轮对话 |
 | `/status` | 显示会话信息 |
-| `/whoami` | 显示你在当前范围内的斜杠命令权限（管理员 / 普通用户 / 无限制） |
+| `/whoami` | 显示你在当前范围内的斜杠命令权限（管理员 / 普通用户） |
 | `/stop` | 停止正在运行的 agent |
 | `/approve` | 批准待执行的危险命令 |
 | `/deny` | 拒绝待执行的危险命令 |
@@ -255,17 +255,17 @@ gateway:
       extra:
         allow_from: ["111", "222", "333"]
         allow_admin_from: ["111"]                    # 管理员 → 所有斜杠命令
-        user_allowed_commands: [status, model]       # 非管理员可运行的命令
+        user_allowed_commands: [status, usage]       # 非管理员可运行的用户级命令
         # 可选：单独配置群组/频道范围
         group_allow_admin_from: ["111"]
         group_user_allowed_commands: [status]
 ```
 
-**向后兼容：** 如果某个范围未设置 `allow_admin_from`，则该范围的层级划分被禁用，所有允许的用户拥有完全访问权限。现有安装无需任何更改即可继续工作——需要区分时再选择启用。
+**默认拒绝迁移：** 如果某个范围的 `allow_admin_from` 缺失、为空或格式错误，该范围内无人获得管理员权限。普通聊天以及 `/help`、`/whoami` 仍可使用。每个内置命令都有明确的最低角色，`user_allowed_commands` 不能降低 `/model`、`/skills`、`/plugins`、`/restart`、`/update` 等管理员命令的权限；未知命令和插件命令默认需要管理员权限。
 
 #### 查看你的权限
 
-在任意平台使用 `/whoami` 查看当前范围、你的层级（管理员 / 普通用户 / 无限制）以及你可以运行的斜杠命令。平台特定示例请参阅 [Telegram](/user-guide/messaging/telegram#slash-command-access-control) 和 [Discord](/user-guide/messaging/discord#slash-command-access-control) 页面。
+在任意平台使用 `/whoami` 查看当前范围、你的层级（管理员 / 普通用户）以及你可以运行的斜杠命令。平台特定示例请参阅 [Telegram](/user-guide/messaging/telegram#slash-command-access-control) 和 [Discord](/user-guide/messaging/discord#slash-command-access-control) 页面。
 
 ## 中断 Agent
 
