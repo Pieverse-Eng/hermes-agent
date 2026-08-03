@@ -10,6 +10,9 @@ import pytest
 from gateway.config import PlatformConfig
 
 
+QQ_COS_UPLOAD_HOST = "qq-media-123.cos.ap-shanghai.myqcloud.com"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -40,15 +43,32 @@ class TestQQAdapterInit:
         return QQAdapter(_make_config(**extra))
 
     def test_basic_attributes(self):
-        adapter = self._make(app_id="123", client_secret="sec")
+        adapter = self._make(
+            app_id="123",
+            client_secret="sec",
+            cos_upload_hosts=[QQ_COS_UPLOAD_HOST],
+        )
         assert adapter._app_id == "123"
         assert adapter._client_secret == "sec"
+        assert adapter._cos_upload_hosts == [QQ_COS_UPLOAD_HOST]
 
     def test_env_fallback(self):
         with mock.patch.dict(os.environ, {"QQ_APP_ID": "env_id", "QQ_CLIENT_SECRET": "env_sec"}, clear=False):
             adapter = self._make()
             assert adapter._app_id == "env_id"
             assert adapter._client_secret == "env_sec"
+
+    def test_cos_upload_hosts_env_fallback(self):
+        with mock.patch.dict(
+            os.environ,
+            {"QQ_COS_UPLOAD_HOSTS": f"{QQ_COS_UPLOAD_HOST},backup-123.cos.ap-shanghai.myqcloud.com"},
+            clear=False,
+        ):
+            adapter = self._make(app_id="a", client_secret="b")
+        assert adapter._cos_upload_hosts == [
+            QQ_COS_UPLOAD_HOST,
+            "backup-123.cos.ap-shanghai.myqcloud.com",
+        ]
 
     def test_env_fallback_extra_wins(self):
         with mock.patch.dict(os.environ, {"QQ_APP_ID": "env_id"}, clear=False):
@@ -827,6 +847,7 @@ class TestChunkedUploaderFlow:
             api_request=fake_api_request,
             safe_request=fake_put,
             log_tag="QQBot:TEST",
+            allowed_upload_hosts=(QQ_COS_UPLOAD_HOST,),
         )
         result = await uploader.upload(
             chat_type="c2c",
@@ -841,7 +862,7 @@ class TestChunkedUploaderFlow:
         assert len(put_calls) == 2
         assert put_calls[0][0:2] == ("PUT", "https://cos.example/p1")
         assert put_calls[1][0:2] == ("PUT", "https://cos.example/p2")
-        assert put_calls[0][4]["allowed_host_suffixes"] == ("myqcloud.com",)
+        assert put_calls[0][4]["allowed_hosts"] == (QQ_COS_UPLOAD_HOST,)
         # Prepare + 2 part_finish + complete = 4 api calls.
         assert len(api_calls) == 4
         assert api_calls[0][1].endswith("/upload_prepare")
@@ -880,7 +901,12 @@ class TestChunkedUploaderFlow:
         async def fake_put(method, url, *, data=None, headers=None, **kwargs):
             return _R()
 
-        u = ChunkedUploader(fake_api_request, fake_put, "QQBot:T")
+        u = ChunkedUploader(
+            fake_api_request,
+            fake_put,
+            "QQBot:T",
+            allowed_upload_hosts=(QQ_COS_UPLOAD_HOST,),
+        )
         await u.upload(
             chat_type="group",
             target_id="grp-openid-1",
@@ -908,7 +934,12 @@ class TestChunkedUploaderFlow:
         async def fake_put(*a, **kw):
             raise AssertionError("PUT should not be called if prepare fails")
 
-        u = ChunkedUploader(fake_api_request, fake_put, "T")
+        u = ChunkedUploader(
+            fake_api_request,
+            fake_put,
+            "T",
+            allowed_upload_hosts=(QQ_COS_UPLOAD_HOST,),
+        )
         with pytest.raises(UploadDailyLimitExceededError) as excinfo:
             await u.upload(
                 chat_type="c2c",
@@ -956,7 +987,12 @@ class TestChunkedUploaderFlow:
             async def fake_put(*a, **kw):
                 return _R()
 
-            u = ChunkedUploader(fake_api_request, fake_put, "T")
+            u = ChunkedUploader(
+                fake_api_request,
+                fake_put,
+                "T",
+                allowed_upload_hosts=(QQ_COS_UPLOAD_HOST,),
+            )
             result = await u.upload(
                 chat_type="c2c",
                 target_id="u",
@@ -1001,7 +1037,12 @@ class TestChunkedUploaderFlow:
                 return _Resp(500, "transient")
             return _Resp(200)
 
-        u = ChunkedUploader(fake_api_request, fake_put, "T")
+        u = ChunkedUploader(
+            fake_api_request,
+            fake_put,
+            "T",
+            allowed_upload_hosts=(QQ_COS_UPLOAD_HOST,),
+        )
         result = await u.upload(
             chat_type="c2c",
             target_id="u",
@@ -1020,7 +1061,12 @@ class TestChunkedUploaderFlow:
         request = mock.AsyncMock(
             side_effect=SafeHttpError("HOST_NOT_ALLOWED", "not a COS host")
         )
-        uploader = ChunkedUploader(mock.AsyncMock(), request, "T")
+        uploader = ChunkedUploader(
+            mock.AsyncMock(),
+            request,
+            "T",
+            allowed_upload_hosts=(QQ_COS_UPLOAD_HOST,),
+        )
 
         with pytest.raises(SafeHttpError) as excinfo:
             await uploader._put_to_presigned_url(
@@ -1029,6 +1075,33 @@ class TestChunkedUploaderFlow:
 
         assert excinfo.value.code == "HOST_NOT_ALLOWED"
         request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_put_requires_exact_host_allowlist_before_request(self):
+        from gateway.platforms.qqbot.chunked_upload import ChunkedUploader
+        from tools.safe_http import SafeHttpError
+
+        request = mock.AsyncMock()
+        uploader = ChunkedUploader(mock.AsyncMock(), request, "T")
+
+        with pytest.raises(SafeHttpError) as excinfo:
+            await uploader._put_to_presigned_url(
+                f"https://{QQ_COS_UPLOAD_HOST}/upload", b"part", 1, 1
+            )
+
+        assert excinfo.value.code == "HOST_NOT_ALLOWED"
+        request.assert_not_awaited()
+
+    def test_broad_cos_suffix_is_not_a_valid_account_allowlist(self):
+        from gateway.platforms.qqbot.chunked_upload import ChunkedUploader
+
+        with pytest.raises(ValueError, match="exact Tencent COS hostnames"):
+            ChunkedUploader(
+                mock.AsyncMock(),
+                mock.AsyncMock(),
+                "T",
+                allowed_upload_hosts=("myqcloud.com",),
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -37,9 +37,10 @@ import asyncio
 import functools
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from gateway.platforms.qqbot.constants import FILE_UPLOAD_TIMEOUT
 
@@ -65,6 +66,37 @@ _COMPLETE_UPLOAD_BASE_DELAY = 2.0
 
 # First 10,002,432 bytes used for the ``md5_10m`` hash (per QQ API spec).
 _MD5_10M_SIZE = 10_002_432
+
+_COS_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _normalize_cos_upload_hosts(values: Optional[Iterable[str]]) -> tuple[str, ...]:
+    """Validate an exact, account-scoped COS upload-host allowlist.
+
+    A broad ``*.myqcloud.com`` suffix is insufficient here: any Tencent COS
+    customer can own a bucket beneath it and receive uploaded media.  QQ does
+    not bind its authenticated ``upload_prepare`` response to a hostname we can
+    derive from the bot app ID, so operators must pin the exact bucket host(s)
+    used by their account.
+    """
+    hosts: list[str] = []
+    for raw in values or ():
+        host = str(raw).strip().lower().rstrip(".")
+        labels = host.split(".")
+        if (
+            len(labels) < 5
+            or ".cos." not in host
+            or not host.endswith(".myqcloud.com")
+            or any(not _COS_HOST_LABEL.fullmatch(label) for label in labels)
+        ):
+            raise ValueError(
+                "QQ COS upload hosts must be exact Tencent COS hostnames "
+                "(for example bucket-123.cos.ap-shanghai.myqcloud.com); "
+                "URLs, wildcards, and suffix-only entries are not allowed"
+            )
+        if host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
 
 
 # ── Exceptions ───────────────────────────────────────────────────────
@@ -207,6 +239,9 @@ class ChunkedUploader:
         :func:`tools.safe_http.safe_http_request_async`. Production callers
         use that primitive directly; tests may inject a deterministic fake.
     :param log_tag: Log prefix.
+    :param allowed_upload_hosts: Exact account-scoped Tencent COS bucket hosts.
+        Empty is fail-closed; configure ``cos_upload_hosts`` or
+        ``QQ_COS_UPLOAD_HOSTS`` before using chunked uploads.
     """
 
     def __init__(
@@ -214,6 +249,7 @@ class ChunkedUploader:
         api_request: ApiRequestFn,
         safe_request: Optional[Callable[..., Awaitable[Any]]] = None,
         log_tag: str = "QQBot",
+        allowed_upload_hosts: Optional[Iterable[str]] = None,
     ) -> None:
         if safe_request is None:
             from tools.safe_http import safe_http_request_async
@@ -222,6 +258,9 @@ class ChunkedUploader:
         self._api_request = api_request
         self._safe_request = safe_request
         self._log_tag = log_tag
+        self._allowed_upload_hosts = _normalize_cos_upload_hosts(
+            allowed_upload_hosts
+        )
 
     async def upload(
         self,
@@ -405,6 +444,13 @@ class ChunkedUploader:
         """PUT part data to a pre-signed COS URL with retry."""
         from tools.safe_http import SafeHttpError
 
+        if not self._allowed_upload_hosts:
+            raise SafeHttpError(
+                "HOST_NOT_ALLOWED",
+                "QQ chunked uploads require an exact COS bucket-host allowlist "
+                "via cos_upload_hosts or QQ_COS_UPLOAD_HOSTS",
+            )
+
         last_exc: Optional[Exception] = None
         for attempt in range(_PART_UPLOAD_MAX_RETRIES + 1):
             try:
@@ -416,7 +462,7 @@ class ChunkedUploader:
                     timeout=_PART_UPLOAD_TIMEOUT,
                     max_bytes=64 * 1024,
                     max_redirects=5,
-                    allowed_host_suffixes=("myqcloud.com",),
+                    allowed_hosts=self._allowed_upload_hosts,
                 )
                 status = getattr(resp, "status_code", 0)
                 if 200 <= status < 300:

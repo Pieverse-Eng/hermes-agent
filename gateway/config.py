@@ -2029,6 +2029,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             extra["app_id"] = qq_app_id
         if qq_client_secret:
             extra["client_secret"] = qq_client_secret
+        qq_cos_upload_hosts = getenv("QQ_COS_UPLOAD_HOSTS", "").strip()
+        if qq_cos_upload_hosts:
+            extra["cos_upload_hosts"] = qq_cos_upload_hosts
         qq_allowed_users = getenv("QQ_ALLOWED_USERS", "").strip()
         if qq_allowed_users:
             extra["allow_from"] = qq_allowed_users

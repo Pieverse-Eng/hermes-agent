@@ -252,7 +252,7 @@ def test_sensitive_headers_are_removed_on_cross_host_redirect():
 
     def transport(method, url, address, headers, data, timeout, max_bytes):
         calls.append((url, {key.lower(): value for key, value in headers.items()}))
-        if url.startswith("https://api.example"):
+        if url == "https://api.example/start":
             return SafeHttpTransportResponse(
                 302,
                 {"location": "https://cdn.example/file"},
@@ -391,7 +391,7 @@ def test_proxy_transport_uses_validated_ip_with_original_host_and_sni(monkeypatc
     assert kwargs["extensions"] == {"sni_hostname": "media.example"}
 
 
-def test_qq_put_host_allowlist_and_redirect_method_policy():
+def test_qq_put_exact_host_allowlist_and_redirect_method_policy():
     calls = []
     resolver = _resolver({
         "bucket.cos.ap-shanghai.myqcloud.com": [PUBLIC_A],
@@ -405,7 +405,7 @@ def test_qq_put_host_allowlist_and_redirect_method_policy():
             "https://attacker.example/upload",
             data=b"part",
             max_bytes=1024,
-            allowed_host_suffixes=("myqcloud.com",),
+            allowed_hosts=("bucket.cos.ap-shanghai.myqcloud.com",),
             resolver=resolver,
             transport=_ok_transport(calls),
         )
@@ -424,20 +424,38 @@ def test_qq_put_host_allowlist_and_redirect_method_policy():
             "https://bucket.cos.ap-shanghai.myqcloud.com/upload",
             data=b"part",
             max_bytes=1024,
-            allowed_host_suffixes=("myqcloud.com",),
+            allowed_hosts=("bucket.cos.ap-shanghai.myqcloud.com",),
             resolver=resolver,
             transport=unsafe_redirect,
         )
     assert method_exc.value.code == "UNSAFE_METHOD_REDIRECT"
 
+    def cross_bucket_redirect(method, url, address, headers, data, timeout, max_bytes):
+        return SafeHttpTransportResponse(
+            307,
+            {"location": "https://next.cos.ap-shanghai.myqcloud.com/upload"},
+        )
+
+    with pytest.raises(SafeHttpError) as cross_bucket_exc:
+        safe_http_request(
+            "PUT",
+            "https://bucket.cos.ap-shanghai.myqcloud.com/upload",
+            data=b"part",
+            max_bytes=1024,
+            allowed_hosts=("bucket.cos.ap-shanghai.myqcloud.com",),
+            resolver=resolver,
+            transport=cross_bucket_redirect,
+        )
+    assert cross_bucket_exc.value.code == "HOST_NOT_ALLOWED"
+
     calls.clear()
 
     def safe_redirect(method, url, address, headers, data, timeout, max_bytes):
         calls.append((method, url, address, data))
-        if "bucket." in url:
+        if url.endswith("/upload"):
             return SafeHttpTransportResponse(
                 307,
-                {"location": "https://next.cos.ap-shanghai.myqcloud.com/upload"},
+                {"location": "https://bucket.cos.ap-shanghai.myqcloud.com/upload-2"},
             )
         return SafeHttpTransportResponse(200, {}, b"")
 
@@ -446,7 +464,7 @@ def test_qq_put_host_allowlist_and_redirect_method_policy():
         "https://bucket.cos.ap-shanghai.myqcloud.com/upload",
         data=b"part",
         max_bytes=1024,
-        allowed_host_suffixes=("myqcloud.com",),
+        allowed_hosts=("bucket.cos.ap-shanghai.myqcloud.com",),
         resolver=resolver,
         transport=safe_redirect,
     )
@@ -460,8 +478,8 @@ def test_qq_put_host_allowlist_and_redirect_method_policy():
         ),
         (
             "PUT",
-            "https://next.cos.ap-shanghai.myqcloud.com/upload",
-            PUBLIC_B,
+            "https://bucket.cos.ap-shanghai.myqcloud.com/upload-2",
+            PUBLIC_A,
             b"part",
         ),
     ]

@@ -11,6 +11,8 @@ Configuration in config.yaml:
         extra:
           app_id: "your-app-id"            # or QQ_APP_ID env var
           client_secret: "your-secret"     # or QQ_CLIENT_SECRET env var
+          cos_upload_hosts:                 # exact QQ COS bucket host(s), required for >10 MB
+            - "bucket-123.cos.ap-shanghai.myqcloud.com"  # or QQ_COS_UPLOAD_HOSTS
           markdown_support: true           # enable QQ markdown (msg_type 2)
           dm_policy: "pairing"             # open | allowlist | disabled | pairing
           allow_from: ["openid_1"]
@@ -205,6 +207,9 @@ class QQAdapter(BasePlatformAdapter):
         self._client_secret = str(
             extra.get("client_secret") or os.getenv("QQ_CLIENT_SECRET", "")
         ).strip()
+        self._cos_upload_hosts = _coerce_list(
+            extra.get("cos_upload_hosts") or os.getenv("QQ_COS_UPLOAD_HOSTS", "")
+        )
         self._markdown_support = bool(extra.get("markdown_support", True))
 
         # Auth/ACL policies
@@ -3008,6 +3013,7 @@ class QQAdapter(BasePlatformAdapter):
         uploader = ChunkedUploader(
             api_request=self._api_request,
             log_tag=self._log_tag,
+            allowed_upload_hosts=self._cos_upload_hosts,
         )
         complete = await uploader.upload(
             chat_type=chat_type,
