@@ -3410,38 +3410,19 @@ class TestSendImageSSRFGuards:
 
     @pytest.mark.asyncio
     async def test_send_image_blocks_private_redirect_target(self, adapter):
-        redirect_response = MagicMock()
-        redirect_response.is_redirect = True
-        redirect_response.next_request = MagicMock(
-            url="http://169.254.169.254/latest/meta-data"
-        )
+        from tools.safe_http import SafeHttpError
 
-        client_kwargs = {}
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        async def fake_get(_url):
-            for hook in client_kwargs["event_hooks"]["response"]:
-                await hook(redirect_response)
-
-        mock_client.get = AsyncMock(side_effect=fake_get)
         adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "reply_ts"}
         )
+        request = AsyncMock(
+            side_effect=SafeHttpError(
+                "ADDRESS_NOT_PUBLIC", "Destination resolved to a non-public address"
+            )
+        )
 
-        def fake_async_client(*args, **kwargs):
-            client_kwargs.update(kwargs)
-            return mock_client
-
-        def fake_is_safe_url(url):
-            return url == "https://public.example/image.png"
-
-        with (
-            patch("tools.url_safety.is_safe_url", side_effect=fake_is_safe_url),
-            patch("httpx.AsyncClient", side_effect=fake_async_client),
-        ):
+        with patch("tools.safe_http.safe_http_request_async", new=request):
             result = await adapter.send_image(
                 chat_id="C123",
                 image_url="https://public.example/image.png",
@@ -3449,8 +3430,7 @@ class TestSendImageSSRFGuards:
             )
 
         assert result.success
-        assert client_kwargs["follow_redirects"] is True
-        assert client_kwargs["event_hooks"]["response"]
+        request.assert_awaited_once()
         adapter._app.client.files_upload_v2.assert_not_awaited()
         adapter._app.client.chat_postMessage.assert_awaited_once()
         call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
@@ -3459,38 +3439,19 @@ class TestSendImageSSRFGuards:
 
     @pytest.mark.asyncio
     async def test_send_image_fallback_preserves_thread_metadata(self, adapter):
-        redirect_response = MagicMock()
-        redirect_response.is_redirect = True
-        redirect_response.next_request = MagicMock(
-            url="http://169.254.169.254/latest/meta-data"
-        )
+        from tools.safe_http import SafeHttpError
 
-        client_kwargs = {}
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        async def fake_get(_url):
-            for hook in client_kwargs["event_hooks"]["response"]:
-                await hook(redirect_response)
-
-        mock_client.get = AsyncMock(side_effect=fake_get)
         adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "reply_ts"}
         )
+        request = AsyncMock(
+            side_effect=SafeHttpError(
+                "ADDRESS_NOT_PUBLIC", "Destination resolved to a non-public address"
+            )
+        )
 
-        def fake_async_client(*args, **kwargs):
-            client_kwargs.update(kwargs)
-            return mock_client
-
-        def fake_is_safe_url(url):
-            return url == "https://public.example/image.png"
-
-        with (
-            patch("tools.url_safety.is_safe_url", side_effect=fake_is_safe_url),
-            patch("httpx.AsyncClient", side_effect=fake_async_client),
-        ):
+        with patch("tools.safe_http.safe_http_request_async", new=request):
             await adapter.send_image(
                 chat_id="C123",
                 image_url="https://public.example/image.png",

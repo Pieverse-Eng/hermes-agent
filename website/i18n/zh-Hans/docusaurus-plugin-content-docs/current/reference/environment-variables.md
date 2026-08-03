@@ -366,6 +366,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `BLUEBUBBLES_ALLOW_ALL_USERS` | 允许所有用户（`true`/`false`） |
 | `QQ_APP_ID` | 来自 [q.qq.com](https://q.qq.com) 的 QQ Bot App ID |
 | `QQ_CLIENT_SECRET` | 来自 [q.qq.com](https://q.qq.com) 的 QQ Bot App Secret |
+| `QQ_COS_UPLOAD_HOSTS` | QQ 大于 10 MB 的分片上传所用腾讯 COS 精确桶主机名（逗号分隔；拒绝通配符和仅后缀配置） |
 | `QQ_STT_API_KEY` | 外部 STT 回退提供商的 API 密钥（可选，当 QQ 内置 ASR 未返回文本时使用） |
 | `QQ_STT_BASE_URL` | 外部 STT 提供商的 base URL（可选） |
 | `QQ_STT_MODEL` | 外部 STT 提供商的模型名称（可选） |

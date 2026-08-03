@@ -132,11 +132,22 @@ def _load_image_bytes(ref: str) -> Tuple[bytes, str]:
     ref = ref.strip()
     lower = ref.lower()
     if lower.startswith(("http://", "https://")):
-        import requests
+        from tools.safe_http import safe_http_request
 
-        resp = requests.get(ref, timeout=60)
+        resp = safe_http_request(
+            "GET",
+            ref,
+            timeout=60.0,
+            max_bytes=25 * 1024 * 1024,
+            allowed_content_types=("image/", "application/octet-stream"),
+            allow_missing_content_type=True,
+            headers={
+                "User-Agent": "HermesAgent/1.0",
+                "Accept": "image/*,application/octet-stream;q=0.5",
+            },
+        )
         resp.raise_for_status()
-        name = ref.split("?", 1)[0].rsplit("/", 1)[-1] or "image.png"
+        name = resp.url.split("?", 1)[0].rsplit("/", 1)[-1] or "image.png"
         return resp.content, name
     if lower.startswith("data:"):
         import base64

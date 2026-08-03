@@ -669,6 +669,55 @@ async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
     return b"".join(chunks)
 
 
+async def _safe_download_remote_media(
+    url: str,
+    *,
+    media_type: str,
+    allowed_content_types: tuple[str, ...],
+    retries: int,
+    proxy_url: Optional[str] = None,
+) -> bytes:
+    """Download untrusted media through the shared pinned-address boundary."""
+    from tools.safe_http import SafeHttpError, safe_http_request_async
+
+    max_bytes = get_inbound_media_max_bytes()
+    # A configured value <= 0 historically disables the cache cap.  Keep the
+    # feature usable while retaining a hard process boundary for remote data.
+    effective_max = max_bytes if max_bytes > 0 else 512 * 1024 * 1024
+    for attempt in range(retries + 1):
+        try:
+            response = await safe_http_request_async(
+                "GET",
+                url,
+                timeout=30.0,
+                max_bytes=effective_max,
+                allowed_content_types=allowed_content_types,
+                allow_missing_content_type=True,
+                proxy_url=proxy_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                    "Accept": "*/*",
+                },
+            )
+            if 200 <= response.status_code < 300:
+                return response.content
+            if response.status_code < 429 or attempt >= retries:
+                response.raise_for_status()
+        except SafeHttpError as exc:
+            if exc.code not in {"REQUEST_FAILED", "DEADLINE_EXCEEDED"} or attempt >= retries:
+                raise
+        wait = 1.5 * (attempt + 1)
+        logger.debug(
+            "Media cache retry %d/%d for %s (%.1fs)",
+            attempt + 1,
+            retries,
+            safe_url_for_log(url),
+            wait,
+        )
+        await asyncio.sleep(wait)
+    raise RuntimeError(f"Failed to download remote {media_type}")
+
+
 def get_image_cache_dir() -> Path:
     """Return the image cache directory, creating it if it doesn't exist."""
     d = _resolve_cache_dir("IMAGE_CACHE_DIR", "cache/images", "image_cache")
@@ -740,49 +789,13 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
     Raises:
         ValueError: If the URL targets a private/internal network (SSRF protection).
     """
-    from tools.url_safety import is_safe_url
-    if not is_safe_url(url):
-        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
-
-    import httpx
-    _log = logging.getLogger(__name__)
-
-    async with httpx.AsyncClient(
-        timeout=30.0,
-        follow_redirects=True,
-        event_hooks={"response": [_ssrf_redirect_guard]},
-    ) as client:
-        for attempt in range(retries + 1):
-            try:
-                async with client.stream(
-                    "GET",
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                        "Accept": "image/*,*/*;q=0.8",
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    content = await _read_httpx_body_with_limit(
-                        response, media_type="image",
-                    )
-                return cache_image_from_bytes(content, ext)
-            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
-                    raise
-                if attempt < retries:
-                    wait = 1.5 * (attempt + 1)
-                    _log.debug(
-                        "Media cache retry %d/%d for %s (%.1fs): %s",
-                        attempt + 1,
-                        retries,
-                        safe_url_for_log(url),
-                        wait,
-                        exc,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                raise
+    content = await _safe_download_remote_media(
+        url,
+        media_type="image",
+        allowed_content_types=("image/", "application/octet-stream"),
+        retries=retries,
+    )
+    return cache_image_from_bytes(content, ext)
 
 
 def cleanup_image_cache(max_age_hours: int = 24) -> int:
@@ -860,49 +873,18 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
     Raises:
         ValueError: If the URL targets a private/internal network (SSRF protection).
     """
-    from tools.url_safety import is_safe_url
-    if not is_safe_url(url):
-        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
-
-    import httpx
-    _log = logging.getLogger(__name__)
-
-    async with httpx.AsyncClient(
-        timeout=30.0,
-        follow_redirects=True,
-        event_hooks={"response": [_ssrf_redirect_guard]},
-    ) as client:
-        for attempt in range(retries + 1):
-            try:
-                async with client.stream(
-                    "GET",
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                        "Accept": "audio/*,*/*;q=0.8",
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    content = await _read_httpx_body_with_limit(
-                        response, media_type="audio",
-                    )
-                return cache_audio_from_bytes(content, ext)
-            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
-                    raise
-                if attempt < retries:
-                    wait = 1.5 * (attempt + 1)
-                    _log.debug(
-                        "Audio cache retry %d/%d for %s (%.1fs): %s",
-                        attempt + 1,
-                        retries,
-                        safe_url_for_log(url),
-                        wait,
-                        exc,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                raise
+    content = await _safe_download_remote_media(
+        url,
+        media_type="audio",
+        allowed_content_types=(
+            "audio/",
+            "video/mp4",
+            "application/ogg",
+            "application/octet-stream",
+        ),
+        retries=retries,
+    )
+    return cache_audio_from_bytes(content, ext)
 
 
 # ---------------------------------------------------------------------------

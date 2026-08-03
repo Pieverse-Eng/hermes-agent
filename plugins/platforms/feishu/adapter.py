@@ -140,6 +140,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    get_inbound_media_max_bytes,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -3402,26 +3403,29 @@ class FeishuAdapter(BasePlatformAdapter):
         default_ext: str,
         preferred_name: str,
     ) -> tuple[str, str]:
-        from tools.url_safety import is_safe_url
-        if not is_safe_url(file_url):
-            raise ValueError(f"Blocked unsafe URL (SSRF protection): {file_url[:80]}")
+        from tools.safe_http import safe_http_request_async
 
-        import httpx
-
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            response = await client.get(
-                file_url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                    "Accept": "*/*",
-                },
-            )
-            response.raise_for_status()
-            # Snapshot Content-Type and body while the client context is
-            # still active so pooled connections fully release on exit.
-            # See #18451.
-            content_type_hdr = str(response.headers.get("Content-Type", ""))
-            body = response.content
+        configured_max = get_inbound_media_max_bytes()
+        max_bytes = configured_max if configured_max > 0 else 512 * 1024 * 1024
+        response = await safe_http_request_async(
+            "GET",
+            file_url,
+            timeout=30.0,
+            max_bytes=max_bytes,
+            allowed_content_types=(
+                "application/",
+                "text/",
+                "image/",
+            ),
+            allow_missing_content_type=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                "Accept": "*/*",
+            },
+        )
+        response.raise_for_status()
+        content_type_hdr = str(response.headers.get("content-type", ""))
+        body = response.content
         filename = self._derive_remote_filename(
             file_url,
             content_type=content_type_hdr,

@@ -37,9 +37,10 @@ import asyncio
 import functools
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from gateway.platforms.qqbot.constants import FILE_UPLOAD_TIMEOUT
 
@@ -65,6 +66,37 @@ _COMPLETE_UPLOAD_BASE_DELAY = 2.0
 
 # First 10,002,432 bytes used for the ``md5_10m`` hash (per QQ API spec).
 _MD5_10M_SIZE = 10_002_432
+
+_COS_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _normalize_cos_upload_hosts(values: Optional[Iterable[str]]) -> tuple[str, ...]:
+    """Validate an exact, account-scoped COS upload-host allowlist.
+
+    A broad ``*.myqcloud.com`` suffix is insufficient here: any Tencent COS
+    customer can own a bucket beneath it and receive uploaded media.  QQ does
+    not bind its authenticated ``upload_prepare`` response to a hostname we can
+    derive from the bot app ID, so operators must pin the exact bucket host(s)
+    used by their account.
+    """
+    hosts: list[str] = []
+    for raw in values or ():
+        host = str(raw).strip().lower().rstrip(".")
+        labels = host.split(".")
+        if (
+            len(labels) < 5
+            or ".cos." not in host
+            or not host.endswith(".myqcloud.com")
+            or any(not _COS_HOST_LABEL.fullmatch(label) for label in labels)
+        ):
+            raise ValueError(
+                "QQ COS upload hosts must be exact Tencent COS hostnames "
+                "(for example bucket-123.cos.ap-shanghai.myqcloud.com); "
+                "URLs, wildcards, and suffix-only entries are not allowed"
+            )
+        if host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
 
 
 # ── Exceptions ───────────────────────────────────────────────────────
@@ -203,20 +235,32 @@ class ChunkedUploader:
     :param api_request: Bound ``_api_request(method, path, body=..., timeout=...)``
         coroutine from the adapter. Must raise ``RuntimeError`` with the biz_code
         embedded in the message on API errors.
-    :param http_put: Coroutine ``(url, data, headers, timeout) -> response`` for
-        COS part uploads. Typically wraps ``httpx.AsyncClient.put``.
+    :param safe_request: Optional injected equivalent of
+        :func:`tools.safe_http.safe_http_request_async`. Production callers
+        use that primitive directly; tests may inject a deterministic fake.
     :param log_tag: Log prefix.
+    :param allowed_upload_hosts: Exact account-scoped Tencent COS bucket hosts.
+        Empty is fail-closed; configure ``cos_upload_hosts`` or
+        ``QQ_COS_UPLOAD_HOSTS`` before using chunked uploads.
     """
 
     def __init__(
         self,
         api_request: ApiRequestFn,
-        http_put: Callable[..., Awaitable[Any]],
+        safe_request: Optional[Callable[..., Awaitable[Any]]] = None,
         log_tag: str = "QQBot",
+        allowed_upload_hosts: Optional[Iterable[str]] = None,
     ) -> None:
+        if safe_request is None:
+            from tools.safe_http import safe_http_request_async
+
+            safe_request = safe_http_request_async
         self._api_request = api_request
-        self._http_put = http_put
+        self._safe_request = safe_request
         self._log_tag = log_tag
+        self._allowed_upload_hosts = _normalize_cos_upload_hosts(
+            allowed_upload_hosts
+        )
 
     async def upload(
         self,
@@ -398,18 +442,28 @@ class ChunkedUploader:
         total_parts: int,
     ) -> None:
         """PUT part data to a pre-signed COS URL with retry."""
+        from tools.safe_http import SafeHttpError
+
+        if not self._allowed_upload_hosts:
+            raise SafeHttpError(
+                "HOST_NOT_ALLOWED",
+                "QQ chunked uploads require an exact COS bucket-host allowlist "
+                "via cos_upload_hosts or QQ_COS_UPLOAD_HOSTS",
+            )
+
         last_exc: Optional[Exception] = None
         for attempt in range(_PART_UPLOAD_MAX_RETRIES + 1):
             try:
-                resp = await asyncio.wait_for(
-                    self._http_put(
-                        url,
-                        data=data,
-                        headers={"Content-Length": str(len(data))},
-                    ),
+                resp = await self._safe_request(
+                    "PUT",
+                    url,
+                    data=data,
+                    headers={"Content-Length": str(len(data))},
                     timeout=_PART_UPLOAD_TIMEOUT,
+                    max_bytes=64 * 1024,
+                    max_redirects=5,
+                    allowed_hosts=self._allowed_upload_hosts,
                 )
-                # Caller's http_put is expected to return an httpx-like response.
                 status = getattr(resp, "status_code", 0)
                 if 200 <= status < 300:
                     logger.debug(
@@ -417,14 +471,23 @@ class ChunkedUploader:
                         self._log_tag, part_index, total_parts, status,
                     )
                     return
-                body_preview = ""
-                try:
-                    body_preview = getattr(resp, "text", "")[:200]
-                except Exception:  # pragma: no cover — defensive
-                    pass
+                raw_body = getattr(resp, "content", b"")
+                body_preview = bytes(raw_body).decode("utf-8", errors="replace")[:200]
                 raise RuntimeError(
                     f"COS PUT returned {status}: {body_preview}"
                 )
+            except SafeHttpError as exc:
+                if exc.code not in {"REQUEST_FAILED", "DEADLINE_EXCEEDED"}:
+                    raise
+                last_exc = exc
+                if attempt < _PART_UPLOAD_MAX_RETRIES:
+                    delay = 1.0 * (2 ** attempt)
+                    logger.warning(
+                        "[%s] PUT part %d/%d attempt %d failed, retry in %.1fs: %s",
+                        self._log_tag, part_index, total_parts,
+                        attempt + 1, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
             except Exception as exc:
                 last_exc = exc
                 if attempt < _PART_UPLOAD_MAX_RETRIES:

@@ -125,6 +125,33 @@ class TestModelResolution:
 
 
 class TestSourceImageLoading:
+    def test_load_remote_image_uses_bounded_shared_fetch(self, monkeypatch):
+        from tools.safe_http import SafeHttpResponse
+
+        request = MagicMock(
+            return_value=SafeHttpResponse(
+                200,
+                {"content-type": "image/png"},
+                b"\x89PNG\r\n\x1a\nremote",
+                "https://cdn.example/final.png",
+                1,
+            )
+        )
+        monkeypatch.setattr("tools.safe_http.safe_http_request", request)
+
+        data, name = openai_plugin._load_image_bytes(
+            "https://source.example/reference"
+        )
+
+        assert data == b"\x89PNG\r\n\x1a\nremote"
+        assert name == "final.png"
+        kwargs = request.call_args.kwargs
+        assert kwargs["max_bytes"] == 25 * 1024 * 1024
+        assert kwargs["allowed_content_types"] == (
+            "image/",
+            "application/octet-stream",
+        )
+
     def test_load_image_bytes_blocks_credential_store(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

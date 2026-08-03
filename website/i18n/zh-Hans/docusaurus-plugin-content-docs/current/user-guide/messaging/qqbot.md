@@ -40,6 +40,9 @@ hermes gateway setup
 ```bash
 QQ_APP_ID=your-app-id
 QQ_CLIENT_SECRET=your-app-secret
+# 仅大于 10 MB 的分片上传需要。请填写精确主机名；
+# 不要填写 *.myqcloud.com 或完整 URL。
+QQ_COS_UPLOAD_HOSTS=qq-media-123.cos.ap-shanghai.myqcloud.com
 ```
 
 ## 环境变量
@@ -48,6 +51,7 @@ QQ_CLIENT_SECRET=your-app-secret
 |---|---|---|
 | `QQ_APP_ID` | QQ Bot App ID（必填） | — |
 | `QQ_CLIENT_SECRET` | QQ Bot App Secret（必填） | — |
+| `QQ_COS_UPLOAD_HOSTS` | 逗号分隔的、该 Bot 分片上传（>10 MB）所用腾讯 COS 精确桶主机名；拒绝通配符和仅后缀配置 | —（分片上传默认关闭） |
 | `QQBOT_HOME_CHANNEL` | 用于 cron/通知投递的 OpenID | — |
 | `QQBOT_HOME_CHANNEL_NAME` | 主频道显示名称 | `Home` |
 | `QQ_ALLOWED_USERS` | 允许私聊访问的用户 OpenID 列表（逗号分隔） | 开放（所有用户） |
@@ -69,6 +73,8 @@ platforms:
     extra:
       app_id: "your-app-id"
       client_secret: "your-secret"
+      cos_upload_hosts:
+        - "qq-media-123.cos.ap-shanghai.myqcloud.com"
       markdown_support: true       # enable QQ markdown (msg_type 2). Config-only; no env-var equivalent.
       dm_policy: "open"          # open | allowlist | disabled
       allow_from:

@@ -256,17 +256,22 @@ def save_b64_image(
     return path
 
 
-# Extension inference for save_url_image — keep small and explicit.  We don't
-# want to import mimetypes for a handful of formats every image_gen provider
-# actually returns, and we never want to inherit a content-type that points
-# at HTML or JSON when the API gives us a degenerate response.
-_URL_IMAGE_CONTENT_TYPES = {
-    "image/png": "png",
-    "image/jpeg": "jpg",
-    "image/jpg": "jpg",
-    "image/webp": "webp",
-    "image/gif": "gif",
-}
+# Extension inference for save_url_image — keep small and explicit. We derive
+# it from file magic so a misleading Content-Type or URL suffix cannot turn
+# HTML/JSON into a cached image.
+def _image_extension_from_bytes(data: bytes) -> Optional[str]:
+    """Return a supported extension only when the payload has image magic."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if data.startswith(b"BM"):
+        return "bmp"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "webp"
+    return None
 
 
 def save_url_image(
@@ -288,52 +293,31 @@ def save_url_image(
     network / HTTP / oversize / non-image-content-type error so callers can
     fall back to returning the bare URL with a clear error message.
     """
-    import requests
+    from tools.safe_http import safe_http_request
 
-    response = requests.get(url, timeout=timeout, stream=True)
+    response = safe_http_request(
+        "GET",
+        url,
+        timeout=timeout,
+        max_bytes=max_bytes,
+        allowed_content_types=("image/", "application/octet-stream"),
+        allow_missing_content_type=True,
+        headers={
+            "User-Agent": "HermesAgent/1.0",
+            "Accept": "image/*,application/octet-stream;q=0.5",
+        },
+    )
     response.raise_for_status()
 
-    # Infer extension from the response content-type, falling back to the
-    # URL suffix when xAI / OpenAI omit a precise type (some CDNs return
-    # ``application/octet-stream``).  Defaults to ``png``.
-    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-    extension = _URL_IMAGE_CONTENT_TYPES.get(content_type)
+    extension = _image_extension_from_bytes(response.content)
     if extension is None:
-        url_path = url.split("?", 1)[0].lower()
-        for ext in ("png", "jpg", "jpeg", "webp", "gif"):
-            if url_path.endswith(f".{ext}"):
-                extension = "jpg" if ext == "jpeg" else ext
-                break
-    if extension is None:
-        extension = "png"
+        raise ValueError("Provider image response is not a supported raster image")
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
     path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
 
-    bytes_written = 0
-    with path.open("wb") as fh:
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            bytes_written += len(chunk)
-            if bytes_written > max_bytes:
-                fh.close()
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-                raise ValueError(
-                    f"Image at {url} exceeds {max_bytes // (1024 * 1024)}MB cap; refusing to cache."
-                )
-            fh.write(chunk)
-
-    if bytes_written == 0:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        raise ValueError(f"Image at {url} returned 0 bytes; refusing to cache.")
+    path.write_bytes(response.content)
 
     return path
 

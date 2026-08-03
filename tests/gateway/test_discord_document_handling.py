@@ -138,19 +138,11 @@ def make_message(attachments: list, content: str = "") -> SimpleNamespace:
 
 
 def _mock_aiohttp_download(raw_bytes: bytes):
-    """Return a patch context manager that makes aiohttp return raw_bytes."""
-    resp = AsyncMock()
-    resp.status = 200
-    resp.read = AsyncMock(return_value=raw_bytes)
-    resp.__aenter__ = AsyncMock(return_value=resp)
-    resp.__aexit__ = AsyncMock(return_value=False)
-
-    session = AsyncMock()
-    session.get = MagicMock(return_value=resp)
-    session.__aenter__ = AsyncMock(return_value=session)
-    session.__aexit__ = AsyncMock(return_value=False)
-
-    return patch("aiohttp.ClientSession", return_value=session)
+    """Return a patch for the already-tested shared download boundary."""
+    return patch(
+        "plugins.platforms.discord.adapter._safe_download_remote_media",
+        new=AsyncMock(return_value=raw_bytes),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,34 +315,11 @@ class TestIncomingDocumentHandling:
         content1 = b"First file content"
         content2 = b"Second file content"
 
-        call_count = 0
-        responses = [content1, content2]
-
-        def make_session(_responses):
-            idx = 0
-
-            class FakeSession:
-                async def __aenter__(self):
-                    return self
-
-                async def __aexit__(self, *_):
-                    pass
-
-                def get(self, url, **kwargs):
-                    nonlocal idx
-                    data = _responses[idx % len(_responses)]
-                    idx += 1
-
-                    resp = AsyncMock()
-                    resp.status = 200
-                    resp.read = AsyncMock(return_value=data)
-                    resp.__aenter__ = AsyncMock(return_value=resp)
-                    resp.__aexit__ = AsyncMock(return_value=False)
-                    return resp
-
-            return FakeSession()
-
-        with patch("aiohttp.ClientSession", return_value=make_session([content1, content2])):
+        download = AsyncMock(side_effect=[content1, content2])
+        with patch(
+            "plugins.platforms.discord.adapter._safe_download_remote_media",
+            new=download,
+        ):
             msg = make_message(
                 attachments=[
                     make_attachment(filename="file1.txt", content_type="text/plain"),
@@ -510,4 +479,3 @@ class TestAllowAnyAttachment:
         """Garbage in max_attachment_bytes config falls back to 32 MiB."""
         adapter.config.extra["max_attachment_bytes"] = "not-a-number"
         assert adapter._discord_max_attachment_bytes() == 32 * 1024 * 1024
-

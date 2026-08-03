@@ -415,6 +415,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `BLUEBUBBLES_ALLOW_ALL_USERS` | Allow all users (`true`/`false`) |
 | `QQ_APP_ID` | QQ Bot App ID from [q.qq.com](https://q.qq.com) |
 | `QQ_CLIENT_SECRET` | QQ Bot App Secret from [q.qq.com](https://q.qq.com) |
+| `QQ_COS_UPLOAD_HOSTS` | Comma-separated exact Tencent COS bucket hosts for QQ chunked uploads over 10 MB (wildcards and suffix-only entries are rejected) |
 | `QQ_STT_API_KEY` | API key for external STT fallback provider (optional, used when QQ built-in ASR returns no text) |
 | `QQ_STT_BASE_URL` | Base URL for external STT provider (optional) |
 | `QQ_STT_MODEL` | Model name for external STT provider (optional) |

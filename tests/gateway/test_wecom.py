@@ -452,34 +452,24 @@ class TestMediaUpload:
         assert calls[3][1]["chunk_index"] == 2
 
     @pytest.mark.asyncio
-    @patch("tools.url_safety.is_safe_url", return_value=True)
-    async def test_download_remote_bytes_rejects_large_content_length(self, _mock_safe):
+    async def test_download_remote_bytes_rejects_large_content_length(self):
         from plugins.platforms.wecom.adapter import WeComAdapter
-
-        class FakeResponse:
-            headers = {"content-length": "10"}
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return None
-
-            def raise_for_status(self):
-                return None
-
-            async def aiter_bytes(self):
-                yield b"abc"
-
-        class FakeClient:
-            def stream(self, method, url, headers=None):
-                return FakeResponse()
+        from tools.safe_http import SafeHttpError
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
-        adapter._http_client = FakeClient()
 
-        with pytest.raises(ValueError, match="exceeds WeCom limit"):
-            await adapter._download_remote_bytes("https://example.com/file.bin", max_bytes=4)
+        request = AsyncMock(
+            side_effect=SafeHttpError(
+                "RESPONSE_TOO_LARGE", "Response exceeds the byte limit"
+            )
+        )
+        with patch("tools.safe_http.safe_http_request_async", new=request):
+            with pytest.raises(SafeHttpError) as excinfo:
+                await adapter._download_remote_bytes(
+                    "https://example.com/file.bin", max_bytes=4
+                )
+        assert excinfo.value.code == "RESPONSE_TOO_LARGE"
+        assert request.await_args.kwargs["max_bytes"] == 4
 
     @pytest.mark.asyncio
     async def test_cache_media_decrypts_url_payload_before_writing(self):

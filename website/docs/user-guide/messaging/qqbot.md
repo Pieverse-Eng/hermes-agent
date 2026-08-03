@@ -40,6 +40,9 @@ Set the required environment variables in `~/.hermes/.env`:
 ```bash
 QQ_APP_ID=your-app-id
 QQ_CLIENT_SECRET=your-app-secret
+# Required only for chunked uploads larger than 10 MB. Use exact hostnames;
+# do not use *.myqcloud.com or a URL.
+QQ_COS_UPLOAD_HOSTS=qq-media-123.cos.ap-shanghai.myqcloud.com
 ```
 
 ## Environment Variables
@@ -48,6 +51,7 @@ QQ_CLIENT_SECRET=your-app-secret
 |---|---|---|
 | `QQ_APP_ID` | QQ Bot App ID (required) | — |
 | `QQ_CLIENT_SECRET` | QQ Bot App Secret (required) | — |
+| `QQ_COS_UPLOAD_HOSTS` | Comma-separated exact Tencent COS bucket hosts returned for this bot's chunked uploads (>10 MB); wildcards and suffix-only entries are rejected | — (chunked uploads fail closed) |
 | `QQBOT_HOME_CHANNEL` | OpenID for cron/notification delivery | — |
 | `QQBOT_HOME_CHANNEL_NAME` | Display name for home channel | `Home` |
 | `QQ_ALLOWED_USERS` | Comma-separated user OpenIDs for DM access | open (all users) |
@@ -69,6 +73,8 @@ platforms:
     extra:
       app_id: "your-app-id"
       client_secret: "your-secret"
+      cos_upload_hosts:
+        - "qq-media-123.cos.ap-shanghai.myqcloud.com"
       markdown_support: true       # enable QQ markdown (msg_type 2). Config-only; no env-var equivalent.
       dm_policy: "open"          # open | allowlist | disabled
       allow_from:
