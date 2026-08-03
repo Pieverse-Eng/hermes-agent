@@ -8,6 +8,7 @@ import pytest
 
 import gateway.run as gateway_run
 from agent.i18n import t
+from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 from gateway.session import SessionEntry, build_session_key
@@ -20,6 +21,7 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     # which changes the restart call signature.
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     runner, _adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].extra["allow_admin_from"] = ["u1"]
     runner.request_restart = MagicMock(return_value=True)
     event = MessageEvent(
         text="/restart",

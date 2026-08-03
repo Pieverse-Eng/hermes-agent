@@ -37,10 +37,17 @@ class _FakeAdapter:
             event.set()
 
 
-def _make_runner():
+def _make_runner(*, admin: bool = False):
+    platform_extra = {"allow_admin_from": ["u1"]} if admin else {}
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="***",
+                extra=platform_extra,
+            )
+        }
     )
     runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
     runner._running_agents = {}
@@ -372,21 +379,22 @@ async def test_start_command_is_noop_during_active_session():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("command_text", "handler_attr", "handler_result"),
+    ("command_text", "handler_attr", "handler_result", "requires_admin"),
     [
-        ("/help", "_handle_help_command", "Help text"),
-        ("/commands", "_handle_commands_command", "Commands text"),
-        ("/update", "_handle_update_command", "Update text"),
-        ("/profile", "_handle_profile_command", "Profile text"),
+        ("/help", "_handle_help_command", "Help text", False),
+        ("/commands", "_handle_commands_command", "Commands text", False),
+        ("/update", "_handle_update_command", "Update text", True),
+        ("/profile", "_handle_profile_command", "Profile text", False),
     ],
 )
 async def test_active_session_bypass_commands_dispatch_without_interrupt(
     command_text,
     handler_attr,
     handler_result,
+    requires_admin,
 ):
     """Gateway-handled bypass commands must return directly while an agent runs."""
-    runner = _make_runner()
+    runner = _make_runner(admin=requires_admin)
     event = _make_event(text=command_text)
     session_key = build_session_key(event.source)
 
@@ -409,7 +417,7 @@ async def test_active_session_bypass_commands_dispatch_without_interrupt(
 async def test_stop_during_sentinel_force_cleans_session():
     """If /stop arrives while the sentinel is set (agent still starting),
     it should force-clean the sentinel and unlock the session."""
-    runner = _make_runner()
+    runner = _make_runner(admin=True)
     event1 = _make_event(text="hello")
     session_key = build_session_key(event1.source)
 
@@ -457,7 +465,7 @@ async def test_stop_hard_kills_running_agent():
     3. Return a confirmation message
     This fixes the bug where a hung agent kept the session locked
     forever — showing 'writing...' but never producing output."""
-    runner = _make_runner()
+    runner = _make_runner(admin=True)
     session_key = build_session_key(
         SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="u1")
     )
@@ -496,7 +504,7 @@ async def test_stop_hard_kills_running_agent():
 async def test_stop_clears_pending_messages():
     """When /stop hard-kills a running agent, any pending messages
     queued during the run must be discarded."""
-    runner = _make_runner()
+    runner = _make_runner(admin=True)
     session_key = build_session_key(
         SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="u1")
     )
