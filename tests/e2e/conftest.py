@@ -176,7 +176,17 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={platform: PlatformConfig(enabled=True, token="e2e-test-token")}
+        platforms={
+            platform: PlatformConfig(
+                enabled=True,
+                token="e2e-test-token",
+                # Command-pipeline E2E tests exercise dispatch, not the
+                # authorization matrix. Give the fixture caller explicit
+                # authority; fail-closed user/admin behavior is covered by
+                # test_slash_access*.py.
+                extra={"allow_admin_from": ["e2e-user-1"]},
+            )
+        }
     )
     runner.adapters = {}
     runner._voice_mode = {}
