@@ -134,7 +134,30 @@ class TestCLIQuickCommands:
 class TestGatewayQuickCommands:
     """Test quick command dispatch in GatewayRunner._handle_message."""
 
+    @staticmethod
+    def _make_runner(quick_commands):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    enabled=True,
+                    token="***",
+                    extra={"allow_admin_from": ["test_user"]},
+                )
+            },
+            quick_commands=quick_commands,
+        )
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+        return runner
+
     def _make_event(self, command, args=""):
+        from gateway.config import Platform
+
         event = MagicMock()
         event.get_command.return_value = command
         event.get_command_args.return_value = args
@@ -142,19 +165,16 @@ class TestGatewayQuickCommands:
         event.source = MagicMock()
         event.source.user_id = "test_user"
         event.source.user_name = "Test User"
-        event.source.platform.value = "telegram"
+        event.source.platform = Platform.TELEGRAM
         event.source.chat_type = "dm"
         event.source.chat_id = "123"
         return event
 
     @pytest.mark.asyncio
     async def test_exec_command_returns_output(self):
-        from gateway.run import GatewayRunner
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"limits": {"type": "exec", "command": "echo ok"}}}
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
+        runner = self._make_runner(
+            {"limits": {"type": "exec", "command": "echo ok"}}
+        )
 
         event = self._make_event("limits")
         result = await runner._handle_message(event)
@@ -163,13 +183,9 @@ class TestGatewayQuickCommands:
     @pytest.mark.asyncio
     async def test_exec_command_does_not_leak_credentials(self):
         """Quick command exec must sanitize env — API keys must not appear in output."""
-        from gateway.run import GatewayRunner
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"leak": {"type": "exec", "command": "env"}}}
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
+        runner = self._make_runner(
+            {"leak": {"type": "exec", "command": "env"}}
+        )
 
         event = self._make_event("leak")
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-secret-12345"}):
@@ -181,17 +197,18 @@ class TestGatewayQuickCommands:
     @pytest.mark.asyncio
     async def test_exec_command_output_is_redacted(self, monkeypatch):
         """Quick command output must redact sensitive patterns before returning."""
-        from gateway.run import GatewayRunner
-
         # Ensure redaction is active regardless of host HERMES_REDACT_SECRETS state
         # or test ordering
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
 
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"token": {"type": "exec", "command": "echo sk-ant-api03-supersecretkey1234567890"}}}
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
+        runner = self._make_runner(
+            {
+                "token": {
+                    "type": "exec",
+                    "command": "echo sk-ant-api03-supersecretkey1234567890",
+                }
+            }
+        )
 
         event = self._make_event("token")
         result = await runner._handle_message(event)
@@ -201,12 +218,9 @@ class TestGatewayQuickCommands:
 
     @pytest.mark.asyncio
     async def test_unsupported_type_returns_error(self):
-        from gateway.run import GatewayRunner
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"bad": {"type": "prompt", "command": "echo hi"}}}
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
+        runner = self._make_runner(
+            {"bad": {"type": "prompt", "command": "echo hi"}}
+        )
 
         event = self._make_event("bad")
         result = await runner._handle_message(event)
@@ -215,13 +229,10 @@ class TestGatewayQuickCommands:
 
     @pytest.mark.asyncio
     async def test_timeout_returns_error(self):
-        from gateway.run import GatewayRunner
         import asyncio
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"slow": {"type": "exec", "command": "sleep 100"}}}
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
+        runner = self._make_runner(
+            {"slow": {"type": "exec", "command": "sleep 100"}}
+        )
 
         event = self._make_event("slow")
         with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
@@ -231,16 +242,9 @@ class TestGatewayQuickCommands:
 
     @pytest.mark.asyncio
     async def test_gateway_config_object_supports_quick_commands(self):
-        from gateway.config import GatewayConfig
-        from gateway.run import GatewayRunner
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = GatewayConfig(
-            quick_commands={"limits": {"type": "exec", "command": "echo ok"}}
+        runner = self._make_runner(
+            {"limits": {"type": "exec", "command": "echo ok"}}
         )
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
 
         event = self._make_event("limits")
         result = await runner._handle_message(event)

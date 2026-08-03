@@ -15,7 +15,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -44,9 +44,20 @@ def _make_runner(hermes_home=None):
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._failed_platforms = {}
-    # config is accessed by _check_slash_access and quick_commands lookup;
-    # None makes policy_for_source return a disabled (allow-all) policy.
-    runner.config = None
+    # These tests exercise update interception rather than authorization, so
+    # make the fixture user an explicit admin under the production policy.
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={
+                    "allow_admin_from": ["12345"],
+                    "group_allow_admin_from": ["12345"],
+                },
+            )
+        }
+    )
     # Bypass the destructive-slash confirm gate — this test exercises
     # update-prompt interception, not the confirm prompt.
     runner._read_user_config = lambda: {

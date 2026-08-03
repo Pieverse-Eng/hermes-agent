@@ -51,7 +51,24 @@ def _make_event(text: str = "hello", chat_id: str = "chat-1") -> MessageEvent:
 def _make_runner(max_concurrent_sessions: int | None = None) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={
+                    "allow_admin_from": [
+                        "user-chat-1",
+                        "user-busy",
+                        "user-new",
+                    ],
+                    "group_allow_admin_from": [
+                        "user-chat-1",
+                        "user-busy",
+                        "user-new",
+                    ],
+                },
+            )
+        },
         max_concurrent_sessions=max_concurrent_sessions,
     )
     runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
