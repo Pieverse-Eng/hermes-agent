@@ -3007,7 +3007,6 @@ class QQAdapter(BasePlatformAdapter):
         resolved_name = file_name or local_path.name
         uploader = ChunkedUploader(
             api_request=self._api_request,
-            http_put=self._http_client.put,
             log_tag=self._log_tag,
         )
         complete = await uploader.upload(

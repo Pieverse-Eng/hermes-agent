@@ -812,20 +812,20 @@ class TestChunkedUploaderFlow:
             # complete
             return {"file_info": "FILEINFO_TOKEN", "file_uuid": "u-1"}
 
-        # Mock http_put — always returns 200.
+        # Mock the shared safe request — always returns 200.
         put_calls = []
 
         class _FakeResp:
             status_code = 200
-            text = ""
+            content = b""
 
-        async def fake_put(url, data=None, headers=None):
-            put_calls.append((url, len(data), headers))
+        async def fake_put(method, url, *, data=None, headers=None, **kwargs):
+            put_calls.append((method, url, len(data), headers, kwargs))
             return _FakeResp()
 
         uploader = ChunkedUploader(
             api_request=fake_api_request,
-            http_put=fake_put,
+            safe_request=fake_put,
             log_tag="QQBot:TEST",
         )
         result = await uploader.upload(
@@ -839,8 +839,9 @@ class TestChunkedUploaderFlow:
         assert result["file_info"] == "FILEINFO_TOKEN"
         # Two PUTs, one per part.
         assert len(put_calls) == 2
-        assert put_calls[0][0] == "https://cos.example/p1"
-        assert put_calls[1][0] == "https://cos.example/p2"
+        assert put_calls[0][0:2] == ("PUT", "https://cos.example/p1")
+        assert put_calls[1][0:2] == ("PUT", "https://cos.example/p2")
+        assert put_calls[0][4]["allowed_host_suffixes"] == ("myqcloud.com",)
         # Prepare + 2 part_finish + complete = 4 api calls.
         assert len(api_calls) == 4
         assert api_calls[0][1].endswith("/upload_prepare")
@@ -874,9 +875,9 @@ class TestChunkedUploaderFlow:
 
         class _R:
             status_code = 200
-            text = ""
+            content = b""
 
-        async def fake_put(url, data=None, headers=None):
+        async def fake_put(method, url, *, data=None, headers=None, **kwargs):
             return _R()
 
         u = ChunkedUploader(fake_api_request, fake_put, "QQBot:T")
@@ -950,7 +951,7 @@ class TestChunkedUploaderFlow:
 
             class _R:
                 status_code = 200
-                text = ""
+                content = b""
 
             async def fake_put(*a, **kw):
                 return _R()
@@ -992,9 +993,9 @@ class TestChunkedUploaderFlow:
         class _Resp:
             def __init__(self, status, text=""):
                 self.status_code = status
-                self.text = text
+                self.content = text.encode()
 
-        async def fake_put(url, data=None, headers=None):
+        async def fake_put(method, url, *, data=None, headers=None, **kwargs):
             put_attempts["n"] += 1
             if put_attempts["n"] < 2:
                 return _Resp(500, "transient")
@@ -1010,6 +1011,24 @@ class TestChunkedUploaderFlow:
         )
         assert result["file_info"] == "F"
         assert put_attempts["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_put_does_not_retry_destination_policy_failure(self):
+        from gateway.platforms.qqbot.chunked_upload import ChunkedUploader
+        from tools.safe_http import SafeHttpError
+
+        request = mock.AsyncMock(
+            side_effect=SafeHttpError("HOST_NOT_ALLOWED", "not a COS host")
+        )
+        uploader = ChunkedUploader(mock.AsyncMock(), request, "T")
+
+        with pytest.raises(SafeHttpError) as excinfo:
+            await uploader._put_to_presigned_url(
+                "https://attacker.example/upload", b"part", 1, 1
+            )
+
+        assert excinfo.value.code == "HOST_NOT_ALLOWED"
+        request.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

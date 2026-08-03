@@ -203,19 +203,24 @@ class ChunkedUploader:
     :param api_request: Bound ``_api_request(method, path, body=..., timeout=...)``
         coroutine from the adapter. Must raise ``RuntimeError`` with the biz_code
         embedded in the message on API errors.
-    :param http_put: Coroutine ``(url, data, headers, timeout) -> response`` for
-        COS part uploads. Typically wraps ``httpx.AsyncClient.put``.
+    :param safe_request: Optional injected equivalent of
+        :func:`tools.safe_http.safe_http_request_async`. Production callers
+        use that primitive directly; tests may inject a deterministic fake.
     :param log_tag: Log prefix.
     """
 
     def __init__(
         self,
         api_request: ApiRequestFn,
-        http_put: Callable[..., Awaitable[Any]],
+        safe_request: Optional[Callable[..., Awaitable[Any]]] = None,
         log_tag: str = "QQBot",
     ) -> None:
+        if safe_request is None:
+            from tools.safe_http import safe_http_request_async
+
+            safe_request = safe_http_request_async
         self._api_request = api_request
-        self._http_put = http_put
+        self._safe_request = safe_request
         self._log_tag = log_tag
 
     async def upload(
@@ -398,18 +403,21 @@ class ChunkedUploader:
         total_parts: int,
     ) -> None:
         """PUT part data to a pre-signed COS URL with retry."""
+        from tools.safe_http import SafeHttpError
+
         last_exc: Optional[Exception] = None
         for attempt in range(_PART_UPLOAD_MAX_RETRIES + 1):
             try:
-                resp = await asyncio.wait_for(
-                    self._http_put(
-                        url,
-                        data=data,
-                        headers={"Content-Length": str(len(data))},
-                    ),
+                resp = await self._safe_request(
+                    "PUT",
+                    url,
+                    data=data,
+                    headers={"Content-Length": str(len(data))},
                     timeout=_PART_UPLOAD_TIMEOUT,
+                    max_bytes=64 * 1024,
+                    max_redirects=5,
+                    allowed_host_suffixes=("myqcloud.com",),
                 )
-                # Caller's http_put is expected to return an httpx-like response.
                 status = getattr(resp, "status_code", 0)
                 if 200 <= status < 300:
                     logger.debug(
@@ -417,14 +425,23 @@ class ChunkedUploader:
                         self._log_tag, part_index, total_parts, status,
                     )
                     return
-                body_preview = ""
-                try:
-                    body_preview = getattr(resp, "text", "")[:200]
-                except Exception:  # pragma: no cover — defensive
-                    pass
+                raw_body = getattr(resp, "content", b"")
+                body_preview = bytes(raw_body).decode("utf-8", errors="replace")[:200]
                 raise RuntimeError(
                     f"COS PUT returned {status}: {body_preview}"
                 )
+            except SafeHttpError as exc:
+                if exc.code not in {"REQUEST_FAILED", "DEADLINE_EXCEEDED"}:
+                    raise
+                last_exc = exc
+                if attempt < _PART_UPLOAD_MAX_RETRIES:
+                    delay = 1.0 * (2 ** attempt)
+                    logger.warning(
+                        "[%s] PUT part %d/%d attempt %d failed, retry in %.1fs: %s",
+                        self._log_tag, part_index, total_parts,
+                        attempt + 1, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
             except Exception as exc:
                 last_exc = exc
                 if attempt < _PART_UPLOAD_MAX_RETRIES:

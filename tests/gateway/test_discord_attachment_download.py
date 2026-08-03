@@ -257,49 +257,43 @@ class TestCacheDiscordDocument:
 
     @pytest.mark.asyncio
     async def test_fallback_blocked_by_ssrf_guard(self):
-        """Document fallback path now honors is_safe_url — was missing before.
+        """A shared-boundary rejection is propagated without raw HTTP fallback."""
+        from tools.safe_http import SafeHttpError
 
-        Regression guard for #11345: the old aiohttp block skipped the
-        SSRF check entirely; a non-CDN ``att.url`` could have reached
-        internal-looking hosts. The fallback must now refuse unsafe URLs.
-        """
         adapter = _make_adapter()
         att = _make_attachment_without_read()  # no .read → forces fallback
 
+        download = AsyncMock(
+            side_effect=SafeHttpError(
+                "ADDRESS_NOT_PUBLIC", "Destination resolved to a non-public address"
+            )
+        )
         with patch(
-            "plugins.platforms.discord.adapter.is_safe_url", return_value=False
-        ) as mock_safe, patch("aiohttp.ClientSession") as mock_session:
-            with pytest.raises(ValueError, match="SSRF"):
+            "plugins.platforms.discord.adapter._safe_download_remote_media",
+            new=download,
+        ):
+            with pytest.raises(SafeHttpError) as excinfo:
                 await adapter._cache_discord_document(att, ".pdf")
 
-        mock_safe.assert_called_once_with(att.url)
-        # aiohttp must NOT be contacted when the URL is blocked.
-        mock_session.assert_not_called()
+        assert excinfo.value.code == "ADDRESS_NOT_PUBLIC"
+        download.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_fallback_aiohttp_when_safe_url(self):
-        """Safe URL + no att.read() → aiohttp fallback executes."""
+    async def test_fallback_shared_boundary_when_attachment_read_unavailable(self):
+        """No att.read() routes the URL through the shared download boundary."""
         adapter = _make_adapter()
         att = _make_attachment_without_read()
 
-        # Build an aiohttp session mock that returns 200 + payload.
-        resp = AsyncMock()
-        resp.status = 200
-        resp.read = AsyncMock(return_value=_PDF_BYTES)
-        resp.__aenter__ = AsyncMock(return_value=resp)
-        resp.__aexit__ = AsyncMock(return_value=False)
-
-        session = AsyncMock()
-        session.get = MagicMock(return_value=resp)
-        session.__aenter__ = AsyncMock(return_value=session)
-        session.__aexit__ = AsyncMock(return_value=False)
-
+        download = AsyncMock(return_value=_PDF_BYTES)
         with patch(
-            "plugins.platforms.discord.adapter.is_safe_url", return_value=True
-        ), patch("aiohttp.ClientSession", return_value=session):
+            "plugins.platforms.discord.adapter._safe_download_remote_media",
+            new=download,
+        ):
             result = await adapter._cache_discord_document(att, ".pdf")
 
         assert result == _PDF_BYTES
+        assert download.await_args.args == (att.url,)
+        assert download.await_args.kwargs["media_type"] == "document"
 
 
 # ---------------------------------------------------------------------------

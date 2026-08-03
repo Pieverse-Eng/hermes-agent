@@ -1094,44 +1094,25 @@ class WeComAdapter(BasePlatformAdapter):
         url: str,
         max_bytes: int,
     ) -> Tuple[bytes, Dict[str, str]]:
-        from tools.url_safety import is_safe_url
-        if not is_safe_url(url):
-            raise ValueError(f"Blocked unsafe URL (SSRF protection): {url[:80]}")
+        from tools.safe_http import safe_http_request_async
 
-        if not HTTPX_AVAILABLE:
-            raise RuntimeError("httpx is required for WeCom media download")
-
-        client = self._http_client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        created_client = client is not self._http_client
-        try:
-            async with client.stream(
-                "GET",
-                url,
-                headers={
-                    "User-Agent": "HermesAgent/1.0",
-                    "Accept": "*/*",
-                },
-            ) as response:
-                response.raise_for_status()
-                headers = {key.lower(): value for key, value in response.headers.items()}
-                content_length = headers.get("content-length")
-                if content_length and content_length.isdigit() and int(content_length) > max_bytes:
-                    raise ValueError(
-                        f"Remote media exceeds WeCom limit: {int(content_length)} bytes > {max_bytes} bytes"
-                    )
-
-                data = bytearray()
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > max_bytes:
-                        raise ValueError(
-                            f"Remote media exceeds WeCom limit while downloading: {len(data)} bytes > {max_bytes} bytes"
-                        )
-
-                return bytes(data), headers
-        finally:
-            if created_client:
-                await client.aclose()
+        response = await safe_http_request_async(
+            "GET",
+            url,
+            timeout=30.0,
+            max_bytes=max_bytes,
+            allowed_content_types=(
+                "image/",
+                "audio/",
+                "video/",
+                "application/",
+                "text/",
+            ),
+            allow_missing_content_type=True,
+            headers={"User-Agent": "HermesAgent/1.0", "Accept": "*/*"},
+        )
+        response.raise_for_status()
+        return response.content, dict(response.headers)
 
     @staticmethod
     def _looks_like_url(media_source: str) -> bool:

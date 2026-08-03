@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import httpx
 
+from tools.safe_http import SafeHttpError, SafeHttpResponse
+
 # ---------------------------------------------------------------------------
 # Helpers for building httpx exceptions
 # ---------------------------------------------------------------------------
@@ -32,6 +34,21 @@ def _make_http_status_error(status_code: int) -> httpx.HTTPStatusError:
 
 def _make_timeout_error() -> httpx.TimeoutException:
     return httpx.TimeoutException("timed out")
+
+
+def _safe_response(
+    content: bytes,
+    *,
+    status: int = 200,
+    content_type: str = "application/octet-stream",
+) -> SafeHttpResponse:
+    return SafeHttpResponse(
+        status,
+        {"content-type": content_type},
+        content,
+        "https://media.example/file",
+        0,
+    )
 
 
 def _make_stream_response(content: bytes = b"\xff\xd8\xff fake media"):
@@ -127,111 +144,125 @@ class TestCacheImageFromBytes:
 # cache_image_from_url (base.py)
 # ---------------------------------------------------------------------------
 
-@patch("tools.url_safety.is_safe_url", return_value=True)
 class TestCacheImageFromUrl:
     """Tests for gateway.platforms.base.cache_image_from_url"""
 
-    def test_success_on_first_attempt(self, _mock_safe, tmp_path, monkeypatch):
+    def test_success_on_first_attempt(self, tmp_path, monkeypatch):
         """A clean 200 response caches the image and returns a path."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
 
-        mock_client = _make_stream_client(
-            responses=[_make_stream_response(b"\xff\xd8\xff fake jpeg")]
+        request = AsyncMock(
+            return_value=_safe_response(
+                b"\xff\xd8\xff fake jpeg", content_type="image/jpeg"
+            )
         )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.safe_http.safe_http_request_async", new=request):
                 from gateway.platforms.base import cache_image_from_url
                 return await cache_image_from_url(
-                    "http://example.com/img.jpg", ext=".jpg"
+                    "https://example.com/img.jpg", ext=".jpg"
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".jpg")
-        mock_client.stream.assert_called_once()
+        request.assert_awaited_once()
 
-    def test_retries_on_timeout_then_succeeds(self, _mock_safe, tmp_path, monkeypatch):
+    def test_retries_on_timeout_then_succeeds(self, tmp_path, monkeypatch):
         """A timeout on the first attempt is retried; second attempt succeeds."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
 
-        mock_client = _make_stream_client(
-            responses=[_make_timeout_error(), _make_stream_response(b"\xff\xd8\xff image data")]
+        request = AsyncMock(
+            side_effect=[
+                SafeHttpError("DEADLINE_EXCEEDED", "timed out"),
+                _safe_response(b"\xff\xd8\xff image data", content_type="image/jpeg"),
+            ]
         )
         mock_sleep = AsyncMock()
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", mock_sleep):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", mock_sleep
+            ):
                 from gateway.platforms.base import cache_image_from_url
                 return await cache_image_from_url(
-                    "http://example.com/img.jpg", ext=".jpg", retries=2
+                    "https://example.com/img.jpg", ext=".jpg", retries=2
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".jpg")
-        assert mock_client.stream.call_count == 2
+        assert request.await_count == 2
         mock_sleep.assert_called_once()
 
-    def test_retries_on_429_then_succeeds(self, _mock_safe, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("status", [429, 500])
+    def test_retries_on_retryable_status_then_succeeds(
+        self, status, tmp_path, monkeypatch
+    ):
         """A 429 response on the first attempt is retried; second attempt succeeds."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
 
-        mock_client = _make_stream_client(
-            responses=[_make_http_status_error(429), _make_stream_response(b"\xff\xd8\xff image data")]
+        request = AsyncMock(
+            side_effect=[
+                _safe_response(b"", status=status),
+                _safe_response(b"\xff\xd8\xff image data", content_type="image/jpeg"),
+            ]
         )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", new_callable=AsyncMock
+            ):
                 from gateway.platforms.base import cache_image_from_url
                 return await cache_image_from_url(
-                    "http://example.com/img.jpg", ext=".jpg", retries=2
+                    "https://example.com/img.jpg", ext=".jpg", retries=2
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".jpg")
-        assert mock_client.stream.call_count == 2
+        assert request.await_count == 2
 
-    def test_raises_after_max_retries_exhausted(self, _mock_safe, tmp_path, monkeypatch):
+    def test_raises_after_max_retries_exhausted(self, tmp_path, monkeypatch):
         """Timeout on every attempt raises after all retries are consumed."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
 
-        mock_client = _make_stream_client(side_effect=_make_timeout_error())
+        request = AsyncMock(
+            side_effect=SafeHttpError("DEADLINE_EXCEEDED", "timed out")
+        )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", new_callable=AsyncMock
+            ):
                 from gateway.platforms.base import cache_image_from_url
                 await cache_image_from_url(
-                    "http://example.com/img.jpg", ext=".jpg", retries=2
+                    "https://example.com/img.jpg", ext=".jpg", retries=2
                 )
 
-        with pytest.raises(httpx.TimeoutException):
+        with pytest.raises(SafeHttpError) as excinfo:
             asyncio.run(run())
+        assert excinfo.value.code == "DEADLINE_EXCEEDED"
+        assert request.await_count == 3
 
-        # 3 total calls: initial + 2 retries
-        assert mock_client.stream.call_count == 3
-
-    def test_non_retryable_4xx_raises_immediately(self, _mock_safe, tmp_path, monkeypatch):
+    def test_non_retryable_4xx_raises_immediately(self, tmp_path, monkeypatch):
         """A 404 (non-retryable) is raised immediately without any retry."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
 
         mock_sleep = AsyncMock()
-        mock_client = _make_stream_client(side_effect=_make_http_status_error(404))
+        request = AsyncMock(return_value=_safe_response(b"", status=404))
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", mock_sleep):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", mock_sleep
+            ):
                 from gateway.platforms.base import cache_image_from_url
                 await cache_image_from_url(
-                    "http://example.com/img.jpg", ext=".jpg", retries=2
+                    "https://example.com/img.jpg", ext=".jpg", retries=2
                 )
 
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(SafeHttpError) as excinfo:
             asyncio.run(run())
-
-        # Only 1 attempt, no sleep
-        assert mock_client.stream.call_count == 1
+        assert excinfo.value.code == "HTTP_STATUS"
+        assert request.await_count == 1
         mock_sleep.assert_not_called()
 
 
@@ -239,131 +270,123 @@ class TestCacheImageFromUrl:
 # cache_audio_from_url (base.py)
 # ---------------------------------------------------------------------------
 
-@patch("tools.url_safety.is_safe_url", return_value=True)
 class TestCacheAudioFromUrl:
     """Tests for gateway.platforms.base.cache_audio_from_url"""
 
-    def test_success_on_first_attempt(self, _mock_safe, tmp_path, monkeypatch):
+    def test_success_on_first_attempt(self, tmp_path, monkeypatch):
         """A clean 200 response caches the audio and returns a path."""
         monkeypatch.setattr("gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio")
 
-        mock_client = _make_stream_client(
-            responses=[_make_stream_response(b"\x00\x01 fake audio")]
+        request = AsyncMock(
+            return_value=_safe_response(b"\x00\x01 fake audio", content_type="audio/ogg")
         )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.safe_http.safe_http_request_async", new=request):
                 from gateway.platforms.base import cache_audio_from_url
                 return await cache_audio_from_url(
-                    "http://example.com/voice.ogg", ext=".ogg"
+                    "https://example.com/voice.ogg", ext=".ogg"
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".ogg")
-        mock_client.stream.assert_called_once()
+        request.assert_awaited_once()
 
-    def test_retries_on_timeout_then_succeeds(self, _mock_safe, tmp_path, monkeypatch):
+    def test_retries_on_timeout_then_succeeds(self, tmp_path, monkeypatch):
         """A timeout on the first attempt is retried; second attempt succeeds."""
         monkeypatch.setattr("gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio")
 
-        mock_client = _make_stream_client(
-            responses=[_make_timeout_error(), _make_stream_response(b"audio data")]
+        request = AsyncMock(
+            side_effect=[
+                SafeHttpError("DEADLINE_EXCEEDED", "timed out"),
+                _safe_response(b"audio data", content_type="audio/ogg"),
+            ]
         )
         mock_sleep = AsyncMock()
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", mock_sleep):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", mock_sleep
+            ):
                 from gateway.platforms.base import cache_audio_from_url
                 return await cache_audio_from_url(
-                    "http://example.com/voice.ogg", ext=".ogg", retries=2
+                    "https://example.com/voice.ogg", ext=".ogg", retries=2
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".ogg")
-        assert mock_client.stream.call_count == 2
+        assert request.await_count == 2
         mock_sleep.assert_called_once()
 
-    def test_retries_on_429_then_succeeds(self, _mock_safe, tmp_path, monkeypatch):
-        """A 429 response on the first attempt is retried; second attempt succeeds."""
+    @pytest.mark.parametrize("status", [429, 500])
+    def test_retries_on_retryable_status_then_succeeds(
+        self, status, tmp_path, monkeypatch
+    ):
+        """A retryable response is retried; the second attempt succeeds."""
         monkeypatch.setattr("gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio")
 
-        mock_client = _make_stream_client(
-            responses=[_make_http_status_error(429), _make_stream_response(b"audio data")]
+        request = AsyncMock(
+            side_effect=[
+                _safe_response(b"", status=status),
+                _safe_response(b"audio data", content_type="audio/ogg"),
+            ]
         )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", new_callable=AsyncMock
+            ):
                 from gateway.platforms.base import cache_audio_from_url
                 return await cache_audio_from_url(
-                    "http://example.com/voice.ogg", ext=".ogg", retries=2
+                    "https://example.com/voice.ogg", ext=".ogg", retries=2
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".ogg")
-        assert mock_client.stream.call_count == 2
+        assert request.await_count == 2
 
-    def test_retries_on_500_then_succeeds(self, _mock_safe, tmp_path, monkeypatch):
-        """A 500 response on the first attempt is retried; second attempt succeeds."""
-        monkeypatch.setattr("gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio")
-
-        mock_client = _make_stream_client(
-            responses=[_make_http_status_error(500), _make_stream_response(b"audio data")]
-        )
-
-        async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
-                from gateway.platforms.base import cache_audio_from_url
-                return await cache_audio_from_url(
-                    "http://example.com/voice.ogg", ext=".ogg", retries=2
-                )
-
-        path = asyncio.run(run())
-        assert path.endswith(".ogg")
-        assert mock_client.stream.call_count == 2
-
-    def test_raises_after_max_retries_exhausted(self, _mock_safe, tmp_path, monkeypatch):
+    def test_raises_after_max_retries_exhausted(self, tmp_path, monkeypatch):
         """Timeout on every attempt raises after all retries are consumed."""
         monkeypatch.setattr("gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio")
 
-        mock_client = _make_stream_client(side_effect=_make_timeout_error())
+        request = AsyncMock(
+            side_effect=SafeHttpError("DEADLINE_EXCEEDED", "timed out")
+        )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", new_callable=AsyncMock
+            ):
                 from gateway.platforms.base import cache_audio_from_url
                 await cache_audio_from_url(
-                    "http://example.com/voice.ogg", ext=".ogg", retries=2
+                    "https://example.com/voice.ogg", ext=".ogg", retries=2
                 )
 
-        with pytest.raises(httpx.TimeoutException):
+        with pytest.raises(SafeHttpError) as excinfo:
             asyncio.run(run())
+        assert excinfo.value.code == "DEADLINE_EXCEEDED"
+        assert request.await_count == 3
 
-        # 3 total calls: initial + 2 retries
-        assert mock_client.stream.call_count == 3
-
-    def test_non_retryable_4xx_raises_immediately(self, _mock_safe, tmp_path, monkeypatch):
+    def test_non_retryable_4xx_raises_immediately(self, tmp_path, monkeypatch):
         """A 404 (non-retryable) is raised immediately without any retry."""
         monkeypatch.setattr("gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio")
 
         mock_sleep = AsyncMock()
-        mock_client = _make_stream_client(side_effect=_make_http_status_error(404))
+        request = AsyncMock(return_value=_safe_response(b"", status=404))
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", mock_sleep):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", mock_sleep
+            ):
                 from gateway.platforms.base import cache_audio_from_url
                 await cache_audio_from_url(
-                    "http://example.com/voice.ogg", ext=".ogg", retries=2
+                    "https://example.com/voice.ogg", ext=".ogg", retries=2
                 )
 
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(SafeHttpError) as excinfo:
             asyncio.run(run())
-
-        # Only 1 attempt, no sleep
-        assert mock_client.stream.call_count == 1
+        assert excinfo.value.code == "HTTP_STATUS"
+        assert request.await_count == 1
         mock_sleep.assert_not_called()
 
 
@@ -376,135 +399,29 @@ class TestSSRFRedirectGuard:
     """cache_image_from_url / cache_audio_from_url must reject redirects
     that land on private/internal hosts (e.g. cloud metadata endpoint)."""
 
-    def _make_redirect_response(self, target_url: str):
-        """Build a mock httpx response that looks like a redirect."""
-        resp = MagicMock()
-        resp.is_redirect = True
-        resp.next_request = MagicMock(url=target_url)
-        return resp
-
-    def _make_client_capturing_hooks(self):
-        """Return (mock_client, captured_kwargs dict) where captured_kwargs
-        will contain the kwargs passed to httpx.AsyncClient()."""
-        captured = {}
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        def factory(*args, **kwargs):
-            captured.update(kwargs)
-            return mock_client
-
-        return mock_client, captured, factory
-
-    def test_image_blocks_private_redirect(self, tmp_path, monkeypatch):
-        """cache_image_from_url rejects a redirect to a private IP."""
-        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
-
-        redirect_resp = self._make_redirect_response(
-            "http://169.254.169.254/latest/meta-data"
+    @pytest.mark.parametrize(
+        ("function_name", "url", "ext"),
+        [
+            ("cache_image_from_url", "https://public.example/image.png", ".png"),
+            ("cache_audio_from_url", "https://public.example/voice.ogg", ".ogg"),
+        ],
+    )
+    def test_shared_boundary_rejection_propagates(self, function_name, url, ext):
+        request = AsyncMock(
+            side_effect=SafeHttpError(
+                "ADDRESS_NOT_PUBLIC", "Destination resolved to a non-public address"
+            )
         )
-        mock_client, captured, factory = self._make_client_capturing_hooks()
-
-        def fake_stream(method, _url, **kwargs):
-            async def _aenter(*a):
-                # Simulate httpx invoking the response event hooks on the stream.
-                for hook in captured["event_hooks"]["response"]:
-                    await hook(redirect_resp)
-                return redirect_resp
-            cm = AsyncMock()
-            cm.__aenter__ = AsyncMock(side_effect=_aenter)
-            cm.__aexit__ = AsyncMock(return_value=False)
-            return cm
-
-        mock_client.stream = MagicMock(side_effect=fake_stream)
-
-        def fake_safe(url):
-            return url == "https://public.example.com/image.png"
 
         async def run():
-            with patch("tools.url_safety.is_safe_url", side_effect=fake_safe), \
-                 patch("httpx.AsyncClient", side_effect=factory):
-                from gateway.platforms.base import cache_image_from_url
-                await cache_image_from_url(
-                    "https://public.example.com/image.png", ext=".png"
-                )
+            with patch("tools.safe_http.safe_http_request_async", new=request):
+                from gateway.platforms import base
 
-        with pytest.raises(ValueError, match="Blocked redirect"):
+                await getattr(base, function_name)(url, ext=ext)
+
+        with pytest.raises(SafeHttpError) as excinfo:
             asyncio.run(run())
-
-    def test_audio_blocks_private_redirect(self, tmp_path, monkeypatch):
-        """cache_audio_from_url rejects a redirect to a private IP."""
-        monkeypatch.setattr("gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio")
-
-        redirect_resp = self._make_redirect_response(
-            "http://10.0.0.1/internal/secrets"
-        )
-        mock_client, captured, factory = self._make_client_capturing_hooks()
-
-        def fake_stream(method, _url, **kwargs):
-            async def _aenter(*a):
-                for hook in captured["event_hooks"]["response"]:
-                    await hook(redirect_resp)
-                return redirect_resp
-            cm = AsyncMock()
-            cm.__aenter__ = AsyncMock(side_effect=_aenter)
-            cm.__aexit__ = AsyncMock(return_value=False)
-            return cm
-
-        mock_client.stream = MagicMock(side_effect=fake_stream)
-
-        def fake_safe(url):
-            return url == "https://public.example.com/voice.ogg"
-
-        async def run():
-            with patch("tools.url_safety.is_safe_url", side_effect=fake_safe), \
-                 patch("httpx.AsyncClient", side_effect=factory):
-                from gateway.platforms.base import cache_audio_from_url
-                await cache_audio_from_url(
-                    "https://public.example.com/voice.ogg", ext=".ogg"
-                )
-
-        with pytest.raises(ValueError, match="Blocked redirect"):
-            asyncio.run(run())
-
-    def test_safe_redirect_allowed(self, tmp_path, monkeypatch):
-        """A redirect to a public IP is allowed through."""
-        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
-
-        redirect_resp = self._make_redirect_response(
-            "https://cdn.example.com/real-image.png"
-        )
-
-        ok_response = _make_stream_response(b"\xff\xd8\xff fake jpeg")
-        ok_response.is_redirect = False
-
-        mock_client, captured, factory = self._make_client_capturing_hooks()
-
-        async def _aenter(*a):
-            # Public redirect passes the guard; body then streams normally.
-            for hook in captured["event_hooks"]["response"]:
-                await hook(redirect_resp)
-            return ok_response
-
-        def fake_stream(method, _url, **kwargs):
-            cm = AsyncMock()
-            cm.__aenter__ = AsyncMock(side_effect=_aenter)
-            cm.__aexit__ = AsyncMock(return_value=False)
-            return cm
-
-        mock_client.stream = MagicMock(side_effect=fake_stream)
-
-        async def run():
-            with patch("tools.url_safety.is_safe_url", return_value=True), \
-                 patch("httpx.AsyncClient", side_effect=factory):
-                from gateway.platforms.base import cache_image_from_url
-                return await cache_image_from_url(
-                    "https://public.example.com/image.png", ext=".jpg"
-                )
-
-        path = asyncio.run(run())
-        assert path.endswith(".jpg")
+        assert excinfo.value.code == "ADDRESS_NOT_PUBLIC"
 
 
 # ---------------------------------------------------------------------------
@@ -597,43 +514,39 @@ class TestSlackDownloadSlackFile:
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
         adapter = _make_slack_adapter()
 
-        fake_response = MagicMock()
-        fake_response.content = b"\x89PNG\r\n\x1a\n fake png"
-        fake_response.raise_for_status = MagicMock()
-        fake_response.headers = {"content-type": "image/png"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=fake_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        request = AsyncMock(
+            return_value=_safe_response(
+                b"\x89PNG\r\n\x1a\n fake png", content_type="image/png"
+            )
+        )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.safe_http.safe_http_request_async", new=request):
                 return await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".jpg")
-        mock_client.get.assert_called_once()
+        request.assert_awaited_once()
+        kwargs = request.await_args.kwargs
+        assert kwargs["credential_hosts"] == ("files.slack.com",)
+        assert kwargs["headers"]["Authorization"].startswith("Bearer ")
 
     def test_rejects_html_response(self, tmp_path, monkeypatch):
         """An HTML sign-in page from Slack is rejected, not cached as image."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
         adapter = _make_slack_adapter()
 
-        fake_response = MagicMock()
-        fake_response.content = b"<!DOCTYPE html><html><title>Slack</title></html>"
-        fake_response.raise_for_status = MagicMock()
-        fake_response.headers = {"content-type": "text/html; charset=utf-8"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=fake_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        request = AsyncMock(
+            return_value=_safe_response(
+                b"<!DOCTYPE html><html><title>Slack</title></html>",
+                content_type="text/html; charset=utf-8",
+            )
+        )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.safe_http.safe_http_request_async", new=request):
                 await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
@@ -651,30 +564,28 @@ class TestSlackDownloadSlackFile:
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
         adapter = _make_slack_adapter()
 
-        fake_response = MagicMock()
-        fake_response.content = b"\x89PNG\r\n\x1a\n image bytes"
-        fake_response.raise_for_status = MagicMock()
-        fake_response.headers = {"content-type": "image/png"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(
-            side_effect=[_make_timeout_error(), fake_response]
+        request = AsyncMock(
+            side_effect=[
+                SafeHttpError("DEADLINE_EXCEEDED", "timed out"),
+                _safe_response(
+                    b"\x89PNG\r\n\x1a\n image bytes", content_type="image/png"
+                ),
+            ]
         )
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
 
         mock_sleep = AsyncMock()
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", mock_sleep):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", mock_sleep
+            ):
                 return await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
 
         path = asyncio.run(run())
         assert path.endswith(".jpg")
-        assert mock_client.get.call_count == 2
+        assert request.await_count == 2
         mock_sleep.assert_called_once()
 
     def test_raises_after_max_retries(self, tmp_path, monkeypatch):
@@ -682,22 +593,22 @@ class TestSlackDownloadSlackFile:
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
         adapter = _make_slack_adapter()
 
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=_make_timeout_error())
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        request = AsyncMock(
+            side_effect=SafeHttpError("DEADLINE_EXCEEDED", "timed out")
+        )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", new_callable=AsyncMock
+            ):
                 await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
 
-        with pytest.raises(httpx.TimeoutException):
+        with pytest.raises(SafeHttpError) as excinfo:
             asyncio.run(run())
-
-        assert mock_client.get.call_count == 3
+        assert excinfo.value.code == "DEADLINE_EXCEEDED"
+        assert request.await_count == 3
 
     def test_non_retryable_403_raises_immediately(self, tmp_path, monkeypatch):
         """A 403 is not retried; it raises immediately."""
@@ -705,22 +616,20 @@ class TestSlackDownloadSlackFile:
         adapter = _make_slack_adapter()
 
         mock_sleep = AsyncMock()
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=_make_http_status_error(403))
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        request = AsyncMock(return_value=_safe_response(b"", status=403))
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", mock_sleep):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", mock_sleep
+            ):
                 await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
 
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(SafeHttpError) as excinfo:
             asyncio.run(run())
-
-        assert mock_client.get.call_count == 1
+        assert excinfo.value.code == "HTTP_STATUS"
+        assert request.await_count == 1
         mock_sleep.assert_not_called()
 
 
@@ -735,41 +644,35 @@ class TestSlackDownloadSlackFileBytes:
         """Successful download returns raw bytes."""
         adapter = _make_slack_adapter()
 
-        fake_response = MagicMock()
-        fake_response.content = b"raw bytes here"
-        fake_response.raise_for_status = MagicMock()
-        fake_response.headers = {"content-type": "application/pdf"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=fake_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        request = AsyncMock(
+            return_value=_safe_response(
+                b"raw bytes here", content_type="application/pdf"
+            )
+        )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.safe_http.safe_http_request_async", new=request):
                 return await adapter._download_slack_file_bytes(
                     "https://files.slack.com/file.bin"
                 )
 
         result = asyncio.run(run())
         assert result == b"raw bytes here"
+        assert request.await_args.kwargs["credential_hosts"] == ("files.slack.com",)
 
     def test_rejects_html_response(self):
         """Slack HTML sign-in pages should not be accepted as file bytes."""
         adapter = _make_slack_adapter()
 
-        fake_response = MagicMock()
-        fake_response.content = b"<!DOCTYPE html><html><title>Slack</title></html>"
-        fake_response.raise_for_status = MagicMock()
-        fake_response.headers = {"content-type": "text/html; charset=utf-8"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=fake_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        request = AsyncMock(
+            return_value=_safe_response(
+                b"<!DOCTYPE html><html><title>Slack</title></html>",
+                content_type="text/html; charset=utf-8",
+            )
+        )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("tools.safe_http.safe_http_request_async", new=request):
                 await adapter._download_slack_file_bytes(
                     "https://files.slack.com/file.bin"
                 )
@@ -781,49 +684,45 @@ class TestSlackDownloadSlackFileBytes:
         """429 on first attempt is retried; raw bytes returned on second."""
         adapter = _make_slack_adapter()
 
-        ok_response = MagicMock()
-        ok_response.content = b"final bytes"
-        ok_response.raise_for_status = MagicMock()
-        ok_response.headers = {"content-type": "application/pdf"}
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(
-            side_effect=[_make_http_status_error(429), ok_response]
+        request = AsyncMock(
+            side_effect=[
+                _safe_response(b"", status=429),
+                _safe_response(b"final bytes", content_type="application/pdf"),
+            ]
         )
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", new_callable=AsyncMock
+            ):
                 return await adapter._download_slack_file_bytes(
                     "https://files.slack.com/file.bin"
                 )
 
         result = asyncio.run(run())
         assert result == b"final bytes"
-        assert mock_client.get.call_count == 2
+        assert request.await_count == 2
 
     def test_raises_after_max_retries(self):
         """Persistent timeouts raise after all 3 attempts are exhausted."""
         adapter = _make_slack_adapter()
 
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=_make_timeout_error())
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        request = AsyncMock(
+            side_effect=SafeHttpError("DEADLINE_EXCEEDED", "timed out")
+        )
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client), \
-                 patch("asyncio.sleep", new_callable=AsyncMock):
+            with patch("tools.safe_http.safe_http_request_async", new=request), patch(
+                "asyncio.sleep", new_callable=AsyncMock
+            ):
                 await adapter._download_slack_file_bytes(
                     "https://files.slack.com/file.bin"
                 )
 
-        with pytest.raises(httpx.TimeoutException):
+        with pytest.raises(SafeHttpError) as excinfo:
             asyncio.run(run())
-
-        assert mock_client.get.call_count == 3
+        assert excinfo.value.code == "DEADLINE_EXCEEDED"
+        assert request.await_count == 3
 
 
 # ---------------------------------------------------------------------------

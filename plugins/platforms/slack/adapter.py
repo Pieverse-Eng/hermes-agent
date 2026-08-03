@@ -1704,7 +1704,6 @@ class SlackAdapter(BasePlatformAdapter):
                     exc,
                 )
                 await asyncio.sleep(1.5 * (attempt + 1))
-
         raise last_exc
 
     async def send_multiple_images(
@@ -1729,9 +1728,9 @@ class SlackAdapter(BasePlatformAdapter):
             return
 
         try:
-            import httpx as _httpx
             from urllib.parse import unquote as _unquote
-            from tools.url_safety import is_safe_url as _is_safe_url
+            from gateway.platforms.base import get_inbound_media_max_bytes
+            from tools.safe_http import safe_http_request_async
         except Exception:
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return
@@ -1748,56 +1747,64 @@ class SlackAdapter(BasePlatformAdapter):
             file_uploads: List[Dict[str, Any]] = []
             initial_comment_parts: List[str] = []
             try:
-                async with _httpx.AsyncClient(
-                    timeout=30.0, follow_redirects=True
-                ) as http_client:
-                    for image_url, alt_text in chunk:
-                        if alt_text:
-                            initial_comment_parts.append(alt_text)
+                configured_max = get_inbound_media_max_bytes()
+                max_bytes = configured_max if configured_max > 0 else 512 * 1024 * 1024
+                for image_url, alt_text in chunk:
+                    if alt_text:
+                        initial_comment_parts.append(alt_text)
 
-                        if image_url.startswith("file://"):
-                            local_path = _unquote(image_url[7:])
-                            if not os.path.exists(local_path):
-                                logger.warning(
-                                    "[Slack] Skipping missing image: %s", local_path
-                                )
-                                continue
+                    if image_url.startswith("file://"):
+                        local_path = _unquote(image_url[7:])
+                        if not os.path.exists(local_path):
+                            logger.warning(
+                                "[Slack] Skipping missing image: %s", local_path
+                            )
+                            continue
+                        file_uploads.append(
+                            {
+                                "file": local_path,
+                                "filename": os.path.basename(local_path),
+                            }
+                        )
+                    else:
+                        try:
+                            response = await safe_http_request_async(
+                                "GET",
+                                image_url,
+                                timeout=30.0,
+                                max_bytes=max_bytes,
+                                allowed_content_types=(
+                                    "image/",
+                                    "application/octet-stream",
+                                ),
+                                allow_missing_content_type=True,
+                                headers={
+                                    "User-Agent": "HermesAgent/1.0",
+                                    "Accept": "image/*,application/octet-stream;q=0.5",
+                                },
+                            )
+                            response.raise_for_status()
+                            ext = "png"
+                            ct = response.headers.get("content-type", "")
+                            if "jpeg" in ct or "jpg" in ct:
+                                ext = "jpg"
+                            elif "gif" in ct:
+                                ext = "gif"
+                            elif "webp" in ct:
+                                ext = "webp"
                             file_uploads.append(
                                 {
-                                    "file": local_path,
-                                    "filename": os.path.basename(local_path),
+                                    "content": response.content,
+                                    "filename": f"image_{len(file_uploads)}.{ext}",
                                 }
                             )
-                        else:
-                            if not _is_safe_url(image_url):
-                                logger.warning(
-                                    "[Slack] Blocked unsafe image URL in batch"
-                                )
-                                continue
-                            try:
-                                response = await http_client.get(image_url)
-                                response.raise_for_status()
-                                ext = "png"
-                                ct = response.headers.get("content-type", "")
-                                if "jpeg" in ct or "jpg" in ct:
-                                    ext = "jpg"
-                                elif "gif" in ct:
-                                    ext = "gif"
-                                elif "webp" in ct:
-                                    ext = "webp"
-                                file_uploads.append(
-                                    {
-                                        "content": response.content,
-                                        "filename": f"image_{len(file_uploads)}.{ext}",
-                                    }
-                                )
-                            except Exception as dl_err:
-                                logger.warning(
-                                    "[Slack] Download failed for %s: %s",
-                                    safe_url_for_log(image_url),
-                                    dl_err,
-                                )
-                                continue
+                        except Exception as dl_err:
+                            logger.warning(
+                                "[Slack] Download failed for %s: %s",
+                                safe_url_for_log(image_url),
+                                dl_err,
+                            )
+                            continue
 
                 if not file_uploads:
                     continue
@@ -2149,32 +2156,26 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
-        from tools.url_safety import is_safe_url
-
-        if not is_safe_url(image_url):
-            logger.warning("[Slack] Blocked unsafe image URL (SSRF protection)")
-            return await super().send_image(
-                chat_id, image_url, caption, reply_to, metadata=metadata
-            )
-
         try:
-            import httpx
-
-            async def _ssrf_redirect_guard(response):
-                """Re-check redirect targets so public URLs cannot bounce into private IPs."""
-                from tools.url_safety import redirect_target_from_response
-                redirect_url = redirect_target_from_response(response)
-                if redirect_url and not is_safe_url(redirect_url):
-                    raise ValueError("Blocked redirect to private/internal address")
+            from gateway.platforms.base import get_inbound_media_max_bytes
+            from tools.safe_http import safe_http_request_async
 
             # Download the image first
-            async with httpx.AsyncClient(
+            configured_max = get_inbound_media_max_bytes()
+            max_bytes = configured_max if configured_max > 0 else 512 * 1024 * 1024
+            response = await safe_http_request_async(
+                "GET",
+                image_url,
                 timeout=30.0,
-                follow_redirects=True,
-                event_hooks={"response": [_ssrf_redirect_guard]},
-            ) as client:
-                response = await client.get(image_url)
-                response.raise_for_status()
+                max_bytes=max_bytes,
+                allowed_content_types=("image/", "application/octet-stream"),
+                allow_missing_content_type=True,
+                headers={
+                    "User-Agent": "HermesAgent/1.0",
+                    "Accept": "image/*,application/octet-stream;q=0.5",
+                },
+            )
+            response.raise_for_status()
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             result = await self._get_client(chat_id).files_upload_v2(
@@ -4048,7 +4049,8 @@ class SlackAdapter(BasePlatformAdapter):
         self, url: str, ext: str, audio: bool = False, team_id: str = ""
     ) -> str:
         """Download a Slack file using the bot token for auth, with retry."""
-        import httpx
+        from gateway.platforms.base import get_inbound_media_max_bytes
+        from tools.safe_http import SafeHttpError, safe_http_request_async
 
         bot_token = (
             self._team_clients[team_id].token
@@ -4056,55 +4058,63 @@ class SlackAdapter(BasePlatformAdapter):
             else self.config.token
         )
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            for attempt in range(3):
-                try:
-                    response = await client.get(
-                        url,
-                        headers={"Authorization": f"Bearer {bot_token}"},
+        max_bytes = get_inbound_media_max_bytes()
+        effective_max = max_bytes if max_bytes > 0 else 512 * 1024 * 1024
+        for attempt in range(3):
+            try:
+                response = await safe_http_request_async(
+                    "GET",
+                    url,
+                    timeout=30.0,
+                    max_bytes=effective_max,
+                    allowed_content_types=(
+                        "image/",
+                        "audio/",
+                        "video/",
+                        "application/",
+                    ),
+                    allow_missing_content_type=True,
+                    credential_hosts=("files.slack.com",),
+                    headers={
+                        "Authorization": f"Bearer {bot_token}",
+                        "Accept": "*/*",
+                        "User-Agent": "HermesAgent/1.0",
+                    },
+                )
+                if not 200 <= response.status_code < 300:
+                    if response.status_code < 429 or attempt >= 2:
+                        response.raise_for_status()
+                    raise SafeHttpError("REQUEST_FAILED", "Retryable Slack response")
+
+                if "text/html" in response.headers.get("content-type", ""):
+                    raise ValueError(
+                        "Slack returned HTML instead of media; "
+                        "check bot token scopes and file permissions"
                     )
-                    response.raise_for_status()
 
-                    # Slack may return an HTML sign-in/redirect page
-                    # instead of actual media bytes (e.g. expired token,
-                    # restricted file access).  Detect this early so we
-                    # don't cache bogus data and confuse downstream tools.
-                    ct = response.headers.get("content-type", "")
-                    if "text/html" in ct:
-                        raise ValueError(
-                            "Slack returned HTML instead of media "
-                            f"(content-type: {ct}); "
-                            "check bot token scopes and file permissions"
-                        )
+                if audio:
+                    from gateway.platforms.base import cache_audio_from_bytes
 
-                    if audio:
-                        from gateway.platforms.base import cache_audio_from_bytes
+                    return cache_audio_from_bytes(response.content, ext)
+                from gateway.platforms.base import cache_image_from_bytes
 
-                        return cache_audio_from_bytes(response.content, ext)
-                    else:
-                        from gateway.platforms.base import cache_image_from_bytes
-
-                        return cache_image_from_bytes(response.content, ext)
-                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                    if (
-                        isinstance(exc, httpx.HTTPStatusError)
-                        and exc.response.status_code < 429
-                    ):
-                        raise
-                    if attempt < 2:
-                        logger.debug(
-                            "Slack file download retry %d/2 for %s: %s",
-                            attempt + 1,
-                            url[:80],
-                            exc,
-                        )
-                        await asyncio.sleep(1.5 * (attempt + 1))
-                        continue
+                return cache_image_from_bytes(response.content, ext)
+            except SafeHttpError as exc:
+                if exc.code not in {"REQUEST_FAILED", "DEADLINE_EXCEEDED"} or attempt >= 2:
                     raise
+                logger.debug(
+                    "Slack file download retry %d/2 for %s",
+                    attempt + 1,
+                    safe_url_for_log(url),
+                )
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+        raise RuntimeError("Slack file download exhausted retries")
 
     async def _download_slack_file_bytes(self, url: str, team_id: str = "") -> bytes:
         """Download a Slack file and return raw bytes, with retry."""
-        import httpx
+        from gateway.platforms.base import get_inbound_media_max_bytes
+        from tools.safe_http import SafeHttpError, safe_http_request_async
 
         bot_token = (
             self._team_clients[team_id].token
@@ -4112,44 +4122,50 @@ class SlackAdapter(BasePlatformAdapter):
             else self.config.token
         )
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            for attempt in range(3):
-                try:
-                    response = await client.get(
-                        url,
-                        headers={"Authorization": f"Bearer {bot_token}"},
-                    )
-                    response.raise_for_status()
-                    ct = response.headers.get("content-type", "")
-                    if "text/html" in ct:
+        max_bytes = get_inbound_media_max_bytes()
+        effective_max = max_bytes if max_bytes > 0 else 512 * 1024 * 1024
+        for attempt in range(3):
+            try:
+                response = await safe_http_request_async(
+                    "GET",
+                    url,
+                    timeout=30.0,
+                    max_bytes=effective_max,
+                    allowed_content_types=(
+                        "image/",
+                        "audio/",
+                        "video/",
+                        "application/",
+                        "text/",
+                    ),
+                    allow_missing_content_type=True,
+                    credential_hosts=("files.slack.com",),
+                    headers={
+                        "Authorization": f"Bearer {bot_token}",
+                        "Accept": "*/*",
+                        "User-Agent": "HermesAgent/1.0",
+                    },
+                )
+                if 200 <= response.status_code < 300:
+                    if "text/html" in response.headers.get("content-type", ""):
                         raise ValueError(
-                            "Slack returned HTML instead of file bytes "
-                            f"(content-type: {ct}); "
+                            "Slack returned HTML instead of file bytes; "
                             "check bot token scopes and file permissions"
                         )
                     return response.content
-                except (
-                    httpx.TimeoutException,
-                    httpx.HTTPStatusError,
-                    ValueError,
-                ) as exc:
-                    if (
-                        isinstance(exc, httpx.HTTPStatusError)
-                        and exc.response.status_code < 429
-                    ):
-                        raise
-                    if isinstance(exc, ValueError):
-                        raise
-                    if attempt < 2:
-                        logger.debug(
-                            "Slack file download retry %d/2 for %s: %s",
-                            attempt + 1,
-                            url[:80],
-                            exc,
-                        )
-                        await asyncio.sleep(1.5 * (attempt + 1))
-                        continue
+                if response.status_code < 429 or attempt >= 2:
+                    response.raise_for_status()
+                raise SafeHttpError("REQUEST_FAILED", "Retryable Slack response")
+            except SafeHttpError as exc:
+                if exc.code not in {"REQUEST_FAILED", "DEADLINE_EXCEEDED"} or attempt >= 2:
                     raise
+                logger.debug(
+                    "Slack file download retry %d/2 for %s",
+                    attempt + 1,
+                    safe_url_for_log(url),
+                )
+                await asyncio.sleep(1.5 * (attempt + 1))
+        raise RuntimeError("Slack file download exhausted retries")
 
     # ── Channel mention gating ─────────────────────────────────────────────
 

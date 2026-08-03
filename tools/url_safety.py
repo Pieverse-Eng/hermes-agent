@@ -12,15 +12,16 @@ that use 198.18.0.0/15 or 100.64.0.0/10).  Even when disabled, cloud
 metadata hostnames (metadata.google.internal, 169.254.169.254) are
 **always** blocked — those are never legitimate agent targets.
 
-Limitations (documented, not fixable at pre-flight level):
+Limitations of this legacy pre-flight helper:
   - DNS rebinding (TOCTOU): an attacker-controlled DNS server with TTL=0
     can return a public IP for the check, then a private IP for the actual
-    connection. Fixing this requires connection-level validation (e.g.
-    Python's Champion library or an egress proxy like Stripe's Smokescreen).
-  - Redirect-based bypass is mitigated by httpx event hooks that re-validate
-    each redirect target in vision_tools, gateway platform adapters, and
-    media cache helpers. Web tools use third-party SDKs (Firecrawl/Tavily)
-    where redirect handling is on their servers.
+    connection.
+  - Some older callers add httpx redirect hooks, but pre-flight checks and
+    hooks do not pin the validated address. Untrusted server-side media and
+    provider-response URLs must use ``tools.safe_http`` instead; that strict
+    boundary revalidates and pins every hop and does not honor the global
+    private-URL compatibility toggle. Web tools use third-party SDKs
+    (Firecrawl/Tavily) where redirect handling is on their servers.
 """
 
 import ipaddress
