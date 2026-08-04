@@ -398,7 +398,7 @@ Configure the TTS provider in your `config.yaml` under the `tts.provider` key.
 
 ## Large Files (>20MB) via Local Bot API Server
 
-Telegram's **public** Bot API caps `getFile` downloads at **20 MB**, so any voice note, audio file, video, or document larger than that is silently rejected by Hermes with a "too large" reply. The documented way around this is to run a **local** [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) daemon — the same server software Telegram uses, but running on your network. A local server raises the file ceiling to **2 GB** and Hermes auto-lifts its own internal cap when it sees a custom `base_url` configured.
+Telegram's **public** Bot API caps `getFile` downloads at **20 MB**, so any voice note, audio file, video, or document larger than that is silently rejected by Hermes with a "too large" reply. The documented way around this is to run a **local** [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) daemon — the same server software Telegram uses, but running on your network. A local server running with `--local` raises the file ceiling to **2 GB**, and Hermes auto-lifts its own internal cap when both a custom `base_url` and `local_mode: true` are configured.
 
 This unlocks workflows like:
 
@@ -484,8 +484,14 @@ At the moment only the `platforms.<name>.extra` form is deep-merged into the pla
 When `base_url` is set, Hermes:
 
 - Builds the python-telegram-bot client against the local server
+
+When `local_mode: true` is also set, Hermes:
+
 - Auto-lifts its internal document/audio size cap from 20 MB → 2 GB
 - Reports the active limit in the "too large" error message (`Maximum: 2048 MB.`) so it's obvious which mode you're in
+
+A custom `base_url` used only as a reverse proxy keeps the public Bot API's
+20 MB limit unless `local_mode: true` is explicitly enabled.
 
 Restart the gateway and look for a confirmation log line:
 
