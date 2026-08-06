@@ -72,6 +72,12 @@ class ProviderProfile:
     # (e.g. Xiaomi MiMo, which returns 400 "text is not set").
     supports_vision_tool_messages: bool = True
 
+    # True only when this provider's Chat Completions endpoint explicitly
+    # documents ``prompt_cache_key`` as an accepted request body field.  This
+    # is deliberately opt-in: many OpenAI-compatible endpoints reject unknown
+    # top-level fields rather than ignoring them.
+    supports_prompt_cache_key: bool = False
+
     # ── Model catalog ─────────────────────────────────────────
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.
@@ -144,6 +150,19 @@ class ProviderProfile:
         Default: ({}, {}).
         """
         return {}, {}
+
+    def default_vision_model(self) -> str | None:
+        """Return a default vision model id for this provider, or None.
+
+        Overrideable hook for providers that discover their vision default at
+        runtime (e.g. from a live catalog) rather than pinning one in code.
+        Keeps provider-specific vision discovery inside the provider's plugin
+        instead of a name-check branch in shared vision resolution.
+
+        Default: None (no provider-specific vision model — the caller falls
+        back to the user's chat model or the aggregator chain).
+        """
+        return None
 
     def get_max_tokens(self, model: str | None) -> int | None:
         """Return the default max_tokens cap for *model*.
