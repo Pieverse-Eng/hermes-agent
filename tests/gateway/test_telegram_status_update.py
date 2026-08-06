@@ -5,6 +5,7 @@ The status-update path must:
   2. Edit that same message on subsequent calls with the same key.
   3. Fall back to sending fresh when the cached message edit fails.
   4. Keep distinct keys independent (no cross-talk).
+  5. Keep Telegram forum/private topics independent within the same chat.
 """
 
 from __future__ import annotations
@@ -85,7 +86,7 @@ async def test_first_call_sends_and_caches_message_id(adapter):
     assert result.message_id == "100"
     adapter.send.assert_awaited_once()
     adapter.edit_message.assert_not_awaited()
-    assert adapter._status_message_ids[("chat-1", "lifecycle")] == "100"
+    assert adapter._status_message_ids[("chat-1", "", "lifecycle")] == "100"
 
 
 @pytest.mark.asyncio
@@ -101,7 +102,7 @@ async def test_distinct_status_keys_do_not_collide(adapter):
 
     assert adapter.send.await_count == 2
     adapter.edit_message.assert_not_awaited()
-    assert adapter._status_message_ids[("chat-1", "lifecycle")] == "100"
-    assert adapter._status_message_ids[("chat-1", "model-switch")] == "200"
+    assert adapter._status_message_ids[("chat-1", "", "lifecycle")] == "100"
+    assert adapter._status_message_ids[("chat-1", "", "model-switch")] == "200"
 
 

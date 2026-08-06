@@ -1027,3 +1027,28 @@ class TestPluginCommandEnumeration:
         slack_names = set(slack_subcommand_map())
         assert "status" in tg_names
         assert "status" in slack_names
+    def test_plugin_command_platform_scope_filters_native_menus(self, monkeypatch):
+        """Platform-scoped plugin commands only appear on allowed gateway menus."""
+        from unittest.mock import patch
+
+        self._patch_plugin_commands(monkeypatch, {
+            "metricas": {
+                "handler": lambda _a: "ok",
+                "description": "Metrics",
+                "args_hint": "",
+                "plugin": "metrics-plugin",
+                "platforms": ("telegram", "line"),
+            }
+        })
+
+        telegram_names = {name for name, _desc in telegram_bot_commands()}
+        slack_mapping = slack_subcommand_map()
+        with patch("agent.skill_commands.get_skill_commands", return_value={}):
+            discord_entries, _hidden = discord_skill_commands(
+                max_slots=10,
+                reserved_names=set(),
+            )
+
+        assert "metricas" in telegram_names
+        assert "metricas" not in slack_mapping
+        assert all(name != "metricas" for name, _desc, _key in discord_entries)

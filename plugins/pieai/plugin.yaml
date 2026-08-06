@@ -1,0 +1,7 @@
+name: pieverse-byok
+version: 0.1.0
+description: "Pieverse BYOK command for hosted Hermes tenants."
+author: "Pieverse"
+kind: backend
+hooks:
+  - pre_gateway_dispatch

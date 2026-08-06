@@ -1,9 +1,4 @@
-"""Tests for Telegram document-size cap.
-
-The public Telegram Bot API caps `getFile` at 20MB. A locally-hosted
-`telegram-bot-api` server raises that ceiling to 2GB. We treat the presence
-of `extra.base_url` as the explicit opt-in to the higher cap.
-"""
+"""Tests for Telegram document-size cap."""
 
 import sys
 from unittest.mock import MagicMock
@@ -32,7 +27,7 @@ _ensure_telegram_mock()
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
-def test_max_doc_bytes_raised_to_2gb_when_base_url_set():
+def test_max_doc_bytes_stays_at_20mb_for_custom_base_url_without_local_mode():
     adapter = TelegramAdapter(
         PlatformConfig(
             enabled=True,
@@ -40,6 +35,31 @@ def test_max_doc_bytes_raised_to_2gb_when_base_url_set():
             extra={"base_url": "http://localhost:8081/bot"},
         )
     )
+    assert adapter._max_doc_bytes == 20 * 1024 * 1024
+
+
+def test_max_doc_bytes_raised_to_2gb_for_local_bot_api_mode():
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "base_url": "http://localhost:8081/bot",
+                "local_mode": True,
+            },
+        )
+    )
     assert adapter._max_doc_bytes == 2 * 1024 * 1024 * 1024
+
+
+def test_max_doc_bytes_local_mode_without_custom_base_url_keeps_default():
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"local_mode": True},
+        )
+    )
+    assert adapter._max_doc_bytes == 20 * 1024 * 1024
 
 

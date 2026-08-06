@@ -841,12 +841,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topic_chat_ids: Set[str] = {
             str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e
         }
-        # Document size cap. Telegram's public Bot API caps getFile at 20MB; a
-        # locally-hosted telegram-bot-api server (configured via extra.base_url)
-        # raises that to 2GB, so the presence of base_url is the opt-in.
+        # Document size cap. A custom base_url may be only a reverse proxy to
+        # Telegram's public Bot API, which still caps getFile at 20MB. Raise the
+        # cap only for an explicitly configured local Bot API running in local
+        # mode, where Telegram supports files up to 2GB.
         self._max_doc_bytes: int = (
             2 * 1024 * 1024 * 1024
-            if self.config.extra.get("base_url")
+            if self.config.extra.get("base_url") and self.config.extra.get("local_mode")
             else 20 * 1024 * 1024
         )
         # Interactive model picker state per chat
@@ -869,7 +870,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # "all"       — every message triggers a push notification (legacy
         #               behavior; opt-in via display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
-        # send_or_update_status() bookkeeping: {(chat_id, status_key) -> bot message_id}
+        # send_or_update_status() bookkeeping:
+        # {(chat_id, thread_id, status_key) -> bot message_id}
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
@@ -4773,7 +4775,8 @@ class TelegramAdapter(BasePlatformAdapter):
         message in place. If the edit fails (message deleted, too old, etc.)
         we drop the cached id and send fresh.
         """
-        key = (str(chat_id), str(status_key))
+        thread_id = self._metadata_thread_id(metadata)
+        key = (str(chat_id), str(thread_id or ""), str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
             result = await self.edit_message(

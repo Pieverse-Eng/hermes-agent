@@ -1789,6 +1789,11 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
+def _is_hosted_platform_runtime() -> bool:
+    """Return True inside Pieverse-hosted tenant pods."""
+    return bool(os.getenv("INSTANCE_ID") and os.getenv("HERMES_HOME") == "/opt/data")
+
+
 def _restart_notification_pending() -> bool:
     """Return True when a /restart completion marker is waiting to be delivered."""
     return (_hermes_home / ".restart_notify.json").exists()
@@ -4580,18 +4585,31 @@ class TurnRunner:
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
         # schemas for prompt cache hits.
+        _cache_keys = self._runner._extract_cache_busting_config(ctx.user_config)
         _sig = self._runner._agent_config_signature(
             turn_route["model"],
             turn_route["runtime"],
             ctx.enabled_toolsets,
             combined_ephemeral,
-            cache_keys=self._runner._extract_cache_busting_config(ctx.user_config),
+            cache_keys=_cache_keys,
+            user_id=getattr(ctx.source, "user_id", None),
+            user_id_alt=getattr(ctx.source, "user_id_alt", None),
+            skip_context_files=skip_context_files,
+        )
+        _prewarm_template_sig = self._runner._agent_config_signature(
+            turn_route["model"],
+            turn_route["runtime"],
+            ctx.enabled_toolsets,
+            "",
+            cache_keys=_cache_keys,
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
         )
         agent = None
         reused_cached_agent = False
+        prewarmed_system_prompt = None
+        prewarm_template_key = None
         _cache_lock = getattr(self._runner, "_agent_cache_lock", None)
         _cache = getattr(self._runner, "_agent_cache", None)
 
@@ -4790,6 +4808,15 @@ class TurnRunner:
                     pass
 
         if agent is None:
+            prewarm_template = (
+                self._runner._telegram_dm_threadless_prewarm_prompt_for_source(
+                    ctx.source,
+                    _prewarm_template_sig,
+                )
+            )
+            if prewarm_template is not None:
+                prewarmed_system_prompt, prewarm_template_key = prewarm_template
+
             # Config changed or first message — create fresh agent
             agent = ctx.AIAgent(
                 model=turn_route["model"],
@@ -4829,6 +4856,18 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            if (
+                prewarmed_system_prompt
+                and getattr(agent, "_cached_system_prompt", None) is None
+            ):
+                agent._cached_system_prompt = prewarmed_system_prompt
+                logger.debug(
+                    "Seeded Telegram DM topic agent system prompt from "
+                    "threadless platform prewarm template "
+                    "(session=%s template=%s)",
+                    ctx.session_key,
+                    prewarm_template_key,
+                )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     # Record the session_id the snapshot was taken for
@@ -6009,6 +6048,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # SessionState.persistent.pending_command_text (NOTE: distinct from
         # the adapter-level _pending_messages Dict[str, MessageEvent] in
         # gateway/platforms/base.py, which shares the legacy name).
+        self._skill_security_scan_on_session_refresh = True
         # Last successfully-resolved (non-empty) model, keyed by session. Used
         # as a fallback when a fresh config read transiently returns an empty
         # model (e.g. an mtime-keyed config-cache miss during a post-interrupt
@@ -6705,6 +6745,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    def _telegram_dm_threadless_prewarm_prompt_for_source(
+        self,
+        source: SessionSource,
+        template_signature: str,
+    ) -> Optional[tuple[str, str]]:
+        """Reuse only the warmed prompt from a threadless Telegram DM template."""
+        platform = getattr(source, "platform", None)
+        platform_value = getattr(platform, "value", platform)
+        if platform_value != Platform.TELEGRAM.value:
+            return None
+        if getattr(source, "chat_type", None) != "dm":
+            return None
+        if not getattr(source, "thread_id", None) or not getattr(source, "chat_id", None):
+            return None
+
+        try:
+            threadless_source = dataclasses.replace(
+                source,
+                thread_id=None,
+                chat_topic=None,
+                parent_chat_id=None,
+            )
+            template_key = self._session_key_for_source(threadless_source)
+        except Exception:
+            logger.debug(
+                "Failed to derive threadless Telegram DM prewarm source",
+                exc_info=True,
+            )
+            return None
+
+        cache = getattr(self, "_agent_cache", None)
+        cache_lock = getattr(self, "_agent_cache_lock", None)
+        if cache is None or cache_lock is None:
+            return None
+
+        with cache_lock:
+            cached = cache.get(template_key)
+            if not isinstance(cached, tuple) or len(cached) < 5:
+                return None
+            metadata = cached[4] if isinstance(cached[4], dict) else {}
+            if metadata.get("platform_prewarm_template") is not True:
+                return None
+            if metadata.get("template_kind") != "telegram_dm_threadless":
+                return None
+            if metadata.get("prompt_template_signature") != template_signature:
+                return None
+            if (cached[2] if len(cached) > 2 else None) != 0:
+                return None
+
+            template_agent = cached[0]
+            system_prompt = getattr(template_agent, "_cached_system_prompt", None)
+            if not isinstance(system_prompt, str) or not system_prompt:
+                return None
+            if hasattr(cache, "move_to_end"):
+                try:
+                    cache.move_to_end(template_key)
+                except KeyError:
+                    pass
+
+        return system_prompt, template_key
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -14760,9 +14861,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # hermes_cli/commands.py) and dispatched through the single
             # resolver _dispatch_busy_slash_command below — no per-command
             # if-chain here.
-            from hermes_cli.commands import resolve_command as _resolve_cmd_inner
+            from hermes_cli.commands import (
+                resolve_command as _resolve_cmd_inner,
+                resolve_gateway_command_token as _resolve_gateway_token_inner,
+            )
             _evt_cmd = event.get_command()
-            _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+            _gateway_token_inner = (
+                _resolve_gateway_token_inner(_evt_cmd) if _evt_cmd else None
+            )
+            _cmd_def_inner = (
+                _resolve_cmd_inner(_gateway_token_inner)
+                if _gateway_token_inner
+                else None
+            )
+            _plugin_cmd_inner = (
+                _gateway_token_inner
+                if _gateway_token_inner and _cmd_def_inner is None
+                else None
+            )
 
             # /status and /context are intentionally pre-gate so users
             # always see session state.
@@ -14777,10 +14893,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /status above is intentionally pre-gate so users always see
             # session state. /help and /whoami fall under the always-allowed
             # floor inside _check_slash_access.
-            if _evt_cmd and _cmd_def_inner is not None:
-                _denied = self._check_slash_access(source, _cmd_def_inner.name)
+            _access_cmd_inner = (
+                _cmd_def_inner.name if _cmd_def_inner else _plugin_cmd_inner
+            )
+            if _access_cmd_inner:
+                _denied = self._check_slash_access(source, _access_cmd_inner)
                 if _denied is not None:
                     return _denied
+
+            if _plugin_cmd_inner:
+                try:
+                    from hermes_cli.plugins import get_plugin_command_handler
+
+                    plugin_handler = get_plugin_command_handler(_plugin_cmd_inner)
+                    if plugin_handler:
+                        result = plugin_handler(event.get_command_args().strip())
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        return str(result) if result else None
+                except Exception as exc:
+                    logger.warning(
+                        "Plugin command /%s failed during active session: %s",
+                        _plugin_cmd_inner,
+                        exc,
+                    )
+                return f"Plugin command `/{_plugin_cmd_inner}` is unavailable."
 
             # Any recognized slash command: dispatch according to its
             # declared busy_policy (dispatch / interrupt_then_dispatch /
@@ -17387,7 +17524,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and not _is_hosted_platform_runtime()
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             # Multiplex: home channel may live only in the profile secret

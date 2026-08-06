@@ -27,6 +27,14 @@ requires_env:
     url: "https://developers.line.biz/console/"
     password: true
 optional_env:
+  - name: LINE_API_BASE_URL
+    description: "LINE Messaging API base URL. Hosted deployments can point this at an authenticated outbound proxy."
+    prompt: "LINE API base URL"
+    password: false
+  - name: LINE_DATA_API_BASE_URL
+    description: "LINE content API base URL. Defaults to LINE_API_BASE_URL when that URL is customized."
+    prompt: "LINE data API base URL"
+    password: false
   - name: LINE_PORT
     description: "Webhook listen port (default: 8646)"
     prompt: "Webhook port"

@@ -53,6 +53,21 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _emit_skill_security_scan_reports(agent) -> None:
+    """Surface CertiK skill-scan reports produced during tool execution."""
+    try:
+        from tools.skill_security_gate import (
+            drain_skill_security_scan_reports,
+            format_skill_security_scan_report,
+        )
+
+        report = format_skill_security_scan_report(drain_skill_security_scan_reports())
+        if report:
+            agent._emit_status(report)
+    except Exception:
+        logger.debug("skill security scan report emit failed", exc_info=True)
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -1107,6 +1122,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            _emit_skill_security_scan_reports(agent)
             results[index] = (
                 function_name,
                 function_args,
@@ -2258,6 +2274,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool progress callback error: %s", cb_err)
+
+        _emit_skill_security_scan_reports(agent)
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:

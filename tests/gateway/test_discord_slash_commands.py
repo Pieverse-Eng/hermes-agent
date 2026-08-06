@@ -290,6 +290,26 @@ async def test_slash_command_registration_stays_under_discord_limit(adapter):
 
 
 @pytest.mark.asyncio
+async def test_platform_scoped_plugin_command_is_not_registered_for_discord(adapter):
+    """Plugin commands scoped to other platforms stay out of Discord's picker."""
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "pieverse-byok": {
+                "handler": lambda _a: "ok",
+                "description": "Pieverse BYOK",
+                "args_hint": "[key]",
+                "plugin": "pieverse-byok",
+                "platforms": ("telegram", "line", "slack"),
+            }
+        },
+    ):
+        adapter._register_slash_commands()
+
+    assert "pieverse-byok" not in adapter._client.tree.commands
+
+
+@pytest.mark.asyncio
 async def test_handle_thread_create_slash_reports_success(adapter):
     created_thread = SimpleNamespace(id=555, name="Planning", send=AsyncMock())
     parent_channel = SimpleNamespace(create_thread=AsyncMock(return_value=created_thread), send=AsyncMock())

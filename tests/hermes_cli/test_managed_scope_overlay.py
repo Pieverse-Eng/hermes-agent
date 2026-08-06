@@ -42,3 +42,13 @@ def test_overlay_preserves_user_siblings(managed):
     assert out["display"]["show_reasoning"] is True
 
 
+def test_overlay_adds_managed_plugin_entries_without_dropping_user_entries(managed):
+    from hermes_cli import managed_scope
+
+    _write(managed, "plugins:\n  enabled: [ax, okx-a2a]\n")
+    out = managed_scope.apply_managed_overlay(
+        {"plugins": {"enabled": ["okx-a2a", "local-helper"]}}
+    )
+    assert out["plugins"]["enabled"] == ["okx-a2a", "local-helper", "ax"]
+
+

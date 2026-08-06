@@ -1186,3 +1186,18 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+    def test_register_command_with_platform_scope(self):
+        """platforms limits native gateway command menu registration."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        ctx.register_command(
+            "metricas",
+            lambda a: a,
+            description="Metrics dashboard",
+            platforms=("telegram", "line"),
+        )
+
+        entry = mgr._plugin_commands["metricas"]
+        assert entry["platforms"] == ("line", "telegram")

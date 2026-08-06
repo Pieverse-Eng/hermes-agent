@@ -96,6 +96,12 @@ def _wait_until(predicate, timeout=30.0, interval=0.02):
     return result
 
 
+@pytest.fixture(autouse=True)
+def _use_manual_approval_mode(monkeypatch):
+    """Exercise gateway approve/deny flows without invoking the smart-approval LLM."""
+    monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "manual")
+
+
 # ------------------------------------------------------------------
 # Blocking gateway approval infrastructure (tools/approval.py)
 # ------------------------------------------------------------------

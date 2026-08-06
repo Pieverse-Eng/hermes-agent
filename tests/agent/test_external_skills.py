@@ -2,9 +2,22 @@
 
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+
+import tools.skills_tool as skills_tool_module
+
+
+@pytest.fixture(autouse=True)
+def _allow_certik_skill_view(monkeypatch):
+    """External-dir tests exercise discovery/routing, not CertiK decisions."""
+
+    def _allow(_skill_dir, _name, *, archive=None):
+        return SimpleNamespace(allowed=True, reason="verified in test", archive=archive)
+
+    monkeypatch.setattr(skills_tool_module, "_skill_security_allows_view", _allow)
 
 
 @pytest.fixture
