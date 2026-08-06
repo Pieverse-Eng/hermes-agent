@@ -178,6 +178,7 @@ async def test_internal_runtime_sync_rejects_unknown_files_before_writing(tmp_pa
 @pytest.mark.asyncio
 async def test_internal_prewarm_session_populates_gateway_agent_cache(monkeypatch):
     created: list[dict] = []
+    signature_kwargs: list[dict] = []
 
     class FakeSessionEntry:
         session_key = "agent:main:telegram:dm:42"
@@ -227,15 +228,18 @@ async def test_internal_prewarm_session_populates_gateway_agent_cache(monkeypatc
             }
 
         def _resolve_session_reasoning_config(self, **kwargs):
+            assert kwargs["model"] == "test-model"
             return {"enabled": False}
 
-        def _load_service_tier(self):
-            return None
+        def _resolve_session_service_tier(self, **kwargs):
+            assert kwargs["session_key"] == "agent:main:telegram:dm:42"
+            return "priority"
 
         def _resolve_turn_agent_config(self, prompt, model, runtime):
             return {"model": model, "runtime": runtime, "request_overrides": {}}
 
         def _agent_config_signature(self, *args, **kwargs):
+            signature_kwargs.append(kwargs)
             return "sig"
 
         def _extract_cache_busting_config(self, user_config):
@@ -251,7 +255,21 @@ async def test_internal_prewarm_session_populates_gateway_agent_cache(monkeypatc
             agent.released = True
 
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"agent": {}})
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "agent": {},
+            "checkpoints": {
+                "enabled": True,
+                "max_snapshots": 9,
+                "max_total_size_mb": 444,
+                "max_file_size_mb": 6,
+            },
+            "gateway": {
+                "platforms": {"telegram": {"skip_context_files": True}},
+            },
+        },
+    )
     monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 12)
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda cfg, platform: {"memory"})
 
@@ -289,6 +307,14 @@ async def test_internal_prewarm_session_populates_gateway_agent_cache(monkeypatc
     assert created[0]["session_id"] == "session-real-1"
     assert created[0]["platform"] == "telegram"
     assert created[0]["gateway_session_key"] == "agent:main:telegram:dm:42"
+    assert created[0]["checkpoints_enabled"] is True
+    assert created[0]["checkpoint_max_snapshots"] == 9
+    assert created[0]["checkpoint_max_total_size_mb"] == 444
+    assert created[0]["checkpoint_max_file_size_mb"] == 6
+    assert created[0]["skip_context_files"] is True
+    assert created[0]["load_soul_identity"] is True
+    assert signature_kwargs
+    assert all(kwargs["skip_context_files"] is True for kwargs in signature_kwargs)
     assert runner._agent_cache["agent:main:telegram:dm:42"][3] == "session-real-1"
     assert runner._agent_cache["agent:main:telegram:dm:42"][4] == {
         "platform_prewarm_template": True,

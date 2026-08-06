@@ -3093,7 +3093,11 @@ class APIServerAdapter(BasePlatformAdapter):
             raise RuntimeError("gateway runner is not attached")
 
         from run_agent import AIAgent
-        from gateway.run import _current_max_iterations, _load_gateway_config
+        from gateway.run import (
+            _checkpoint_agent_kwargs,
+            _current_max_iterations,
+            _load_gateway_config,
+        )
         from hermes_cli.tools_config import _get_platform_tools
 
         session_store = getattr(runner, "session_store", None)
@@ -3144,12 +3148,19 @@ class APIServerAdapter(BasePlatformAdapter):
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+        platforms_gateway_cfg = (user_config.get("gateway") or {}).get("platforms") or {}
+        platform_gateway_cfg = platforms_gateway_cfg.get(platform_key) or {}
+        skip_context_files = bool(platform_gateway_cfg.get("skip_context_files", False))
         reasoning_config = runner._resolve_session_reasoning_config(
             source=source,
             session_key=session_key,
+            model=model,
         )
         runner._reasoning_config = reasoning_config
-        runner._service_tier = runner._load_service_tier()
+        runner._service_tier = runner._resolve_session_service_tier(
+            source=source,
+            session_key=session_key,
+        )
         turn_route = runner._resolve_turn_agent_config("", model, runtime_kwargs)
         cache_keys = runner._extract_cache_busting_config(user_config)
         signature = runner._agent_config_signature(
@@ -3160,6 +3171,7 @@ class APIServerAdapter(BasePlatformAdapter):
             cache_keys=cache_keys,
             user_id=getattr(source, "user_id", None),
             user_id_alt=getattr(source, "user_id_alt", None),
+            skip_context_files=skip_context_files,
         )
         prompt_template_signature = runner._agent_config_signature(
             turn_route["model"],
@@ -3169,6 +3181,7 @@ class APIServerAdapter(BasePlatformAdapter):
             cache_keys=cache_keys,
             user_id=getattr(source, "user_id", None),
             user_id_alt=getattr(source, "user_id_alt", None),
+            skip_context_files=skip_context_files,
         )
 
         cache = getattr(runner, "_agent_cache", None)
@@ -3218,6 +3231,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent = AIAgent(
             model=turn_route["model"],
             **turn_route["runtime"],
+            **_checkpoint_agent_kwargs(user_config),
             max_iterations=_current_max_iterations(),
             quiet_mode=True,
             verbose_logging=False,
@@ -3246,6 +3260,8 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=session_key,
             session_db=getattr(getattr(runner, "_session_db", None), "_db", getattr(runner, "_session_db", None)),
             fallback_model=runner._refresh_fallback_model(),
+            skip_context_files=skip_context_files,
+            load_soul_identity=True,
         )
         if getattr(agent, "_cached_system_prompt", None) is None:
             try:
