@@ -81,6 +81,7 @@ tools:
     max_search_limit: 20
     listing: auto       # embed a grouped name+description catalog manifest
     listing_max_tokens: 4000
+    always_visible_tools: [] # selected plugin/MCP tools keep their full schemas
 ```
 
 | Key | Default | Meaning |
@@ -91,6 +92,7 @@ tools:
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 | `listing` | `auto` | Embed a skills-style manifest of every deferred tool (name + first sentence of its description, ≤60 chars, grouped by MCP server) in the `tool_search` bridge description. `auto` includes it when it fits the budget (falling back to names-only, then to the tier-2 server summary); `on`/`off` force either way. |
 | `listing_max_tokens` | `4000` | Absolute cap on the embedded listing, regardless of context size. Range 200–60000. Large catalogs degrade to names-only or per-server summaries, keeping full schemas available through search. |
+| `always_visible_tools` | `[]` | Exact plugin/MCP tool names whose full schemas remain directly visible while all other eligible tools stay deferred. This does not enable a tool or its toolset; use it sparingly for high-frequency tools that are already available in the session. |
 
 ### Why the listing exists
 

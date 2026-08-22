@@ -61,6 +61,13 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_always_visible_tools_are_normalized(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({
+            "always_visible_tools": [" direct_tool ", "", 123, "tool_search"],
+        })
+        assert cfg.always_visible_tools == frozenset({"direct_tool"})
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -219,6 +226,34 @@ class TestAssembly:
         # activation happened; here it didn't).
         assert "tool_search" not in names
 
+    def test_always_visible_plugin_tool_stays_direct_while_others_defer(self):
+        from tools.registry import registry
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES
+
+        direct_name = "test_always_visible_plugin_tool"
+        deferred_name = "test_still_deferred_plugin_tool"
+        for name in (direct_name, deferred_name):
+            registry.register(
+                name=name,
+                handler=lambda args, **kwargs: "{}",
+                schema=_td(name, f"Description for {name}"),
+                toolset="test-always-visible-plugin",
+            )
+
+        result = assemble_tool_defs(
+            [_td(direct_name), _td(deferred_name)],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({
+                "enabled": "on",
+                "always_visible_tools": [direct_name],
+            }),
+        )
+        names = {tool["function"]["name"] for tool in result.tool_defs}
+        assert result.activated
+        assert direct_name in names
+        assert deferred_name not in names
+        assert BRIDGE_TOOL_NAMES <= names
+
 
 # ---------------------------------------------------------------------------
 # Bridge dispatch
@@ -285,6 +320,69 @@ class TestBridgeDispatch:
 
 
 class TestHandleFunctionCallIntegration:
+    def test_config_file_keeps_selected_plugin_tool_direct(self, tmp_path, monkeypatch):
+        """Exercise config.yaml -> load_config -> model-facing tool assembly."""
+        from tools.registry import registry
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            dispatch_tool_search,
+            resolve_underlying_call,
+            scoped_deferrable_names,
+        )
+        import model_tools
+
+        direct_name = "config_e2e_direct_plugin_tool"
+        deferred_name = "config_e2e_deferred_plugin_tool"
+        toolset = "config-e2e-plugin"
+
+        def _handler(args, **kwargs):
+            return "{}"
+
+        for name in (direct_name, deferred_name):
+            registry.register(
+                name=name,
+                handler=_handler,
+                schema=_td(name, f"Description for {name}")["function"],
+                toolset=toolset,
+            )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "tools:\n"
+            "  tool_search:\n"
+            "    enabled: on\n"
+            "    always_visible_tools:\n"
+            f"      - {direct_name}\n",
+            encoding="utf-8",
+        )
+
+        raw_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=[toolset],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        model_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=[toolset],
+            quiet_mode=True,
+        )
+        model_names = {tool["function"]["name"] for tool in model_defs}
+
+        assert direct_name in model_names
+        assert deferred_name not in model_names
+        assert BRIDGE_TOOL_NAMES <= model_names
+
+        search_result = json.loads(dispatch_tool_search(
+            {"query": "config_e2e"},
+            current_tool_defs=raw_defs,
+        ))
+        assert search_result["total_available"] == 1
+        assert [match["name"] for match in search_result["matches"]] == [deferred_name]
+        assert scoped_deferrable_names(raw_defs) == frozenset({deferred_name})
+
+        _, _, error = resolve_underlying_call({"name": direct_name, "arguments": {}})
+        assert error is not None
+        assert "call it directly" in error
+
     def test_tool_search_dispatch_through_handle_function_call(self):
         """The dispatcher recognizes the bridge tool by name."""
         import model_tools

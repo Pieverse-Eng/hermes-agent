@@ -2372,6 +2372,11 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4
             # estimate), regardless of context size. Range 200..60000.
             "listing_max_tokens": 4000,
+            # Non-core tools that should keep their full schemas in the
+            # model-facing array while all other plugin/MCP tools remain
+            # progressively disclosed. Use sparingly for host-managed,
+            # high-frequency tools that should be directly callable.
+            "always_visible_tools": [],
         },
     },
 
