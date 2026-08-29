@@ -400,10 +400,9 @@ def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
 def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | None:
     """Return a copy of tool args safe for logs/progress UI.
 
-    For ``browser_type`` the ``text`` argument is run through the same
-    secret-pattern redactor used for logs.  Recognizable credentials (API
-    keys, tokens) are masked before the value reaches tool progress
-    notifications; normal typed text is left intact for debuggability.
+    Browser credentials and the News Ingress one-time claim token are masked
+    before they reach tool progress notifications; normal arguments remain
+    intact for debuggability.
     """
     if not isinstance(args, dict):
         return args
@@ -411,6 +410,16 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
         safe_args = dict(args)
         safe_args["text"] = redact_sensitive_text(args["text"], force=True)
         return safe_args
+    if tool_name == "terminal" and isinstance(args.get("command"), str):
+        redacted_command = re.sub(
+            r"(--claim-token(?:=|\s+))(?:\"[^\"]*\"|'[^']*'|\S+)",
+            r"\1[REDACTED]",
+            args["command"],
+        )
+        if redacted_command != args["command"]:
+            safe_args = dict(args)
+            safe_args["command"] = redacted_command
+            return safe_args
     return args
 
 

@@ -38,7 +38,7 @@ needs to replace the import + call site:
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -127,6 +127,20 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+_NEWS_RUNTIME_KIND: ContextVar = ContextVar("PURRFECT_NEWS_RUNTIME_KIND", default=_UNSET)
+_NEWS_RUNTIME_RUN_ID: ContextVar = ContextVar("PURRFECT_NEWS_RUNTIME_RUN_ID", default=_UNSET)
+_NEWS_BATCH_ID: ContextVar = ContextVar("PURRFECT_NEWS_BATCH_ID", default=_UNSET)
+_NEWS_WAKE_ATTEMPT_ID: ContextVar = ContextVar("PURRFECT_NEWS_WAKE_ATTEMPT_ID", default=_UNSET)
+_NEWS_ACTIVATION_EPOCH: ContextVar = ContextVar("PURRFECT_NEWS_ACTIVATION_EPOCH", default=_UNSET)
+
+_NEWS_VAR_MAP = {
+    "PURRFECT_NEWS_RUNTIME_KIND": _NEWS_RUNTIME_KIND,
+    "PURRFECT_NEWS_RUNTIME_RUN_ID": _NEWS_RUNTIME_RUN_ID,
+    "PURRFECT_NEWS_BATCH_ID": _NEWS_BATCH_ID,
+    "PURRFECT_NEWS_WAKE_ATTEMPT_ID": _NEWS_WAKE_ATTEMPT_ID,
+    "PURRFECT_NEWS_ACTIVATION_EPOCH": _NEWS_ACTIVATION_EPOCH,
+}
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -145,6 +159,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    **_NEWS_VAR_MAP,
 }
 
 
@@ -220,6 +235,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    news_context: Mapping[str, str] | None = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -261,6 +277,10 @@ def set_session_vars(
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        *[
+            var.set(str(news_context.get(name, "")) if news_context else "")
+            for name, var in _NEWS_VAR_MAP.items()
+        ],
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -297,6 +317,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _CRON_SESSION,
+        *_NEWS_VAR_MAP.values(),
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

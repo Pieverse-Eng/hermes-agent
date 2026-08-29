@@ -189,6 +189,12 @@ TOOLSETS = {
         "tools": ["terminal", "process"],
         "includes": []
     },
+
+    "news_ingress": {
+        "description": "Restricted platform-managed News Ingress client",
+        "tools": ["terminal"],
+        "includes": []
+    },
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",

@@ -77,6 +77,21 @@ class TestBuildToolPreview:
         assert safe_args["ref"] == "@e3"
         assert safe_args["text"].startswith("ghp_AB")
 
+    def test_terminal_display_args_redact_news_claim_token(self):
+        secret = "news-claim-secret"
+        safe_args = redact_tool_args_for_display(
+            "terminal",
+            {
+                "command": (
+                    "node /managed/purrfect-news/scripts/news-client.mjs ack "
+                    f"--claim-token {secret} --thinking-work-id work-1"
+                )
+            },
+        )
+        assert secret not in safe_args["command"]
+        assert "--claim-token [REDACTED]" in safe_args["command"]
+        assert "--thinking-work-id work-1" in safe_args["command"]
+
 
 
 

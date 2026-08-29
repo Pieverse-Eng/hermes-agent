@@ -547,6 +547,15 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
+            from gateway.news_ingress import authorize_news_ingress_tool
+
+            block_message = authorize_news_ingress_tool(
+                agent,
+                function_name,
+                final_args,
+            )
+            block_error_type = "news_ingress_policy"
+        if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():
