@@ -558,6 +558,25 @@ ctx.register_tool(
 )
 ```
 
+### Concurrent tool execution
+
+Plugin tools are sequential barriers by default. If independent calls do not
+share mutable state or depend on call order, opt them into Hermes' existing
+parallel batch executor:
+
+```python
+ctx.register_tool(
+    name="market_lookup",
+    toolset="market_data",
+    schema={...},
+    handler=market_lookup,
+    parallel_safe=True,
+)
+```
+
+Only set `parallel_safe=True` when the handler is safe to run concurrently
+with another call in the same model-emitted batch.
+
 ### Overriding a built-in tool
 
 To replace a built-in tool with your own implementation (e.g. swap the

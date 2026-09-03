@@ -113,6 +113,16 @@ def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
 
 
+def _is_registered_tool_parallel_safe(tool_name: str) -> bool:
+    """Check the canonical registry for an explicit concurrency opt-in."""
+    try:
+        from tools.registry import registry
+
+        return registry.is_tool_parallel_safe(tool_name)
+    except Exception:
+        return False
+
+
 def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
     """Split a tool-call batch into ordered ``(kind, calls)`` segments.
 
@@ -139,8 +149,8 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
       of racing it.  For V4A ``patch(mode="patch")`` the reserved paths are
       the file headers in the patch body, not a possibly-stale ``path=``
       argument.
-    * Anything not in ``_PARALLEL_SAFE_TOOLS`` and not an opted-in MCP
-      tool → barrier.
+    * Anything not in ``_PARALLEL_SAFE_TOOLS``, not explicitly registered as
+      parallel-safe, and not an opted-in MCP tool → barrier.
 
     Parallel runs shorter than two calls are demoted to sequential (no
     concurrency win, and the sequential executor owns the richer inline
@@ -215,7 +225,11 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             current.append(tool_call)
             continue
 
-        if tool_name in _PARALLEL_SAFE_TOOLS or _is_mcp_tool_parallel_safe(tool_name):
+        if (
+            tool_name in _PARALLEL_SAFE_TOOLS
+            or _is_registered_tool_parallel_safe(tool_name)
+            or _is_mcp_tool_parallel_safe(tool_name)
+        ):
             current.append(tool_call)
             continue
 

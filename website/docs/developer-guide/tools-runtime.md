@@ -35,12 +35,17 @@ registry.register(
     check_fn=check_terminal,       # Optional: returns True/False for availability
     requires_env=["SOME_VAR"],     # Optional: env vars needed (for UI display)
     is_async=False,                # Whether the handler is an async coroutine
+    parallel_safe=False,           # Opt in only when concurrent calls are safe
     description="Run commands",    # Human-readable description
     emoji="💻",                    # Emoji for spinner/progress display
 )
 ```
 
 Each call creates a `ToolEntry` stored in the singleton `ToolRegistry._tools` dict keyed by tool name. A registration that would shadow an existing tool from a **different** toolset is rejected (with an error log) unless the caller passes `override=True`; plugin overrides of built-in tools additionally require the operator opt-in `plugins.entries.<plugin_id>.allow_tool_override: true` in `config.yaml`.
+
+Tools are sequential barriers by default. Set `parallel_safe=True` only when
+multiple calls can execute concurrently without conflicting state or ordering
+requirements. The batch planner can then run adjacent opted-in calls together.
 
 ### Discovery: `discover_builtin_tools()`
 

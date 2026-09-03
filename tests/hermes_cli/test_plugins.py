@@ -618,6 +618,61 @@ class TestThreadToolWhitelist:
 class TestPluginContext:
     """Tests for the PluginContext facade."""
 
+    def test_register_tool_forwards_parallel_safety(self):
+        from tools.registry import registry
+
+        tool_name = "plugin_parallel_reader"
+        context = PluginContext(
+            manifest=PluginManifest(name="parallel_plugin", source="user"),
+            manager=PluginManager(),
+        )
+        context.register_tool(
+            name=tool_name,
+            toolset="parallel-plugin",
+            schema={
+                "name": tool_name,
+                "description": "Test parallel plugin tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: "ok",
+            parallel_safe=True,
+        )
+        try:
+            assert registry.is_tool_parallel_safe(tool_name) is True
+        finally:
+            registry.deregister(tool_name)
+
+    def test_register_tool_preserves_positional_override_argument(self):
+        context = PluginContext(
+            manifest=PluginManifest(name="override_plugin", source="user"),
+            manager=PluginManager(),
+        )
+        schema = {
+            "name": "positional_override",
+            "description": "Test positional override compatibility",
+            "parameters": {"type": "object", "properties": {}},
+        }
+
+        with (
+            patch.object(context, "_tool_override_allowed", return_value=True),
+            patch("tools.registry.registry.register") as register,
+        ):
+            context.register_tool(
+                "positional_override",
+                "override-plugin",
+                schema,
+                lambda args, **kwargs: "ok",
+                None,
+                None,
+                False,
+                "",
+                "",
+                True,
+            )
+
+        assert register.call_args.kwargs["override"] is True
+        assert register.call_args.kwargs["parallel_safe"] is False
+
 
 
 

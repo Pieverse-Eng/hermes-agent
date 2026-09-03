@@ -59,6 +59,29 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel"]
         assert _flatten_ids(segments) == [c.id for c in calls]
 
+    def test_registry_opted_in_plugin_tools_run_in_parallel(self):
+        from tools.registry import registry
+
+        tool_name = f"plugin_parallel_{uuid.uuid4().hex}"
+        registry.register(
+            name=tool_name,
+            toolset="plugin-test",
+            schema={
+                "name": tool_name,
+                "description": "Test parallel-safe plugin tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: "ok",
+            parallel_safe=True,
+        )
+        try:
+            calls = [_tc(tool_name, call_id="p1"), _tc(tool_name, call_id="p2")]
+            segments = _plan_tool_batch_segments(calls)
+            assert _kinds(segments) == ["parallel"]
+            assert _flatten_ids(segments) == ["p1", "p2"]
+        finally:
+            registry.deregister(tool_name)
+
     def test_three_safe_reads_plus_trailing_unsafe_keeps_reads_parallel(self):
         """The headline case: 3 safe reads + 1 unsafe tool must NOT go fully sequential."""
         calls = [
