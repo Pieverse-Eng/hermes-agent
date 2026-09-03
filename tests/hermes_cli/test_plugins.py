@@ -618,6 +618,30 @@ class TestThreadToolWhitelist:
 class TestPluginContext:
     """Tests for the PluginContext facade."""
 
+    def test_register_tool_forwards_parallel_safety(self):
+        from tools.registry import registry
+
+        tool_name = "plugin_parallel_reader"
+        context = PluginContext(
+            manifest=PluginManifest(name="parallel_plugin", source="user"),
+            manager=PluginManager(),
+        )
+        context.register_tool(
+            name=tool_name,
+            toolset="parallel-plugin",
+            schema={
+                "name": tool_name,
+                "description": "Test parallel plugin tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: "ok",
+            parallel_safe=True,
+        )
+        try:
+            assert registry.is_tool_parallel_safe(tool_name) is True
+        finally:
+            registry.deregister(tool_name)
+
 
 
 
