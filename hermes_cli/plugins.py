@@ -421,8 +421,8 @@ class PluginContext:
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
-        parallel_safe: bool = False,
         override: bool = False,
+        parallel_safe: bool = False,
     ) -> None:
         """Register a tool in the global registry **and** track it as plugin-provided.
 

@@ -302,6 +302,33 @@ class TestEntryLookup:
         assert reg.is_tool_parallel_safe("parallel_reader") is True
         assert reg.is_tool_parallel_safe("missing") is False
 
+    def test_register_preserves_positional_override_argument(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="positional_override",
+            toolset="original",
+            schema=_make_schema("positional_override"),
+            handler=_dummy_handler,
+        )
+
+        reg.register(
+            "positional_override",
+            "replacement",
+            _make_schema("positional_override"),
+            _dummy_handler,
+            None,
+            None,
+            False,
+            "",
+            "",
+            None,
+            None,
+            True,
+        )
+
+        assert reg.get_toolset_for_tool("positional_override") == "replacement"
+        assert reg.is_tool_parallel_safe("positional_override") is False
+
 
 class TestSecretCaptureResultContract:
     def test_secret_request_result_does_not_include_secret_value(self):

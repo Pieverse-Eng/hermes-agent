@@ -642,6 +642,37 @@ class TestPluginContext:
         finally:
             registry.deregister(tool_name)
 
+    def test_register_tool_preserves_positional_override_argument(self):
+        context = PluginContext(
+            manifest=PluginManifest(name="override_plugin", source="user"),
+            manager=PluginManager(),
+        )
+        schema = {
+            "name": "positional_override",
+            "description": "Test positional override compatibility",
+            "parameters": {"type": "object", "properties": {}},
+        }
+
+        with (
+            patch.object(context, "_tool_override_allowed", return_value=True),
+            patch("tools.registry.registry.register") as register,
+        ):
+            context.register_tool(
+                "positional_override",
+                "override-plugin",
+                schema,
+                lambda args, **kwargs: "ok",
+                None,
+                None,
+                False,
+                "",
+                "",
+                True,
+            )
+
+        assert register.call_args.kwargs["override"] is True
+        assert register.call_args.kwargs["parallel_safe"] is False
+
 
 
 
