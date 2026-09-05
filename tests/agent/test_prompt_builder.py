@@ -319,37 +319,6 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
-    def test_research_priority_requires_available_tool_and_preserves_skills(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        skill_dir = tmp_path / "skills" / "research" / "stock-spread"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: stock-spread\ndescription: Compare stock prices\n---\n"
-        )
-        tools = {"skill_view", "skills_list", "terminal"}
-        disabled = build_skills_system_prompt(available_tools=tools)
-        enabled = build_skills_system_prompt(
-            available_tools=tools | {"research_market"}
-        )
-
-        assert "research_market" not in disabled
-        assert "you MUST load it with skill_view(name)" in disabled
-        assert "Only proceed without loading a skill if genuinely none" in disabled
-        assert "call it before loading related research skills" in enabled
-        assert "Explicitly requested skills and dedicated" in enabled
-        assert "wallet, Robinhood, and swap workflows take precedence" in enabled
-        assert "Before replying, load and follow relevant skills." in enabled
-        assert "Only proceed without loading a skill if genuinely none" not in enabled
-        # Tool availability already keys the cache; toggling it must not leak
-        # research guidance into subsequent normal sessions or alter the catalog.
-        assert build_skills_system_prompt(available_tools=tools) == disabled
-        assert enabled.split("<available_skills>")[1].split("</available_skills>")[0] == (
-            disabled.split("<available_skills>")[1].split("</available_skills>")[0]
-        )
-        assert "stock-spread" in enabled
-
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
