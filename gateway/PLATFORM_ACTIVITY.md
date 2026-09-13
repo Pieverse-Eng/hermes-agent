@@ -16,10 +16,14 @@ The shared async session-store and session-database facades use the same helper,
 so cancellation cannot release residency while a persistence worker is still
 running. Manual `/compress` acquires its own admission because its provider and
 transcript work bypasses the normal message-turn branch.
-Executable quick commands and plugin slash commands also acquire admission at
-their dispatch boundaries. A hosted quick-command cancellation terminates the
-child and retains residency until the process has actually exited; its existing
-timeout likewise settles the child before reporting completion.
+Every work-bearing slash command acquires admission at the shared dispatch
+boundary; only the explicit status, approval, and stop control set remains
+available during drain. This includes unknown plugin and quick-command names,
+so future command additions fail closed. A hosted quick-command cancellation
+terminates the child and retains residency until the process has actually
+exited; its existing timeout likewise settles the child before reporting
+completion. Fire-and-forget background agents acquire their own independent
+admission for their complete execution and delivery lifetime.
 Cancelling or timing out an executor *wait* does
 not stop the Python thread. The lease therefore retains the actual executor
 future and finishes only after all of its workers exit. Once finishing begins,

@@ -416,19 +416,23 @@ class TestSendUpdateNotification:
 
 
 # ---------------------------------------------------------------------------
-# /update in help and known_commands
+# /update gateway dispatch
 # ---------------------------------------------------------------------------
 
 
-class TestUpdateInHelp:
-    """Verify /update appears in help text and known commands set."""
+class TestUpdateDispatch:
+    """Verify /update remains connected to the gateway dispatcher."""
 
+    @pytest.mark.asyncio
+    async def test_update_is_known_command(self):
+        """The real gateway dispatcher routes /update to its handler."""
+        from tests.gateway.restart_test_helpers import make_restart_runner
 
-    def test_update_is_known_command(self):
-        """The /update command is in the help text (proxy for _known_commands)."""
-        # _known_commands is local to _handle_message, so we verify by
-        # checking the help output includes it.
-        from gateway.run import GatewayRunner
-        import inspect
-        source = inspect.getsource(GatewayRunner._handle_message)
-        assert '"update"' in source
+        runner, _ = make_restart_runner()
+        handler = AsyncMock(return_value="update dispatched")
+        runner._handle_update_command = handler
+
+        result = await runner._handle_message(_make_event())
+
+        assert result == "update dispatched"
+        handler.assert_awaited_once()

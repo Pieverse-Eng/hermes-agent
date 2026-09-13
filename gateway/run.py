@@ -2420,6 +2420,41 @@ from gateway.whatsapp_identity import (
 
 logger = logging.getLogger(__name__)
 
+# These commands inspect or control work that is already admitted, so they must
+# remain reachable while a hosted drain has paused new activity. Every other
+# slash command, including unknown plugin and quick-command names, fails closed
+# through platform admission before dispatch.
+_HOSTED_DRAIN_CONTROL_COMMANDS = frozenset({
+    "agents",
+    "approve",
+    "commands",
+    "context",
+    "debug",
+    "deny",
+    "egress",
+    "help",
+    "platform",
+    "profile",
+    "start",
+    "status",
+    "stop",
+    "version",
+    "whoami",
+})
+_SELF_MANAGED_ACTIVITY_COMMANDS = frozenset({"compress"})
+
+
+def _gateway_command_requires_platform_activity(command: Optional[str]) -> bool:
+    if not command:
+        return False
+    from hermes_cli.commands import resolve_command
+
+    definition = resolve_command(command)
+    canonical = definition.name if definition else command
+    return canonical not in (
+        _HOSTED_DRAIN_CONTROL_COMMANDS | _SELF_MANAGED_ACTIVITY_COMMANDS
+    )
+
 
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
@@ -14429,24 +14464,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _run_quick_command_exec(self, exec_cmd: str) -> str:
         """Run one quick-command process under hosted residency protection."""
         from gateway.platform_activity import (
-            PlatformActivityError,
             await_platform_activity_task,
-            begin_platform_activity,
+            current_platform_activity_lease,
         )
         from tools.environments.local import build_subprocess_env
 
-        try:
-            lease = await begin_platform_activity()
-        except PlatformActivityError as exc:
-            logger.warning(
-                "Refusing quick command: platform activity lease unavailable: %s",
-                exc,
-            )
-            return (
-                "⏳ This agent is preparing its runtime and cannot accept new work yet. "
-                "Please retry shortly."
-            )
-
+        lease = current_platform_activity_lease()
         try:
             spawn = asyncio.create_task(
                 asyncio.create_subprocess_shell(
@@ -14456,7 +14479,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     env=build_subprocess_env(),
                 )
             )
-            if not lease.active:
+            if lease is None or not lease.active:
                 process = await spawn
                 try:
                     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
@@ -14512,40 +14535,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise
         except Exception as exc:
             return f"Quick command error: {exc}"
-        finally:
-            try:
-                await lease.finish()
-            except PlatformActivityError as exc:
-                logger.warning("Failed to finish quick-command activity lease: %s", exc)
 
     async def _run_plugin_command(self, handler, args: str) -> Optional[str]:
         """Run one plugin command under hosted residency protection."""
-        from gateway.platform_activity import PlatformActivityError, begin_platform_activity
+        result = handler(args)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return str(result) if result else None
+
+    async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """Fence every work-bearing slash dispatch before it can start."""
+        if (
+            getattr(event, "internal", False)
+            or not _gateway_command_requires_platform_activity(event.get_command())
+        ):
+            return await self._handle_message_impl(event)
+
+        from gateway.platform_activity import (
+            PlatformActivityError,
+            begin_platform_activity,
+            platform_activity_scope,
+        )
 
         try:
             lease = await begin_platform_activity()
         except PlatformActivityError as exc:
-            logger.warning(
-                "Refusing plugin command: platform activity lease unavailable: %s",
-                exc,
-            )
+            logger.warning("Refusing gateway command: platform activity unavailable: %s", exc)
             return (
                 "⏳ This agent is preparing its runtime and cannot accept new work yet. "
                 "Please retry shortly."
             )
-
         try:
-            result = handler(args)
-            if asyncio.iscoroutine(result):
-                result = await result
-            return str(result) if result else None
+            with platform_activity_scope(lease):
+                return await self._handle_message_impl(event)
         finally:
             try:
                 await lease.finish()
             except PlatformActivityError as exc:
-                logger.warning("Failed to finish plugin-command activity lease: %s", exc)
+                logger.warning("Failed to finish gateway-command activity lease: %s", exc)
 
-    async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_message_impl(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
@@ -15894,6 +15923,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         _platform_activity_lease = None
+        _owns_platform_activity_lease = False
         _claimed_platform_turn = False
         _run_generation = None
         try:
@@ -15929,9 +15959,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # gateway work.  Ordinary Deployments have no configured socket, so
             # `begin_platform_activity` is an inert no-op for their existing path.
             try:
-                from gateway.platform_activity import PlatformActivityError, begin_platform_activity
+                from gateway.platform_activity import (
+                    PlatformActivityError,
+                    begin_platform_activity,
+                    current_platform_activity_lease,
+                )
 
-                _platform_activity_lease = await begin_platform_activity()
+                _platform_activity_lease = current_platform_activity_lease()
+                if _platform_activity_lease is None:
+                    _platform_activity_lease = await begin_platform_activity()
+                    _owns_platform_activity_lease = True
             except PlatformActivityError as exc:
                 logger.warning("Refusing new turn: platform activity lease unavailable: %s", exc)
                 return (
@@ -15999,7 +16036,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._release_turn_lease(_quick_key, _run_generation)
             finally:
                 try:
-                    if _platform_activity_lease is not None:
+                    if (
+                        _owns_platform_activity_lease
+                        and _platform_activity_lease is not None
+                    ):
                         await _platform_activity_lease.finish()
                 except PlatformActivityError as exc:
                     # The supervisor will stop heartbeats after the stream loss and
@@ -19735,23 +19775,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
     ) -> None:
-        """Profile-scoping wrapper around the background agent task.
+        """Activity- and profile-scoping wrapper around a background agent task.
 
         When multiplexing is active, resolve the inbound source's profile and
         run the whole task inside ``_profile_runtime_scope`` so credentials
         resolve from that profile's secret scope. Mirrors the pattern in
         ``_run_agent``.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+        from gateway.platform_activity import (
+            PlatformActivityError,
+            begin_platform_activity,
+            platform_activity_scope,
+        )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+        try:
+            lease = await begin_platform_activity()
+        except PlatformActivityError as exc:
+            logger.warning("Refusing background task: platform activity unavailable: %s", exc)
+            adapter = self._adapter_for_source(source)
+            if adapter:
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ Background task {task_id} could not start while the runtime is draining.",
+                    metadata=self._thread_metadata_for_source(source, event_message_id),
+                )
+            return
+
+        try:
+            with platform_activity_scope(lease):
+                if not getattr(
+                    getattr(self, "config", None), "multiplex_profiles", False
+                ):
+                    return await self._run_background_task_inner(
+                        prompt,
+                        source,
+                        task_id,
+                        event_message_id,
+                        media_urls,
+                        media_types,
+                    )
+
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    return await self._run_background_task_inner(
+                        prompt,
+                        source,
+                        task_id,
+                        event_message_id,
+                        media_urls,
+                        media_types,
+                    )
+        finally:
+            try:
+                await lease.finish()
+            except PlatformActivityError as exc:
+                logger.warning("Failed to finish background-task activity lease: %s", exc)
 
     async def _run_background_task_inner(
         self,

@@ -580,6 +580,78 @@ async def test_plugin_command_runs_under_residency(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_registered_work_is_refused_but_control_remains_available_during_drain(
+    monkeypatch, tmp_path
+):
+    """The command classifier fails closed without hiding drain controls."""
+    from gateway import platform_activity
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    drain_path = tmp_path / 'drain-request.json'
+    drain_path.write_text('{}', encoding='utf-8')
+    monkeypatch.setenv('TENANT_RUNTIME_RUN_LEASE_REPORTING_ENABLED', 'true')
+    monkeypatch.setenv('TENANT_RUNTIME_ACTIVITY_SOCKET', str(tmp_path / 'activity.sock'))
+    monkeypatch.setenv('HERMES_DRAIN_REQUEST_PATH', str(drain_path))
+    monkeypatch.setattr(platform_activity, '_client', PlatformActivityClient())
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+    insights = AsyncMock(return_value='unexpected insights')
+    status = AsyncMock(return_value='runtime status')
+    monkeypatch.setattr(runner, '_handle_insights_command', insights)
+    monkeypatch.setattr(runner, '_handle_status_command', status)
+
+    def event(text):
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=make_restart_source(),
+            message_id=text,
+        )
+
+    refused = await runner._handle_message(event('/insights'))
+    available = await runner._handle_message(event('/status'))
+
+    assert refused is not None
+    assert 'cannot accept new work' in refused
+    insights.assert_not_awaited()
+    assert available == 'runtime status'
+    status.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_background_agent_owns_an_independent_activity_lease(monkeypatch):
+    """A fire-and-forget background agent retains residency after dispatch returns."""
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    runner, _ = make_restart_runner()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def background(*_args):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, '_run_background_task_inner', background)
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'background-agent')
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
+    task = asyncio.create_task(
+        runner._run_background_task('work', make_restart_source(), 'background-task')
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        admission.assert_awaited_once()
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+
+    await task
+    client.finish.assert_awaited_once_with('background-agent')
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('worker_fails', [False, True])
 async def test_abandoned_wait_and_cancelled_finish_keep_worker(worker_fails):
     entered = asyncio.Event()

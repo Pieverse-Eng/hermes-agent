@@ -58,6 +58,11 @@ def platform_activity_enabled() -> bool:
     )
 
 
+def current_platform_activity_lease() -> Optional["PlatformActivityLease"]:
+    """Return the activity lease already owning the current dispatch, if any."""
+    return _current_lease.get()
+
+
 @dataclass
 class PlatformActivityLease:
     """One platform-authorized unit of interactive/API work."""
