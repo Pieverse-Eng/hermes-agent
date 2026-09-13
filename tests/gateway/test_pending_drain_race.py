@@ -195,14 +195,19 @@ async def test_no_pending_cleans_up_normally():
         return "ok"
 
     adapter._message_handler = handler
+    background_finished = asyncio.Event()
+    process_message = adapter._process_message_background
+
+    async def process_message_and_signal(event, session_key):
+        try:
+            await process_message(event, session_key)
+        finally:
+            background_finished.set()
+
+    adapter._process_message_background = process_message_and_signal
 
     await adapter.handle_message(_make_event(text="solo"))
-
-    # Wait for background task to finish.
-    for _ in range(50):
-        if sk not in adapter._active_sessions:
-            break
-        await asyncio.sleep(0.01)
+    await asyncio.wait_for(background_finished.wait(), timeout=2.0)
 
     assert sk not in adapter._active_sessions, (
         "_active_sessions was not cleaned up after a normal turn with no pending"
