@@ -5800,15 +5800,21 @@ class BasePlatformAdapter(ABC):
             not command or gateway_command_requires_platform_activity(command)
         )
         if not requires_activity:
-            return await self._process_message_background_impl(event, session_key)
+            # Control messages intentionally run without a new lease during
+            # drain. They still need a fresh ContextVar boundary because a
+            # queued child task may have copied the prior message's lease.
+            with platform_activity_scope(None):
+                return await self._process_message_background_impl(event, session_key)
 
         try:
             lease = await begin_platform_activity()
         except PlatformActivityError:
             # The runner owns the established user-facing refusal response.
-            # Let it retry admission without a scope, then deliver that control
-            # response through the ordinary adapter path.
-            return await self._process_message_background_impl(event, session_key)
+            # A queued child task inherits its parent's ContextVars. Explicitly
+            # clear that copied lease before the runner retries admission, or a
+            # completed parent lease can authorize this new message.
+            with platform_activity_scope(None):
+                return await self._process_message_background_impl(event, session_key)
         try:
             with platform_activity_scope(lease):
                 return await self._process_message_background_impl(event, session_key)

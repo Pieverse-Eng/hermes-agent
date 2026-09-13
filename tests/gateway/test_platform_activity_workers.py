@@ -846,6 +846,61 @@ async def test_inert_lease_keeps_ordinary_executor_cancellation():
 
 
 @pytest.mark.asyncio
+async def test_completed_hosted_scope_refuses_new_worker_before_submission():
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'completed-turn')
+    await lease.finish()
+    submitted = False
+
+    def work():
+        nonlocal submitted
+        submitted = True
+
+    with platform_activity_scope(lease):
+        with pytest.raises(PlatformActivityError, match='finished'):
+            await platform_run_in_executor(None, work)
+
+    assert submitted is False
+
+
+@pytest.mark.asyncio
+async def test_drain_control_clears_inherited_completed_message_lease(monkeypatch):
+    """A queued control remains usable without borrowing its parent's lease."""
+    from gateway.platform_activity import (
+        current_platform_activity_lease,
+        platform_to_thread,
+    )
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import RestartTestAdapter, make_restart_source
+
+    adapter = RestartTestAdapter()
+    client = type('Client', (), {'finish': AsyncMock()})()
+    old_lease = PlatformActivityLease(client, 'previous-message')
+    await old_lease.finish()
+    worker_states = []
+
+    async def dispatch(_event):
+        return await platform_to_thread(
+            lambda: worker_states.append(current_platform_activity_lease())
+            or 'runtime status'
+        )
+
+    adapter._message_handler = dispatch
+    event = MessageEvent(
+        text='/status',
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id='queued-control',
+    )
+
+    with platform_activity_scope(old_lease):
+        await adapter._process_message_background(event, 'telegram:queued-control')
+
+    assert worker_states == [None]
+    assert adapter.sent == ['runtime status']
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('failure', ['refused', 'cancelled'])
 async def test_gateway_releases_session_when_admission_does_not_complete(monkeypatch, failure):
     from gateway.platforms.base import MessageEvent, MessageType
@@ -876,3 +931,145 @@ async def test_gateway_releases_session_when_admission_does_not_complete(monkeyp
         assert 'cannot accept a new turn' in result
     assert not runner._is_session_running(key)
     work.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_debug_upload_is_refused_during_hosted_drain(monkeypatch, tmp_path):
+    """A command that uploads data is new work, not a drain control."""
+    from gateway import platform_activity
+    from gateway.platforms.base import MessageEvent, MessageType
+    from hermes_cli import debug
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    drain_path = tmp_path / 'drain-request.json'
+    drain_path.write_text('{}', encoding='utf-8')
+    monkeypatch.setenv('TENANT_RUNTIME_RUN_LEASE_REPORTING_ENABLED', 'true')
+    monkeypatch.setenv('TENANT_RUNTIME_ACTIVITY_SOCKET', str(tmp_path / 'activity.sock'))
+    monkeypatch.setenv('HERMES_DRAIN_REQUEST_PATH', str(drain_path))
+    monkeypatch.setattr(platform_activity, '_client', PlatformActivityClient())
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+    uploaded = []
+    monkeypatch.setattr(debug, '_best_effort_sweep_expired_pastes', lambda: None)
+    monkeypatch.setattr(debug, '_capture_dump', lambda: '')
+    monkeypatch.setattr(debug, 'collect_debug_report', lambda **_kwargs: 'report')
+    monkeypatch.setattr(
+        debug,
+        'upload_to_pastebin',
+        lambda report: uploaded.append(report) or 'test-url',
+    )
+    monkeypatch.setattr(debug, '_schedule_auto_delete', lambda _urls: None)
+    event = MessageEvent(
+        text='/debug',
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id='debug-during-drain',
+    )
+
+    result = await runner._handle_message(event)
+
+    assert 'cannot accept new work' in result
+    assert uploaded == []
+
+
+@pytest.mark.asyncio
+async def test_manual_compress_retains_residency_through_adapter_delivery(monkeypatch):
+    """The inbound message envelope owns compression and its final delivery."""
+    from gateway.platforms.base import MessageEvent, MessageType, SendResult
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    runner, adapter = make_restart_runner()
+    runner._external_drain_active = False
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'compress-delivery')
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
+    monkeypatch.setattr(
+        runner,
+        '_handle_compress_command_inner',
+        AsyncMock(return_value='Compressed successfully.'),
+    )
+    adapter._message_handler = runner._handle_message
+    delivery_states = []
+
+    async def send(*_args, **_kwargs):
+        delivery_states.append((lease.active, client.finish.await_count))
+        return SendResult(success=True, message_id='sent')
+
+    monkeypatch.setattr(adapter, 'send', send)
+    event = MessageEvent(
+        text='/compress',
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id='compress-delivery',
+    )
+
+    await adapter._process_message_background(event, 'telegram:compress-delivery')
+
+    assert delivery_states == [(True, 0)]
+    client.finish.assert_awaited_once_with('compress-delivery')
+    admission.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_message_refusal_cannot_reuse_completed_parent_lease(monkeypatch):
+    """A child task's copied context must not authorize its next message."""
+    from gateway import platform_activity
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    runner, adapter = make_restart_runner()
+    runner._external_drain_active = False
+    client = type('Client', (), {'finish': AsyncMock()})()
+    old_lease = PlatformActivityLease(client, 'previous-message')
+    finished = asyncio.Event()
+    client.finish.side_effect = lambda _handle: finished.set()
+    admission_count = 0
+
+    async def admit():
+        nonlocal admission_count
+        admission_count += 1
+        if admission_count == 1:
+            return old_lease
+        await finished.wait()
+        raise PlatformActivityError('drain active')
+
+    monkeypatch.setattr(platform_activity, 'begin_platform_activity', admit)
+    work_states = []
+
+    async def insights(_event):
+        return await platform_activity.platform_to_thread(
+            lambda: work_states.append(
+                (old_lease.active, client.finish.await_count)
+            ) or 'Unleased insights ran.'
+        )
+
+    monkeypatch.setattr(runner, '_handle_insights_command', insights)
+
+    def make_event(text, message_id):
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=make_restart_source(),
+            message_id=message_id,
+        )
+
+    async def dispatch(message):
+        if message.text == 'hello':
+            adapter._pending_messages['telegram:queued-refusal'] = make_event(
+                '/insights', 'queued-refusal'
+            )
+            return ''
+        return await runner._handle_message(message)
+
+    adapter._message_handler = dispatch
+
+    await adapter._process_message_background(
+        make_event('hello', 'parent-message'), 'telegram:queued-refusal'
+    )
+    child = adapter._session_tasks['telegram:queued-refusal']
+    await child
+
+    assert admission_count == 3
+    assert work_states == []
+    assert any('cannot accept new work' in message for message in adapter.sent)

@@ -14601,7 +14601,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_activity_scope,
         )
 
-        if current_platform_activity_lease() is not None:
+        current_lease = current_platform_activity_lease()
+        if current_lease is not None and current_lease.reusable:
             return await self._handle_message_impl(event)
 
         try:
@@ -16013,7 +16014,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 _platform_activity_lease = current_platform_activity_lease()
-                if _platform_activity_lease is None:
+                if (
+                    _platform_activity_lease is None
+                    or not _platform_activity_lease.reusable
+                ):
                     _platform_activity_lease = await begin_platform_activity()
                     _owns_platform_activity_lease = True
             except PlatformActivityError as exc:

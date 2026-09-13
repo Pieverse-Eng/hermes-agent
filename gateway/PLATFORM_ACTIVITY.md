@@ -15,12 +15,14 @@ through `platform_run_in_executor` or `platform_to_thread`, including message
 preparation, the normal gateway executor and pre-turn context compression.
 The shared async session-store and session-database facades use the same helper,
 so cancellation cannot release residency while a persistence worker is still
-running. Manual `/compress` acquires its own admission because its provider and
-transcript work bypasses the normal message-turn branch.
+running. Manual `/compress` reuses the adapter's message admission so its
+provider, transcript mutation, response delivery, and adapter cleanup share one
+ownership envelope. Direct callers acquire the same admission themselves.
 Every work-bearing slash command acquires admission at the shared dispatch
-boundary; only the explicit status, approval, and stop control set remains
-available during drain. This includes unknown plugin and quick-command names,
-so future command additions fail closed. A hosted quick-command cancellation
+boundary; only status, stop, approve, and deny remain available during drain.
+This includes unknown plugin and quick-command names, so future command additions
+fail closed. Commands such as `/debug` that perform external work remain fenced
+even when their result is primarily diagnostic. A hosted quick-command cancellation
 terminates its owned process group and retains residency until the shell and
 all live descendants have actually exited; its existing timeout likewise settles them before reporting
 completion. Fire-and-forget background agents acquire their own independent
@@ -28,7 +30,11 @@ admission for their complete execution and delivery lifetime.
 Cancelling or timing out an executor *wait* does
 not stop the Python thread. The lease therefore retains the actual executor
 future and finishes only after all of its workers exit. Once finishing begins,
-that scope refuses additional submissions before scheduling a worker.
+that scope refuses additional submissions before scheduling a worker. A queued
+message task can inherit its parent's ContextVars, but the adapter acquires an
+independent admission for that message. Failed admission explicitly clears copied
+context before producing the refusal response, and a finishing or completed
+hosted lease rejects any worker that reaches it.
 
 API chat/response work and `/v1/runs` keep their own admitted executor lifetimes.
 Hosted API cancellation waits through repeated cancellation until the actual

@@ -4128,20 +4128,27 @@ class GatewaySlashCommandsMixin:
         from gateway.platform_activity import (
             PlatformActivityError,
             begin_platform_activity,
+            current_platform_activity_lease,
             platform_activity_scope,
         )
 
-        try:
-            platform_activity_lease = await begin_platform_activity()
-        except PlatformActivityError as exc:
-            logger.warning(
-                "Refusing manual compression: platform activity lease unavailable: %s",
-                exc,
-            )
-            return (
-                "⏳ This agent is preparing its runtime and cannot accept new work yet. "
-                "Please retry shortly."
-            )
+        platform_activity_lease = current_platform_activity_lease()
+        owns_platform_activity_lease = (
+            platform_activity_lease is None
+            or not platform_activity_lease.reusable
+        )
+        if owns_platform_activity_lease:
+            try:
+                platform_activity_lease = await begin_platform_activity()
+            except PlatformActivityError as exc:
+                logger.warning(
+                    "Refusing manual compression: platform activity lease unavailable: %s",
+                    exc,
+                )
+                return (
+                    "⏳ This agent is preparing its runtime and cannot accept new work yet. "
+                    "Please retry shortly."
+                )
 
         try:
             with platform_activity_scope(platform_activity_lease):
@@ -4154,10 +4161,13 @@ class GatewaySlashCommandsMixin:
                 with _profile_runtime_scope(profile_home):
                     return await self._handle_compress_command_inner(event)
         finally:
-            try:
-                await platform_activity_lease.finish()
-            except PlatformActivityError as exc:
-                logger.warning("Failed to finish manual compression activity lease: %s", exc)
+            if owns_platform_activity_lease:
+                try:
+                    await platform_activity_lease.finish()
+                except PlatformActivityError as exc:
+                    logger.warning(
+                        "Failed to finish manual compression activity lease: %s", exc
+                    )
 
     async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context.

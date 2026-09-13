@@ -28,27 +28,16 @@ _current_lease: ContextVar[Optional["PlatformActivityLease"]] = ContextVar(
     "platform_activity_lease", default=None
 )
 
-# These commands inspect or control work that is already admitted, so they must
-# remain reachable while a hosted drain has paused new activity. Every other
-# slash command, including unknown plugin and quick-command names, fails closed.
+# These commands settle or inspect work that is already admitted, so they must
+# remain reachable while a hosted drain has paused new activity. Keep this set
+# deliberately narrow: every other slash command, including unknown plugin and
+# quick-command names, fails closed.
 _HOSTED_DRAIN_CONTROL_COMMANDS = frozenset({
-    "agents",
     "approve",
-    "commands",
-    "context",
-    "debug",
     "deny",
-    "egress",
-    "help",
-    "platform",
-    "profile",
-    "start",
     "status",
     "stop",
-    "version",
-    "whoami",
 })
-_SELF_MANAGED_ACTIVITY_COMMANDS = frozenset({"compress"})
 
 
 class PlatformActivityError(RuntimeError):
@@ -92,9 +81,7 @@ def gateway_command_requires_platform_activity(command: Optional[str]) -> bool:
 
     definition = resolve_command(command)
     canonical = definition.name if definition else command
-    return canonical not in (
-        _HOSTED_DRAIN_CONTROL_COMMANDS | _SELF_MANAGED_ACTIVITY_COMMANDS
-    )
+    return canonical not in _HOSTED_DRAIN_CONTROL_COMMANDS
 
 
 @dataclass
@@ -105,10 +92,26 @@ class PlatformActivityLease:
     _handle: Optional[str]
     _workers: set[asyncio.Future[Any]] = field(default_factory=set)
     _finish_task: Optional[asyncio.Task[None]] = None
+    _was_admitted: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._was_admitted = self._handle is not None
 
     @property
     def active(self) -> bool:
         return self._handle is not None
+
+    @property
+    def reusable(self) -> bool:
+        """Whether nested work can safely join this still-owned admission."""
+        return not self._was_admitted or (
+            self.active and self._finish_task is None
+        )
+
+    @property
+    def stale(self) -> bool:
+        """Whether a formerly admitted lease can no longer authorize work."""
+        return not self.reusable
 
     async def finish(self) -> None:
         if self._handle is None:
@@ -130,8 +133,8 @@ class PlatformActivityLease:
 
 
 @contextmanager
-def platform_activity_scope(lease: PlatformActivityLease):
-    """Propagate a turn's existing admission to its executor work."""
+def platform_activity_scope(lease: Optional[PlatformActivityLease]):
+    """Set or explicitly clear the admission inherited by child tasks."""
     token = _current_lease.set(lease)
     try:
         yield
@@ -142,8 +145,8 @@ def platform_activity_scope(lease: PlatformActivityLease):
 def platform_run_in_executor(executor, func, *args) -> asyncio.Future[Any]:
     """Submit work under the current lease without cancelling its real future."""
     lease = _current_lease.get()
-    if lease is not None and lease.active and lease._finish_task is not None:
-        raise PlatformActivityError("platform activity is already finishing")
+    if lease is not None and lease.stale:
+        raise PlatformActivityError("platform activity is already finishing or finished")
     future = asyncio.get_running_loop().run_in_executor(executor, func, *args)
     if lease is not None and lease.active:
         lease._workers.add(future)
@@ -154,8 +157,8 @@ def platform_run_in_executor(executor, func, *args) -> asyncio.Future[Any]:
 async def platform_to_thread(func, /, *args, **kwargs) -> Any:
     """Run blocking turn work while retaining its real worker for residency."""
     lease = _current_lease.get()
-    if lease is not None and lease.active and lease._finish_task is not None:
-        raise PlatformActivityError("platform activity is already finishing")
+    if lease is not None and lease.stale:
+        raise PlatformActivityError("platform activity is already finishing or finished")
     worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
     if lease is not None and lease.active:
         lease._workers.add(worker)
