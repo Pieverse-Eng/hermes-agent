@@ -17,6 +17,7 @@ import json
 import os
 import stat
 import sys
+import threading
 import time
 import types
 import uuid
@@ -427,6 +428,54 @@ class TestAgentExecution:
         # arriving after this point can't reap work this turn left running.
         assert mock_agent._gateway_turn_process_task_id == ""
         assert mock_agent._gateway_turn_process_baseline == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_cancel_keeps_platform_lease_until_executor_stops(self, adapter):
+        """Cancelling the wrapper must not expose a still-running worker to reclaim."""
+        entered = asyncio.Event()
+        release = threading.Event()
+        exited = threading.Event()
+        loop = asyncio.get_running_loop()
+        mock_agent = MagicMock()
+        lease = MagicMock()
+        lease.finish = AsyncMock()
+
+        def _run(**_kwargs):
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                release.wait(timeout=5)
+                return {"final_response": "done"}
+            finally:
+                exited.set()
+
+        mock_agent.run_conversation.side_effect = _run
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=mock_agent),
+            patch(
+                "gateway.platform_activity.begin_platform_activity",
+                new=AsyncMock(return_value=lease),
+            ),
+        ):
+            task = asyncio.create_task(
+                adapter._run_agent(user_message="hello", conversation_history=[])
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=2)
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                lease.finish.assert_not_awaited()
+            finally:
+                release.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert exited.is_set()
+            lease.finish.assert_awaited_once_with()
 
 
 class TestDisconnectedAgentReap:
@@ -2859,4 +2908,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

@@ -17,7 +17,9 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from gateway import platform_activity
 from gateway.config import PlatformConfig
+from gateway.platform_activity import PlatformActivityClient
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
@@ -144,6 +146,38 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_activity_admission_failure_finishes_accepted_run(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        """A 202 run must become terminal when its platform lease is refused."""
+        socket_path = tmp_path / "missing-activity.sock"
+        monkeypatch.setenv("TENANT_RUNTIME_RUN_LEASE_REPORTING_ENABLED", "true")
+        monkeypatch.setenv("TENANT_RUNTIME_ACTIVITY_SOCKET", str(socket_path))
+        monkeypatch.setenv(
+            "HERMES_DRAIN_REQUEST_PATH", str(tmp_path / "drain-request.json")
+        )
+        client = PlatformActivityClient()
+        monkeypatch.setattr(platform_activity, "_client", client)
+        app = _create_runs_app(adapter)
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                task = adapter._active_run_tasks[run_id]
+                await task
+
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_response.json()
+                assert status["status"] == "failed"
+                assert run_id not in adapter._active_run_tasks
+                assert adapter._run_streams[run_id].get_nowait()["event"] == "run.failed"
+                assert adapter._run_streams[run_id].get_nowait() is None
+        finally:
+            await client.close()
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):

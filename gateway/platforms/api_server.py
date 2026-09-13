@@ -70,6 +70,21 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
+
+async def _await_executor_completion(future: asyncio.Future[Any]) -> Any:
+    """Preserve worker residency until executor work has actually stopped."""
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        # Cancelling an asyncio Future returned by run_in_executor does not
+        # stop its thread. Keep the enclosing activity lease until the worker
+        # exits so lifecycle reclaim cannot observe false quiescence.
+        try:
+            await asyncio.shield(future)
+        except Exception:
+            pass
+        raise
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
@@ -6724,7 +6739,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            executor_future = loop.run_in_executor(None, _run)
+            return await _await_executor_completion(executor_future)
         finally:
             self._inflight_agent_runs -= 1
             try:
@@ -6991,8 +7007,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # asynchronous API surface has the same pre-admission guarantee.
             from gateway.platform_activity import begin_platform_activity
 
-            platform_activity_lease = await begin_platform_activity()
+            platform_activity_lease = None
             try:
+                platform_activity_lease = await begin_platform_activity()
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
@@ -7118,7 +7135,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                executor_future = asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                result, usage = await _await_executor_completion(executor_future)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -7241,10 +7259,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
-                try:
-                    await platform_activity_lease.finish()
-                except Exception as exc:
-                    logger.warning("Failed to finish platform run activity lease: %s", exc)
+                if platform_activity_lease is not None:
+                    try:
+                        await platform_activity_lease.finish()
+                    except Exception as exc:
+                        logger.warning("Failed to finish platform run activity lease: %s", exc)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())

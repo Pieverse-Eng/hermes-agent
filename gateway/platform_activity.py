@@ -131,17 +131,29 @@ class PlatformActivityClient:
         loop = asyncio.get_running_loop()
         response: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending[request_id] = response
+        transmission_started = False
         try:
             async with self._write_lock:
                 writer = self._writer
                 if writer is None or writer.is_closing():
                     raise PlatformActivityError("platform activity stream is unavailable")
+                # From this point onward a failed or cancelled wait has an
+                # ambiguous server-side outcome. The supervisor may have
+                # created a lease even when its acknowledgement never reaches
+                # this caller.
+                transmission_started = True
                 writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
                 await writer.drain()
             return await asyncio.wait_for(response, timeout=_SOCKET_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            if transmission_started:
+                await self.close()
+            raise
         except PlatformActivityError:
             raise
         except Exception as exc:
+            if transmission_started:
+                await self.close()
             raise PlatformActivityError(f"platform activity request failed: {exc}") from exc
         finally:
             self._pending.pop(request_id, None)

@@ -93,3 +93,67 @@ async def test_ordinary_runtime_is_an_inert_noop(monkeypatch: pytest.MonkeyPatch
     lease = await PlatformActivityClient().start()
     assert lease.active is False
     await lease.finish()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_closes_ambiguous_activity_stream(activity_env: Path):
+    """A cancelled start cannot leave an unowned lease renewing forever."""
+    accepted = asyncio.Event()
+    release_ack = asyncio.Event()
+    disconnected = asyncio.Event()
+    active_handles: set[str] = set()
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while raw := await reader.readline():
+                request = json.loads(raw)
+                if request["operation"] == "start":
+                    handle = request["admissionId"]
+                    active_handles.add(handle)
+                    accepted.set()
+                    await release_ack.wait()
+                    response = {
+                        "version": 1,
+                        "ok": True,
+                        "operation": "start",
+                        "requestId": request["requestId"],
+                        "activityHandle": handle,
+                    }
+                else:
+                    active_handles.remove(request["activityHandle"])
+                    response = {
+                        "version": 1,
+                        "ok": True,
+                        "operation": "finish",
+                        "requestId": request["requestId"],
+                    }
+                writer.write((json.dumps(response) + "\n").encode("utf-8"))
+                await writer.drain()
+        except (asyncio.CancelledError, ConnectionError):
+            pass
+        finally:
+            disconnected.set()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+
+    server = await asyncio.start_unix_server(handler, str(activity_env))
+    client = PlatformActivityClient()
+    task = asyncio.create_task(client.start())
+    try:
+        await asyncio.wait_for(accepted.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client._writer is None
+        assert client._reader_task is None
+        release_ack.set()
+        await asyncio.wait_for(disconnected.wait(), timeout=2)
+        assert active_handles
+    finally:
+        release_ack.set()
+        await client.close()
+        server.close()
+        await server.wait_closed()
