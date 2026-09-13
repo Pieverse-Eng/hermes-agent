@@ -96,22 +96,28 @@ async def test_ordinary_runtime_is_an_inert_noop(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
-async def test_cancelled_start_closes_ambiguous_activity_stream(activity_env: Path):
-    """A cancelled start cannot leave an unowned lease renewing forever."""
+async def test_cancelled_start_finishes_only_its_lease_on_shared_stream(activity_env: Path):
+    """Cancelling one admission must preserve every sibling lease on the stream."""
     accepted = asyncio.Event()
     release_ack = asyncio.Event()
     disconnected = asyncio.Event()
     active_handles: set[str] = set()
+    operations: list[tuple[str, str]] = []
+    start_count = 0
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal start_count
         try:
             while raw := await reader.readline():
                 request = json.loads(raw)
+                operations.append((request["operation"], request.get("activityHandle", "")))
                 if request["operation"] == "start":
+                    start_count += 1
                     handle = request["admissionId"]
                     active_handles.add(handle)
-                    accepted.set()
-                    await release_ack.wait()
+                    if start_count == 2:
+                        accepted.set()
+                        await release_ack.wait()
                     response = {
                         "version": 1,
                         "ok": True,
@@ -141,19 +147,34 @@ async def test_cancelled_start_closes_ambiguous_activity_stream(activity_env: Pa
 
     server = await asyncio.start_unix_server(handler, str(activity_env))
     client = PlatformActivityClient()
+    first = await client.start()
     task = asyncio.create_task(client.start())
     try:
         await asyncio.wait_for(accepted.wait(), timeout=2)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert client._writer is None
-        assert client._reader_task is None
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert client._writer is not None
+
         release_ack.set()
-        await asyncio.wait_for(disconnected.wait(), timeout=2)
-        assert active_handles
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+
+        assert first.active
+        await first.finish()
+        assert active_handles == set()
+        assert [operation for operation, _ in operations] == [
+            "start",
+            "start",
+            "finish",
+            "finish",
+        ]
+        assert client._writer is not None
     finally:
         release_ack.set()
         await client.close()
+        await asyncio.wait_for(disconnected.wait(), timeout=2)
         server.close()
         await server.wait_closed()

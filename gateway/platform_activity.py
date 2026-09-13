@@ -28,6 +28,19 @@ class PlatformActivityError(RuntimeError):
     """The hosted runtime could not obtain or finish its platform lease."""
 
 
+async def _await_task_through_cancellation(task: asyncio.Task[Any]) -> tuple[Any, bool]:
+    """Wait for an owned protocol task despite repeated caller cancellation."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+    return task.result(), cancelled
+
+
 def platform_activity_enabled() -> bool:
     return (
         os.environ.get("TENANT_RUNTIME_RUN_LEASE_REPORTING_ENABLED") == "true"
@@ -86,30 +99,41 @@ class PlatformActivityClient:
         if drain_requested():
             raise PlatformActivityError("platform drain is active")
         request_id = str(uuid.uuid4())
-        payload = await self._request(
-            {
+        request_task = asyncio.create_task(
+            self._request({
                 "version": _PROTOCOL_VERSION,
                 "operation": "start",
                 "requestId": request_id,
                 "admissionId": str(uuid.uuid4()),
-            }
+            })
         )
+        payload, cancelled = await _await_task_through_cancellation(request_task)
         handle = payload.get("activityHandle")
         if not isinstance(handle, str) or not handle:
             raise PlatformActivityError("platform activity start returned no handle")
+        if cancelled:
+            # The supervisor accepted this exact admission while its caller was
+            # being cancelled. Finish only that handle on the existing shared
+            # stream; closing the stream would abandon unrelated live workers.
+            finish_task = asyncio.create_task(self.finish(handle))
+            await _await_task_through_cancellation(finish_task)
+            raise asyncio.CancelledError
         return PlatformActivityLease(self, handle)
 
     async def finish(self, handle: str) -> None:
         if not self.enabled:
             return
-        await self._request(
-            {
+        request_task = asyncio.create_task(
+            self._request({
                 "version": _PROTOCOL_VERSION,
                 "operation": "finish",
                 "requestId": str(uuid.uuid4()),
                 "activityHandle": handle,
-            }
+            })
         )
+        _, cancelled = await _await_task_through_cancellation(request_task)
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def close(self) -> None:
         writer, self._writer = self._writer, None

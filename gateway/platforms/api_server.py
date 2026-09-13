@@ -73,17 +73,27 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
 
 async def _await_executor_completion(future: asyncio.Future[Any]) -> Any:
     """Preserve worker residency until executor work has actually stopped."""
-    try:
-        return await asyncio.shield(future)
-    except asyncio.CancelledError:
-        # Cancelling an asyncio Future returned by run_in_executor does not
-        # stop its thread. Keep the enclosing activity lease until the worker
-        # exits so lifecycle reclaim cannot observe false quiescence.
+    cancelled = False
+    while not future.done():
         try:
             await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # Repeated cancellation must not punch through this wait. Cancelling
+            # an executor Future does not stop its thread, and residency belongs
+            # to that real worker rather than to its request wrapper.
+            cancelled = True
+        except Exception:
+            if cancelled:
+                raise asyncio.CancelledError
+            raise
+    if cancelled:
+        # Retrieve a worker exception before preserving the caller's cancellation.
+        try:
+            future.result()
         except Exception:
             pass
-        raise
+        raise asyncio.CancelledError
+    return future.result()
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:

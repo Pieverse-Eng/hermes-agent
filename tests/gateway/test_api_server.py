@@ -467,6 +467,10 @@ class TestAgentExecution:
                 await asyncio.wait_for(entered.wait(), timeout=2)
                 task.cancel()
                 await asyncio.sleep(0)
+                # A second cancellation must not punch through the cleanup wait
+                # and release residency while the executor thread still runs.
+                task.cancel()
+                await asyncio.sleep(0)
                 assert not task.done()
                 lease.finish.assert_not_awaited()
             finally:
