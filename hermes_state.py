@@ -14,7 +14,6 @@ Key design decisions:
 - Session source tagging ('cli', 'telegram', 'discord', etc.) for filtering
 """
 
-import asyncio
 import atexit
 import errno
 import hashlib
@@ -9675,7 +9674,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
 
 class AsyncSessionDB:
-    """Async door onto SessionDB: offloads each call via asyncio.to_thread so a blocking SQLite call never freezes the event loop. Generic forwarder — the audit confirms no method returns a live cursor/generator."""
+    """Async door onto SessionDB that keeps blocking SQLite work off the loop.
+
+    The generic forwarder returns completed values rather than live cursors or
+    generators. In hosted activity scopes it also retains residency until the
+    actual worker exits.
+    """
 
     def __init__(self, db: "SessionDB") -> None:
         self._db = db
@@ -9686,6 +9690,10 @@ class AsyncSessionDB:
             return attr
 
         async def _offloaded(*args, **kwargs):
-            return await asyncio.to_thread(attr, *args, **kwargs)
+            # Preserve a hosted turn's residency until the actual database
+            # worker exits; cancelling an asyncio wait does not stop its thread.
+            from gateway.platform_activity import platform_to_thread
+
+            return await platform_to_thread(attr, *args, **kwargs)
 
         return _offloaded

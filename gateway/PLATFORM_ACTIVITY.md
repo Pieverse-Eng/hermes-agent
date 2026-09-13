@@ -12,6 +12,10 @@ A message turn acquires residency before entering the agent path. Its
 `platform_activity_scope` propagates that admission to blocking work submitted
 through `platform_run_in_executor` or `platform_to_thread`, including message
 preparation, the normal gateway executor and pre-turn context compression.
+The shared async session-store and session-database facades use the same helper,
+so cancellation cannot release residency while a persistence worker is still
+running. Manual `/compress` acquires its own admission because its provider and
+transcript work bypasses the normal message-turn branch.
 Cancelling or timing out an executor *wait* does
 not stop the Python thread. The lease therefore retains the actual executor
 future and finishes only after all of its workers exit. Once finishing begins,

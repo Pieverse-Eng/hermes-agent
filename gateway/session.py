@@ -8,7 +8,6 @@ Handles:
 - Dynamic system prompt injection (agent knows its context)
 """
 
-import asyncio
 import hashlib
 import logging
 import os
@@ -1198,7 +1197,12 @@ class AsyncSessionStore:
             return attr
 
         async def _offloaded(*args, **kwargs) -> Any:
-            return await asyncio.to_thread(attr, *args, **kwargs)
+            # Hosted turns must retain residency through the real SQLite worker,
+            # even when cancellation abandons this coroutine's wait. The helper
+            # is inert outside an active platform activity scope.
+            from gateway.platform_activity import platform_to_thread
+
+            return await platform_to_thread(attr, *args, **kwargs)
 
         return _offloaded
 

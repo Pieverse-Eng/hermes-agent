@@ -1,7 +1,7 @@
 """Residency belongs to executor work, including abandoned coroutine waits."""
 import asyncio
 import threading
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -125,6 +125,165 @@ async def test_gateway_cancellation_retains_message_preparation_worker(monkeypat
     with pytest.raises(asyncio.CancelledError):
         await task
     client.finish.assert_awaited_once_with('turn')
+
+
+@pytest.mark.asyncio
+async def test_gateway_cancellation_retains_session_store_worker(monkeypatch):
+    """The real async persistence facade must not outlive residency."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    entered = asyncio.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    loop = asyncio.get_running_loop()
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+
+    def get_or_create_session(source):
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            release.wait(10)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(runner, '_recover_telegram_topic_thread_id', lambda source: None)
+    monkeypatch.setattr(runner.session_store, 'get_or_create_session', get_or_create_session)
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'turn')
+    monkeypatch.setattr(
+        'gateway.platform_activity.begin_platform_activity',
+        AsyncMock(return_value=lease),
+    )
+    event = MessageEvent(
+        text='hello',
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id='persistence-review',
+    )
+    task = asyncio.create_task(runner._handle_message(event))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        task.cancel()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not exited.is_set()
+        assert not task.done()
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.to_thread(exited.wait, 3)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    client.finish.assert_awaited_once_with('turn')
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_database_wait_retains_worker():
+    """The lower-level async database facade shares the same ownership rule."""
+    from hermes_state import AsyncSessionDB
+
+    entered = asyncio.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    class BlockingDatabase:
+        def write(self):
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                release.wait(10)
+            finally:
+                exited.set()
+
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'database')
+    database = AsyncSessionDB(BlockingDatabase())
+    with platform_activity_scope(lease):
+        worker_wait = asyncio.create_task(database.write())
+        await asyncio.wait_for(entered.wait(), 3)
+        worker_wait.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_wait
+        finish = asyncio.create_task(lease.finish())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        try:
+            assert not exited.is_set()
+            assert not finish.done()
+            client.finish.assert_not_awaited()
+        finally:
+            release.set()
+            await asyncio.to_thread(exited.wait, 3)
+
+        await finish
+    client.finish.assert_awaited_once_with('database')
+
+
+@pytest.mark.asyncio
+async def test_manual_compress_runs_under_residency(monkeypatch):
+    """The real command dispatcher retains a cancelled compression worker."""
+    from tests.gateway.restart_test_helpers import make_restart_runner
+    from tests.gateway.test_compress_command import _make_event, _make_history, _make_runner
+
+    runner, _ = make_restart_runner()
+    baseline = _make_runner(_make_history())
+    runner.session_store = baseline.session_store
+    runner._session_db = None
+    runner._external_drain_active = False
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'compress')
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
+    monkeypatch.setattr(
+        'gateway.run._resolve_runtime_agent_kwargs',
+        lambda *args, **kwargs: {'api_key': 'test-key'},
+    )
+    monkeypatch.setattr(
+        'gateway.run._resolve_gateway_model',
+        lambda *args, **kwargs: 'test-model',
+    )
+    monkeypatch.setattr(
+        'agent.model_metadata.estimate_request_tokens_rough',
+        lambda *args, **kwargs: 100,
+    )
+    entered = asyncio.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    loop = asyncio.get_running_loop()
+    agent = MagicMock()
+    agent._cached_system_prompt = ''
+    agent.tools = None
+    agent.context_compressor.has_content_to_compress.return_value = True
+
+    def compress(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            release.wait(10)
+        finally:
+            exited.set()
+
+    agent._compress_context.side_effect = compress
+    monkeypatch.setattr('run_agent.AIAgent', lambda **kwargs: agent)
+
+    task = asyncio.create_task(runner._handle_message(_make_event()))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        task.cancel()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not exited.is_set()
+        assert not task.done()
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.to_thread(exited.wait, 3)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    admission.assert_awaited_once()
+    client.finish.assert_awaited_once_with('compress')
 
 
 @pytest.mark.asyncio

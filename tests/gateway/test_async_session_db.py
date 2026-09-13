@@ -2,8 +2,8 @@
 
 The gateway runs one asyncio loop for every session; SessionDB is synchronous,
 so a raw call on the loop freezes every conversation until it returns.
-AsyncSessionDB offloads each call via asyncio.to_thread. These tests pin the
-facade's contract and lock the gateway boundary so a 39th raw call can't regress.
+AsyncSessionDB offloads each call to a worker. These tests pin the facade's
+behavior and lock the gateway boundary so a 39th raw call can't regress.
 """
 
 import ast
@@ -67,24 +67,6 @@ async def test_offloads_off_calling_thread():
 
     ran_idents = [ident for _name, ident in db.calls]
     assert ran_idents and all(i != caller_ident for i in ran_idents)
-
-
-@pytest.mark.asyncio
-async def test_offload_goes_through_to_thread(monkeypatch):
-    """The offload must route through asyncio.to_thread (where the facade lives)."""
-    db = _SpyDB()
-    facade = AsyncSessionDB(db)
-
-    seen = []
-    real = asyncio.to_thread
-
-    async def _spy(func, *args, **kwargs):
-        seen.append(getattr(func, "__name__", repr(func)))
-        return await real(func, *args, **kwargs)
-
-    monkeypatch.setattr(hermes_state.asyncio, "to_thread", _spy)
-    await facade.returns_str()
-    assert "returns_str" in seen
 
 
 # --------------------------------------------------------------------------
@@ -318,5 +300,4 @@ async def test_concurrent_claim_handoff_single_winner(tmp_path):
     results = await asyncio.gather(*(db.claim_handoff(sid) for _ in range(20)))
 
     assert sum(results) == 1, f"exactly one claim must win, got {sum(results)}"
-
 

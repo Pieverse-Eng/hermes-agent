@@ -4091,7 +4091,7 @@ class GatewaySlashCommandsMixin:
         return t("gateway.footer.saved", state=state, example=example)
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
-        """Profile-scoping wrapper around manual /compress.
+        """Hosted-activity and profile-scoping wrapper around manual /compress.
 
         Multiplexed gateways resolve credentials through the fail-closed
         per-profile secret scope (``agent.secret_scope``, Workstream A). The
@@ -4102,15 +4102,45 @@ class GatewaySlashCommandsMixin:
         scope active``). Install the source profile's scope around the whole
         handler, mirroring ``_run_agent``. Single-profile gateways skip this
         — zero behavior change.
+
+        Manual compression performs provider and persistent transcript work
+        outside the normal agent-turn branch in ``GatewayRunner._handle_message``.
+        Hosted runtimes therefore acquire their platform residency here and
+        retain it through every tracked executor and SQLite worker.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._handle_compress_command_inner(event)
+        from gateway.platform_activity import (
+            PlatformActivityError,
+            begin_platform_activity,
+            platform_activity_scope,
+        )
 
-        from gateway.run import _profile_runtime_scope
+        try:
+            platform_activity_lease = await begin_platform_activity()
+        except PlatformActivityError as exc:
+            logger.warning(
+                "Refusing manual compression: platform activity lease unavailable: %s",
+                exc,
+            )
+            return (
+                "⏳ This agent is preparing its runtime and cannot accept new work yet. "
+                "Please retry shortly."
+            )
 
-        profile_home = self._resolve_profile_home_for_source(event.source)
-        with _profile_runtime_scope(profile_home):
-            return await self._handle_compress_command_inner(event)
+        try:
+            with platform_activity_scope(platform_activity_lease):
+                if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    return await self._handle_compress_command_inner(event)
+
+                from gateway.run import _profile_runtime_scope
+
+                profile_home = self._resolve_profile_home_for_source(event.source)
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_compress_command_inner(event)
+        finally:
+            try:
+                await platform_activity_lease.finish()
+            except PlatformActivityError as exc:
+                logger.warning("Failed to finish manual compression activity lease: %s", exc)
 
     async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context.

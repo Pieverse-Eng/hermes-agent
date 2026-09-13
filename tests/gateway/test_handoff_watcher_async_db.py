@@ -6,9 +6,8 @@ SQLite-backed ``SessionDB`` directly on the asyncio event loop every 2s
 ('Shard ID None heartbeat blocked for more than N seconds').
 
 The fix routes every blocking ``SessionDB`` call in the watcher through the
-``AsyncSessionDB`` facade, which offloads each call via ``asyncio.to_thread`` so
-the SQLite I/O runs on a worker thread and never blocks the event loop / Discord
-heartbeat.
+``AsyncSessionDB`` facade, which runs SQLite I/O on a worker thread and never
+blocks the event loop / Discord heartbeat.
 
 These tests assert that behaviour contract. They are mutation-survivable:
 reverting any ``await self._session_db.<call>(...)`` back to a direct synchronous
@@ -27,8 +26,8 @@ class _RecordingSessionDB:
     """SessionDB stand-in that records the thread each method runs on.
 
     If the watcher calls these methods directly on the event loop (the bug),
-    they run on the loop thread. If they are wrapped in ``asyncio.to_thread``
-    (the fix), they run on a *different* worker thread.
+    they run on the loop thread. Through the async facade they run on a
+    *different* worker thread.
     """
 
     def __init__(self, loop_thread_ident):
@@ -106,29 +105,15 @@ async def _run_one_tick(fake, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_watcher_wraps_calls_via_asyncio_to_thread(monkeypatch):
-    """Explicitly assert the offload goes through asyncio.to_thread.
+async def test_watcher_runs_database_calls_off_loop(monkeypatch):
+    """Every watcher database call runs outside the shared event loop."""
+    import threading
 
-    Patches the AsyncSessionDB facade's ``asyncio.to_thread`` (it lives in
-    hermes_state) and records which SessionDB callables were handed to it.
-    Mutation-survivable: dropping any await removes its callable from the set.
-    """
-    import hermes_state
-
-    db = _RecordingSessionDB(loop_thread_ident=-1)
+    db = _RecordingSessionDB(loop_thread_ident=threading.get_ident())
     fake = _make_fake_runner(db, fail_process=False)
-
-    wrapped = []
-    real_to_thread = hermes_state.asyncio.to_thread
-
-    async def _spy_to_thread(func, *args, **kwargs):
-        wrapped.append(getattr(func, "__name__", repr(func)))
-        return await real_to_thread(func, *args, **kwargs)
-
-    monkeypatch.setattr(hermes_state.asyncio, "to_thread", _spy_to_thread)
 
     await _run_one_tick(fake, monkeypatch)
 
-    assert "list_pending_handoffs" in wrapped
-    assert "claim_handoff" in wrapped
-    assert "complete_handoff" in wrapped
+    assert db.ran_off_loop("list_pending_handoffs")
+    assert db.ran_off_loop("claim_handoff")
+    assert db.ran_off_loop("complete_handoff")
