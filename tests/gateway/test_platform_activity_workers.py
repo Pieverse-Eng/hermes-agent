@@ -128,6 +128,84 @@ async def test_gateway_cancellation_retains_message_preparation_worker(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('fallback', [False, True])
+async def test_gateway_cancellation_retains_voice_transcription_worker(monkeypatch, fallback):
+    """Voice preparation must keep residency until its real STT worker exits."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+    from tools import transcription_tools
+
+    entered = asyncio.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    loop = asyncio.get_running_loop()
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+    runner.config.stt_enabled = True
+
+    def blocking_transcription(path):
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            release.wait(10)
+            return {'success': True, 'transcription': 'hello'}
+        finally:
+            exited.set()
+
+    if fallback:
+        monkeypatch.setattr(
+            transcription_tools,
+            'transcribe_audio',
+            lambda path: {'success': False, 'error': 'primary unavailable'},
+        )
+        monkeypatch.setattr(
+            transcription_tools,
+            'transcribe_audio_local_fallback',
+            blocking_transcription,
+        )
+    else:
+        monkeypatch.setattr(
+            transcription_tools,
+            'transcribe_audio',
+            blocking_transcription,
+        )
+
+    async def prepare_voice(event, source, key, generation):
+        return await runner._enrich_message_with_transcription(
+            event.text,
+            ['/tmp/hosted-activity-voice.ogg'],
+        )
+
+    monkeypatch.setattr(runner, '_handle_message_with_agent', prepare_voice)
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'voice')
+    monkeypatch.setattr(
+        'gateway.platform_activity.begin_platform_activity',
+        AsyncMock(return_value=lease),
+    )
+    event = MessageEvent(
+        text='voice',
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id='voice-worker',
+    )
+    task = asyncio.create_task(runner._handle_message(event))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        task.cancel()
+        for _ in range(100):
+            await asyncio.sleep(0)
+        assert not exited.is_set()
+        assert not task.done()
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.to_thread(exited.wait, 3)
+        await asyncio.gather(task, return_exceptions=True)
+
+    client.finish.assert_awaited_once_with('voice')
+
+
+@pytest.mark.asyncio
 async def test_gateway_cancellation_retains_session_store_worker(monkeypatch):
     """The real async persistence facade must not outlive residency."""
     from gateway.platforms.base import MessageEvent, MessageType
@@ -284,6 +362,74 @@ async def test_manual_compress_runs_under_residency(monkeypatch):
         await task
     admission.assert_awaited_once()
     client.finish.assert_awaited_once_with('compress')
+
+
+@pytest.mark.asyncio
+async def test_manual_compress_retains_topic_binding_worker(monkeypatch):
+    """A cancelled rotation keeps residency through its final routing write."""
+    from tests.gateway.restart_test_helpers import make_restart_runner
+    from tests.gateway.test_compress_command import _make_event, _make_history, _make_runner
+
+    runner, _ = make_restart_runner()
+    baseline = _make_runner(_make_history())
+    runner.session_store = baseline.session_store
+    runner._session_db = None
+    runner._external_drain_active = False
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'compress-binding')
+    monkeypatch.setattr(
+        'gateway.platform_activity.begin_platform_activity',
+        AsyncMock(return_value=lease),
+    )
+    monkeypatch.setattr(
+        'gateway.run._resolve_runtime_agent_kwargs',
+        lambda *args, **kwargs: {'api_key': 'test-key'},
+    )
+    monkeypatch.setattr(
+        'gateway.run._resolve_gateway_model',
+        lambda *args, **kwargs: 'test-model',
+    )
+    monkeypatch.setattr(
+        'agent.model_metadata.estimate_request_tokens_rough',
+        lambda *args, **kwargs: 100,
+    )
+    agent = MagicMock()
+    agent._cached_system_prompt = ''
+    agent.tools = None
+    agent.session_id = 'rotated-session'
+    agent._compression_skipped_due_to_lock = False
+    agent.context_compressor.has_content_to_compress.return_value = True
+    agent._compress_context.return_value = (_make_history(), '')
+    monkeypatch.setattr('run_agent.AIAgent', lambda **kwargs: agent)
+
+    entered = asyncio.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def sync_topic_binding(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            release.wait(10)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(runner, '_sync_telegram_topic_binding', sync_topic_binding)
+    task = asyncio.create_task(runner._handle_message(_make_event()))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        task.cancel()
+        for _ in range(100):
+            await asyncio.sleep(0)
+        assert not exited.is_set()
+        assert not task.done()
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.to_thread(exited.wait, 3)
+        await asyncio.gather(task, return_exceptions=True)
+
+    client.finish.assert_awaited_once_with('compress-binding')
 
 
 @pytest.mark.asyncio

@@ -21806,12 +21806,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         enriched_parts = []
         successful_transcripts: List[str] = []
+        from gateway.platform_activity import platform_to_thread
+
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
+                result = await platform_to_thread(transcribe_audio, path)
                 if not result.get("success"):
-                    fallback = await asyncio.to_thread(
+                    fallback = await platform_to_thread(
                         transcribe_audio_local_fallback,
                         path,
                     )
