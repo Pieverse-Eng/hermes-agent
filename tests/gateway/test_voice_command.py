@@ -1414,7 +1414,8 @@ class TestAutoTtsTempFileCleanup:
         """play_tts call is wrapped in try/finally with os.remove."""
         import inspect
         from gateway.platforms.base import BasePlatformAdapter
-        source = inspect.getsource(BasePlatformAdapter._process_message_background)
+
+        source = inspect.getsource(BasePlatformAdapter._process_message_background_impl)
         # Find the play_tts section and verify cleanup
         play_tts_idx = source.find("play_tts")
         assert play_tts_idx > 0

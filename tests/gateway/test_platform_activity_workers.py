@@ -1,8 +1,12 @@
 """Residency belongs to executor work, including abandoned coroutine waits."""
 import asyncio
+import ast
+import os
 import shlex
+import signal
 import sys
 import threading
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -436,16 +440,114 @@ async def test_manual_compress_retains_topic_binding_worker(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_quick_exec_requires_admission_and_retains_live_subprocess(monkeypatch):
-    """A cancelled quick command keeps residency until its process exits."""
+async def test_slash_command_cancellation_retains_actual_worker(monkeypatch):
+    """The shared command dispatcher owns blocking work until its thread exits."""
     from gateway.platforms.base import MessageEvent, MessageType
     from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
-    child_code = (
-        "import sys; print('ready', flush=True); "
-        "sys.stdin.buffer.read(1); print('finished', flush=True)"
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+    client = type("Client", (), {"finish": AsyncMock()})()
+    lease = PlatformActivityLease(client, "slash-worker")
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr("gateway.platform_activity.begin_platform_activity", admission)
+    entered = asyncio.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def run_slash(_text):
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            release.wait(10)
+            return "Created t_abcdef"
+        finally:
+            exited.set()
+
+    monkeypatch.setattr("hermes_cli.kanban.run_slash", run_slash)
+    task = asyncio.create_task(
+        runner._handle_message(
+            MessageEvent(
+                text="/kanban create review-task",
+                message_type=MessageType.TEXT,
+                source=make_restart_source(),
+                message_id="slash-worker",
+            )
+        )
     )
-    command = f'exec {shlex.quote(sys.executable)} -c {shlex.quote(child_code)}'
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        task.cancel()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not exited.is_set()
+        assert not task.done()
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.to_thread(exited.wait, 3)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    admission.assert_awaited_once()
+    client.finish.assert_awaited_once_with("slash-worker")
+
+
+def test_activity_owned_modules_use_owned_worker_helpers():
+    """New gateway worker submissions cannot bypass activity ownership."""
+    root = Path(__file__).resolve().parents[2]
+    violations = []
+    for relative in (
+        "gateway/run.py",
+        "gateway/slash_commands.py",
+        "gateway/platforms/base.py",
+    ):
+        tree = ast.parse((root / relative).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(
+                node.func, ast.Attribute
+            ):
+                continue
+            owner = node.func.value
+            if (
+                node.func.attr == "to_thread"
+                and isinstance(owner, ast.Name)
+                and owner.id == "asyncio"
+            ):
+                violations.append(f"{relative}:{node.lineno}: asyncio.to_thread")
+            if relative != "gateway/run.py" and node.func.attr == "run_in_executor":
+                violations.append(f"{relative}:{node.lineno}: run_in_executor")
+    assert not violations, (
+        "activity-owned gateway work must use platform_to_thread or "
+        f"platform_run_in_executor: {violations}"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_count", [1, 2])
+async def test_quick_exec_cancellation_stops_descendants_before_finish(
+    monkeypatch, tmp_path, cancel_count
+):
+    """A cancelled quick command retains residency through its entire process group."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import (
+        make_restart_runner,
+        make_restart_source,
+    )
+
+    pid_path = tmp_path / "quick-child.pid"
+    child_code = (
+        "import os, pathlib, signal; "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        "signal.signal(signal.SIGTERM, lambda *_: os._exit(0)); "
+        "signal.pause()"
+    )
+    # Avoid syntax that replaces the shell: the regression requires a real
+    # descendant whose stdio does not keep Process.communicate() open.
+    command = (
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)} >/dev/null 2>&1"
+    )
     runner, _ = make_restart_runner()
     runner._external_drain_active = False
     runner.config.quick_commands = {'reviewexec': {'type': 'exec', 'command': command}}
@@ -454,22 +556,6 @@ async def test_quick_exec_requires_admission_and_retains_live_subprocess(monkeyp
     admission = AsyncMock(return_value=lease)
     monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
 
-    entered = asyncio.Event()
-    processes = []
-    original_spawn = asyncio.create_subprocess_shell
-
-    async def observed_spawn(*args, **kwargs):
-        process = await original_spawn(*args, stdin=asyncio.subprocess.PIPE, **kwargs)
-        # Keep the real child alive after request cancellation so the test can
-        # observe whether residency follows process exit rather than its waiter.
-        setattr(process, 'terminate', MagicMock())
-        processes.append(process)
-        assert process.stdout is not None
-        assert await process.stdout.readline() == b'ready\n'
-        entered.set()
-        return process
-
-    monkeypatch.setattr(asyncio, 'create_subprocess_shell', observed_spawn)
     event = MessageEvent(
         text='/reviewexec',
         message_type=MessageType.TEXT,
@@ -478,23 +564,32 @@ async def test_quick_exec_requires_admission_and_retains_live_subprocess(monkeyp
     )
     task = asyncio.create_task(runner._handle_message(event))
     try:
-        await asyncio.wait_for(entered.wait(), 3)
+        for _ in range(300):
+            if pid_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert pid_path.exists()
+        child_pid = int(pid_path.read_text())
         admission.assert_awaited_once()
-        task.cancel()
-        for _ in range(20):
+        for _ in range(cancel_count):
+            task.cancel()
             await asyncio.sleep(0)
-        assert not task.done()
-        client.finish.assert_not_awaited()
-    finally:
-        for process in processes:
-            process.stdin.write(b'x')
-            await process.stdin.drain()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert processes[0].returncode == 0
-    getattr(processes[0], 'terminate').assert_called_once_with()
-    client.finish.assert_awaited_once_with('quick-exec')
+        import psutil
+
+        assert not psutil.pid_exists(child_pid) or (
+            psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        )
+        client.finish.assert_awaited_once_with("quick-exec")
+    finally:
+        if "child_pid" in locals():
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -649,6 +744,52 @@ async def test_background_agent_owns_an_independent_activity_lease(monkeypatch):
 
     await task
     client.finish.assert_awaited_once_with('background-agent')
+
+
+@pytest.mark.asyncio
+async def test_message_envelope_retains_activity_through_delivery_pipeline(monkeypatch):
+    """The adapter releases residency only after processing and delivery settle."""
+    from gateway.platform_activity import current_platform_activity_lease
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import (
+        RestartTestAdapter,
+        make_restart_source,
+    )
+
+    adapter = RestartTestAdapter()
+    client = type("Client", (), {"finish": AsyncMock()})()
+    lease = PlatformActivityLease(client, "message-delivery")
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr("gateway.platform_activity.begin_platform_activity", admission)
+    entered_delivery = asyncio.Event()
+    release_delivery = asyncio.Event()
+
+    async def processing_and_delivery(_event, _session_key):
+        assert current_platform_activity_lease() is lease
+        entered_delivery.set()
+        await release_delivery.wait()
+
+    monkeypatch.setattr(
+        adapter, "_process_message_background_impl", processing_and_delivery
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="message-delivery",
+    )
+    task = asyncio.create_task(
+        adapter._process_message_background(event, "telegram:123456")
+    )
+    try:
+        await asyncio.wait_for(entered_delivery.wait(), 3)
+        admission.assert_awaited_once()
+        client.finish.assert_not_awaited()
+    finally:
+        release_delivery.set()
+
+    await task
+    client.finish.assert_awaited_once_with("message-delivery")
 
 
 @pytest.mark.asyncio

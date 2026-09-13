@@ -8,7 +8,8 @@ executor cancellation behavior.
 
 ## Ownership
 
-A message turn acquires residency before entering the agent path. Its
+A message turn acquires residency before entering the agent path and retains
+it through final channel delivery and adapter cleanup. Its
 `platform_activity_scope` propagates that admission to blocking work submitted
 through `platform_run_in_executor` or `platform_to_thread`, including message
 preparation, the normal gateway executor and pre-turn context compression.
@@ -20,8 +21,8 @@ Every work-bearing slash command acquires admission at the shared dispatch
 boundary; only the explicit status, approval, and stop control set remains
 available during drain. This includes unknown plugin and quick-command names,
 so future command additions fail closed. A hosted quick-command cancellation
-terminates the child and retains residency until the process has actually
-exited; its existing timeout likewise settles the child before reporting
+terminates its owned process group and retains residency until the shell and
+all live descendants have actually exited; its existing timeout likewise settles them before reporting
 completion. Fire-and-forget background agents acquire their own independent
 admission for their complete execution and delivery lifetime.
 Cancelling or timing out an executor *wait* does
@@ -74,3 +75,9 @@ The owning behavior suites are `test_platform_activity.py`,
 `test_api_server_runs.py`. Run them using `scripts/run_tests.sh`; platform
 acceptance must additionally exercise the exact runtime image and supervisor
 together before enabling the hosted cohort.
+
+`gateway/run.py`, `gateway/slash_commands.py`, and the base platform adapter are
+activity-owned execution surfaces. Blocking work in those modules must use
+`platform_to_thread` or `platform_run_in_executor`; the worker-ownership
+regression rejects raw asyncio executor submission so a newly added command or
+delivery step cannot silently escape residency.

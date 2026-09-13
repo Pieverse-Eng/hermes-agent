@@ -17,9 +17,8 @@ import logging
 import os
 import uuid
 from contextlib import contextmanager
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any, Optional
 
 _LOG = logging.getLogger(__name__)
@@ -28,6 +27,28 @@ _SOCKET_TIMEOUT_SECONDS = 5.0
 _current_lease: ContextVar[Optional["PlatformActivityLease"]] = ContextVar(
     "platform_activity_lease", default=None
 )
+
+# These commands inspect or control work that is already admitted, so they must
+# remain reachable while a hosted drain has paused new activity. Every other
+# slash command, including unknown plugin and quick-command names, fails closed.
+_HOSTED_DRAIN_CONTROL_COMMANDS = frozenset({
+    "agents",
+    "approve",
+    "commands",
+    "context",
+    "debug",
+    "deny",
+    "egress",
+    "help",
+    "platform",
+    "profile",
+    "start",
+    "status",
+    "stop",
+    "version",
+    "whoami",
+})
+_SELF_MANAGED_ACTIVITY_COMMANDS = frozenset({"compress"})
 
 
 class PlatformActivityError(RuntimeError):
@@ -61,6 +82,19 @@ def platform_activity_enabled() -> bool:
 def current_platform_activity_lease() -> Optional["PlatformActivityLease"]:
     """Return the activity lease already owning the current dispatch, if any."""
     return _current_lease.get()
+
+
+def gateway_command_requires_platform_activity(command: Optional[str]) -> bool:
+    """Classify a gateway command at the common admission boundary."""
+    if not command:
+        return False
+    from hermes_cli.commands import resolve_command
+
+    definition = resolve_command(command)
+    canonical = definition.name if definition else command
+    return canonical not in (
+        _HOSTED_DRAIN_CONTROL_COMMANDS | _SELF_MANAGED_ACTIVITY_COMMANDS
+    )
 
 
 @dataclass
@@ -119,9 +153,14 @@ def platform_run_in_executor(executor, func, *args) -> asyncio.Future[Any]:
 
 async def platform_to_thread(func, /, *args, **kwargs) -> Any:
     """Run blocking turn work while retaining its real worker for residency."""
-    context = copy_context()
-    call = partial(context.run, func, *args, **kwargs)
-    return await platform_run_in_executor(None, call)
+    lease = _current_lease.get()
+    if lease is not None and lease.active and lease._finish_task is not None:
+        raise PlatformActivityError("platform activity is already finishing")
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    if lease is not None and lease.active:
+        lease._workers.add(worker)
+        return await asyncio.shield(worker)
+    return await worker
 
 
 class PlatformActivityClient:

@@ -33,6 +33,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
+from gateway.platform_activity import platform_run_in_executor, platform_to_thread
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
@@ -245,7 +246,7 @@ class GatewaySlashCommandsMixin:
             set_env = getattr(self, "_set_session_env", None)
             if callable(set_env):
                 tokens = set_env(context)
-            return await asyncio.to_thread(_scan)
+            return await platform_to_thread(_scan)
         except Exception:
             logger.debug("skill security session refresh scan failed", exc_info=True)
             return "", [], {}
@@ -394,18 +395,24 @@ class GatewaySlashCommandsMixin:
         # profile serving this source so a multiplexed /reset //new banner
         # reports the profile's model, not the base config's (#59003).
         try:
-            session_info = await asyncio.to_thread(
+            session_info = await platform_to_thread(
                 self._reset_notice_session_info, source
             )
         except Exception:
             session_info = ""
 
         if new_entry:
-            header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_default")
+            header = await platform_to_thread(
+                self._telegram_topic_new_header, source
+            ) or t("gateway.reset.header_default")
         else:
             # No existing session, just create one
-            new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
-            header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_new")
+            new_entry = await self.async_session_store.get_or_create_session(
+                source, force_new=True
+            )
+            header = await platform_to_thread(
+                self._telegram_topic_new_header, source
+            ) or t("gateway.reset.header_new")
 
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()
@@ -435,9 +442,14 @@ class GatewaySlashCommandsMixin:
         # uses the freshly-created session. Without this, the binding
         # still points at the old session and the binding-lookup at the
         # top of _handle_message_with_agent would switch right back.
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source) and new_entry is not None:
+        if (
+            await platform_to_thread(self._is_telegram_topic_lane, source)
+            and new_entry is not None
+        ):
             try:
-                await asyncio.to_thread(self._record_telegram_topic_binding, source, new_entry)
+                await platform_to_thread(
+                    self._record_telegram_topic_binding, source, new_entry
+                )
             except Exception:
                 logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
 
@@ -622,7 +634,7 @@ class GatewaySlashCommandsMixin:
         is_create = action == "create"
 
         try:
-            output = await asyncio.to_thread(run_slash, text)
+            output = await platform_to_thread(run_slash, text)
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
@@ -667,7 +679,8 @@ class GatewaySlashCommandsMixin:
                                 )
                             finally:
                                 conn.close()
-                        await asyncio.to_thread(_sub)
+
+                        await platform_to_thread(_sub)
                         output = (
                             output.rstrip()
                             + "\n"
@@ -932,7 +945,7 @@ class GatewaySlashCommandsMixin:
                 from agent.model_metadata import get_model_context_length
 
                 context_length = _int_value(
-                    await asyncio.to_thread(get_model_context_length, model_name)
+                    await platform_to_thread(get_model_context_length, model_name)
                 )
             except Exception:
                 context_length = 0
@@ -1020,7 +1033,7 @@ class GatewaySlashCommandsMixin:
             # text (no glyph grid — monospace isn't guaranteed on messaging
             # platforms). Fail-open: rendering errors never break /context.
             if has_agent:
-                breakdown = await asyncio.to_thread(
+                breakdown = await platform_to_thread(
                     self._context_breakdown_block, agent, source, expanded
                 )
                 if breakdown:
@@ -1903,7 +1916,9 @@ class GatewaySlashCommandsMixin:
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads
         # (#30479).
-        source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+        source = await platform_to_thread(
+            self._normalize_source_for_session_key, source
+        )
         session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
@@ -1929,7 +1944,7 @@ class GatewaySlashCommandsMixin:
                     # Offload blocking provider-listing (can fall through to a
                     # synchronous urllib HTTP fetch on a stale cache) off the
                     # event loop so the gateway doesn't freeze. See #41289.
-                    providers = await asyncio.to_thread(
+                    providers = await platform_to_thread(
                         list_picker_providers,
                         current_provider=current_provider,
                         current_base_url=current_base_url,
@@ -1965,7 +1980,7 @@ class GatewaySlashCommandsMixin:
                         # can fall through to a synchronous models.dev HTTP fetch
                         # (requests.get, 15s timeout) on a cold/expired cache,
                         # which freezes the gateway otherwise. See #20525, #41289.
-                        result = await asyncio.to_thread(
+                        result = await platform_to_thread(
                             _switch_model,
                             raw_input=model_id,
                             current_provider=_cur_provider,
@@ -1988,7 +2003,7 @@ class GatewaySlashCommandsMixin:
                             # Offload: merge_preflight_compression_warning()
                             # calls the sync resolve_display_context_length()
                             # provider probe ladder — must not run on the loop.
-                            await asyncio.to_thread(
+                            await platform_to_thread(
                                 enrich_model_switch_warnings_for_gateway,
                                 result,
                                 _self,
@@ -2237,7 +2252,7 @@ class GatewaySlashCommandsMixin:
             try:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
-                providers = await asyncio.to_thread(
+                providers = await platform_to_thread(
                     list_authenticated_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
@@ -2273,7 +2288,7 @@ class GatewaySlashCommandsMixin:
         # through to a synchronous models.dev HTTP fetch (requests.get, 15s
         # timeout) on a cold/expired cache, which freezes the gateway
         # otherwise. See #20525, #41289.
-        result = await asyncio.to_thread(
+        result = await platform_to_thread(
             _switch_model,
             raw_input=model_input,
             current_provider=current_provider,
@@ -2297,7 +2312,7 @@ class GatewaySlashCommandsMixin:
             # Offload: merge_preflight_compression_warning() calls the sync
             # resolve_display_context_length() provider probe ladder — must
             # not run on the loop.
-            await asyncio.to_thread(
+            await platform_to_thread(
                 enrich_model_switch_warnings_for_gateway,
                 result,
                 self,
@@ -2552,7 +2567,7 @@ class GatewaySlashCommandsMixin:
         try:
             from hermes_cli.model_cost_guard import expensive_model_warning
 
-            _cost_warning = await asyncio.to_thread(
+            _cost_warning = await platform_to_thread(
                 expensive_model_warning,
                 result.new_model,
                 provider=result.target_provider,
@@ -2868,7 +2883,7 @@ class GatewaySlashCommandsMixin:
                 import asyncio
                 from hermes_cli.goals import draft_contract
 
-                draft_contract_obj = await asyncio.get_running_loop().run_in_executor(
+                draft_contract_obj = await platform_run_in_executor(
                     None, draft_contract, objective
                 )
             except Exception as exc:
@@ -3368,7 +3383,7 @@ class GatewaySlashCommandsMixin:
 
         from tools.working_diff import collect_working_diff
 
-        result = await asyncio.to_thread(collect_working_diff, cwd, mode)
+        result = await platform_to_thread(collect_working_diff, cwd, mode)
         if not result.get("success"):
             return t("gateway.diff.failed",
                      error=result.get("error", "Could not generate diff"))
@@ -3406,7 +3421,7 @@ class GatewaySlashCommandsMixin:
             max_file_size_mb=cp_kwargs["checkpoint_max_file_size_mb"],
         )
 
-        result = await asyncio.to_thread(mgr.session_diff, cwd)
+        result = await platform_to_thread(mgr.session_diff, cwd)
         if not result.get("success"):
             return t("gateway.diff.failed",
                      error=result.get("error", "Could not generate diff"))
@@ -3644,7 +3659,9 @@ class GatewaySlashCommandsMixin:
         # Normalize the source (Telegram DM topic recovery) before deriving
         # the override key so storage matches the key the next message turn
         # reads — same fix as /model (#30479).
-        _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        _reasoning_source = await platform_to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
         session_key = self._session_key_for_source(_reasoning_source)
         self._show_reasoning = self._load_show_reasoning()
         # Use the session's effective model (session /model override wins over
@@ -4648,7 +4665,9 @@ class GatewaySlashCommandsMixin:
                     )
                     if callable(schedule_rename):
                         try:
-                            await asyncio.to_thread(schedule_rename, source, session_id, sanitized)
+                            await platform_to_thread(
+                                schedule_rename, source, session_id, sanitized
+                            )
                         except Exception:
                             logger.debug(
                                 "Failed to rename Telegram topic from /title",
@@ -4673,7 +4692,7 @@ class GatewaySlashCommandsMixin:
             from hermes_state import format_session_db_unavailable
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
 
-        source = await asyncio.to_thread(
+        source = await platform_to_thread(
             self._normalize_source_for_session_key, event.source
         )
         session_key = self._session_key_for_source(source)
@@ -4862,7 +4881,7 @@ class GatewaySlashCommandsMixin:
             resume_event = dataclasses.replace(event, text=f"/resume {target}")
             return await self._handle_resume_command(resume_event)
 
-        source = await asyncio.to_thread(
+        source = await platform_to_thread(
             self._normalize_source_for_session_key, event.source
         )
         session_key = self._session_key_for_source(source)
@@ -4874,7 +4893,7 @@ class GatewaySlashCommandsMixin:
         # previews / sources — the enumeration half of the /resume IDOR.
         cross_origin = include_all and self._resume_caller_is_admin(source)
         current_entry = await self.async_session_store.get_or_create_session(source)
-        rows = await asyncio.to_thread(
+        rows = await platform_to_thread(
             query_session_listing,
             getattr(self._session_db, "_db", self._session_db),
             source=source.platform.value if source.platform else None,
@@ -5030,7 +5049,7 @@ class GatewaySlashCommandsMixin:
         from agent.account_usage import build_credits_view
 
         try:
-            view = await asyncio.to_thread(build_credits_view, markdown=True)
+            view = await platform_to_thread(build_credits_view, markdown=True)
         except Exception:
             view = None
 
@@ -5183,7 +5202,7 @@ class GatewaySlashCommandsMixin:
             force = "--force" in args[1:]
             from agent.account_usage import redeem_codex_reset_credit
 
-            result = await asyncio.to_thread(
+            result = await platform_to_thread(
                 redeem_codex_reset_credit,
                 base_url=base_url,
                 api_key=api_key,
@@ -5197,7 +5216,7 @@ class GatewaySlashCommandsMixin:
         credits_lines: list[str] = []
         if provider:
             try:
-                account_snapshot = await asyncio.to_thread(
+                account_snapshot = await platform_to_thread(
                     fetch_account_usage,
                     provider,
                     base_url=base_url,
@@ -5219,7 +5238,7 @@ class GatewaySlashCommandsMixin:
         try:
             from agent.account_usage import nous_credits_lines
 
-            credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
+            credits_lines = await platform_to_thread(nous_credits_lines, markdown=True)
         except Exception:
             credits_lines = []  # fail-open: never break /usage
 
@@ -5257,7 +5276,7 @@ class GatewaySlashCommandsMixin:
             # Same engine the desktop popover uses (PR #54907). The system
             # prompt / tools / skills / memory slices read off the live agent;
             # the conversation slice is estimated from the session transcript.
-            breakdown_lines = await asyncio.to_thread(
+            breakdown_lines = await platform_to_thread(
                 self._context_breakdown_lines, agent, source
             )
             if breakdown_lines:
@@ -5347,7 +5366,7 @@ class GatewaySlashCommandsMixin:
                 db.close()
                 return result
 
-            return await loop.run_in_executor(None, _run_insights)
+            return await platform_run_in_executor(None, _run_insights)
         except Exception as e:
             logger.error("Insights command error: %s", e, exc_info=True)
             return t("gateway.insights.error", error=e)
@@ -5437,8 +5456,8 @@ class GatewaySlashCommandsMixin:
                 unregister_skill_commands_for_security,
             )
 
-            result = await loop.run_in_executor(None, reload_skills)
-            added = result.get("added", [])      # [{"name", "description"}, ...]
+            result = await platform_run_in_executor(None, reload_skills)
+            added = result.get("added", [])  # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)
             scan_report = ""
@@ -5838,7 +5857,7 @@ class GatewaySlashCommandsMixin:
             lines.append(t("gateway.debug.share_hint"))
             return "\n".join(lines)
 
-        return await loop.run_in_executor(None, _collect_and_upload)
+        return await platform_run_in_executor(None, _collect_and_upload)
 
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update command — update Hermes Agent to the latest version.

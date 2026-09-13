@@ -22,6 +22,10 @@ import weakref
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
+from gateway.platform_activity import (
+    gateway_command_requires_platform_activity,
+    platform_to_thread,
+)
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -5573,7 +5577,7 @@ class BasePlatformAdapter(ABC):
             and event.source.chat_type == "dm"
         )
         if needs_topic_recovery:
-            await asyncio.to_thread(self._apply_topic_recovery, event)
+            await platform_to_thread(self._apply_topic_recovery, event)
 
         session_key = build_session_key(
             event.source,
@@ -5784,7 +5788,44 @@ class BasePlatformAdapter(ABC):
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
-        """Background task that actually processes the message."""
+        """Own hosted residency through processing, delivery, and cleanup."""
+        from gateway.platform_activity import (
+            PlatformActivityError,
+            begin_platform_activity,
+            platform_activity_scope,
+        )
+
+        command = event.get_command()
+        requires_activity = (
+            not command or gateway_command_requires_platform_activity(command)
+        )
+        if not requires_activity:
+            return await self._process_message_background_impl(event, session_key)
+
+        try:
+            lease = await begin_platform_activity()
+        except PlatformActivityError:
+            # The runner owns the established user-facing refusal response.
+            # Let it retry admission without a scope, then deliver that control
+            # response through the ordinary adapter path.
+            return await self._process_message_background_impl(event, session_key)
+        try:
+            with platform_activity_scope(lease):
+                return await self._process_message_background_impl(event, session_key)
+        finally:
+            try:
+                await lease.finish()
+            except PlatformActivityError as exc:
+                logger.warning(
+                    "[%s] Failed to finish message-delivery activity lease: %s",
+                    self.name,
+                    exc,
+                )
+
+    async def _process_message_background_impl(
+        self, event: MessageEvent, session_key: str
+    ) -> None:
+        """Process and deliver one message under its caller's activity scope."""
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -5982,7 +6023,7 @@ class BasePlatformAdapter(ABC):
                             _tts_requested_path = build_auto_tts_output_path(
                                 self.platform
                             )
-                            tts_result_str = await asyncio.to_thread(
+                            tts_result_str = await platform_to_thread(
                                 text_to_speech_tool,
                                 text=speech_text,
                                 output_path=_tts_requested_path,
@@ -6066,13 +6107,13 @@ class BasePlatformAdapter(ABC):
                                 record_obligation,
                             )
 
-                            if await asyncio.to_thread(ledger_enabled):
+                            if await platform_to_thread(ledger_enabled):
                                 _obligation_id = compute_obligation_id(
                                     session_key,
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
                                 )
-                                await asyncio.to_thread(
+                                await platform_to_thread(
                                     record_obligation,
                                     obligation_id=_obligation_id,
                                     session_key=session_key,
@@ -6084,7 +6125,9 @@ class BasePlatformAdapter(ABC):
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
                                 )
-                                await asyncio.to_thread(mark_attempting, _obligation_id)
+                                await platform_to_thread(
+                                    mark_attempting, _obligation_id
+                                )
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
@@ -6103,9 +6146,9 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                await asyncio.to_thread(mark_delivered, _obligation_id)
+                                await platform_to_thread(mark_delivered, _obligation_id)
                             else:
-                                await asyncio.to_thread(
+                                await platform_to_thread(
                                     mark_failed,
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),

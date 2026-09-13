@@ -36,6 +36,7 @@ import queue
 import re
 import shlex
 import site
+import subprocess
 import sys
 import signal
 import threading
@@ -62,6 +63,11 @@ from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
+)
+from gateway.platform_activity import (
+    gateway_command_requires_platform_activity,
+    platform_run_in_executor,
+    platform_to_thread,
 )
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
@@ -2420,42 +2426,6 @@ from gateway.whatsapp_identity import (
 
 logger = logging.getLogger(__name__)
 
-# These commands inspect or control work that is already admitted, so they must
-# remain reachable while a hosted drain has paused new activity. Every other
-# slash command, including unknown plugin and quick-command names, fails closed
-# through platform admission before dispatch.
-_HOSTED_DRAIN_CONTROL_COMMANDS = frozenset({
-    "agents",
-    "approve",
-    "commands",
-    "context",
-    "debug",
-    "deny",
-    "egress",
-    "help",
-    "platform",
-    "profile",
-    "start",
-    "status",
-    "stop",
-    "version",
-    "whoami",
-})
-_SELF_MANAGED_ACTIVITY_COMMANDS = frozenset({"compress"})
-
-
-def _gateway_command_requires_platform_activity(command: Optional[str]) -> bool:
-    if not command:
-        return False
-    from hermes_cli.commands import resolve_command
-
-    definition = resolve_command(command)
-    canonical = definition.name if definition else command
-    return canonical not in (
-        _HOSTED_DRAIN_CONTROL_COMMANDS | _SELF_MANAGED_ACTIVITY_COMMANDS
-    )
-
-
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -2830,7 +2800,7 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
                     frames = wf.getnframes()
                     rate = wf.getframerate() or 1
                     return frames / float(rate)
-            secs = await asyncio.to_thread(_wav_duration)
+            secs = await platform_to_thread(_wav_duration)
             return _format_duration(secs)
         except Exception:
             pass
@@ -2840,7 +2810,7 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
             def _ogg_duration() -> float:
                 from mutagen.oggopus import OggOpus
                 return float(OggOpus(path).info.length)
-            secs = await asyncio.to_thread(_ogg_duration)
+            secs = await platform_to_thread(_ogg_duration)
             return _format_duration(secs)
         except Exception:
             pass
@@ -6849,7 +6819,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return False
-        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        # Runs off-loop (always via platform_to_thread); use the sync handle.
         session_db = getattr(session_db, "_db", session_db)
         try:
             raw = session_db.is_telegram_topic_mode_enabled(
@@ -6948,7 +6918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None or not source.chat_id or not source.thread_id:
             return
-        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        # Runs off-loop (always via platform_to_thread); use the sync handle.
         session_db = getattr(session_db, "_db", session_db)
         session_db.bind_telegram_topic(
             chat_id=str(source.chat_id),
@@ -7018,7 +6988,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return None
-        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        # Runs off-loop (always via platform_to_thread); use the sync handle.
         session_db = getattr(session_db, "_db", session_db)
         try:
             bindings = session_db.list_telegram_topic_bindings_for_chat(
@@ -8745,7 +8715,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key or session_store is None:
             return False
         try:
-            session_id = await asyncio.to_thread(
+            session_id = await platform_to_thread(
                 self._lookup_session_id_under_store_lock, session_store, session_key
             )
         except (AttributeError, TypeError):
@@ -8766,7 +8736,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         raw_db = getattr(session_db, "_db", session_db)
         try:
-            holder = await asyncio.to_thread(
+            holder = await platform_to_thread(
                 raw_db.get_compression_lock_holder, str(session_id)
             )
             return bool(holder)
@@ -10502,7 +10472,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 sweep_recoverable,
             )
 
-            if not await asyncio.to_thread(ledger_enabled):
+            if not await platform_to_thread(ledger_enabled):
                 return 0
             # Only claim rows we can actually send this boot: self.adapters
             # holds a platform only after its connect() succeeded, and each
@@ -10510,7 +10480,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _deliverable = {
                 getattr(p, "value", str(p)) for p in self.adapters
             }
-            claimed = await asyncio.to_thread(
+            claimed = await platform_to_thread(
                 sweep_recoverable, None, deliverable_platforms=_deliverable
             )
         except Exception:
@@ -10554,7 +10524,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = None
             try:
                 if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    await platform_to_thread(mark_delivered, row["obligation_id"])
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s "
@@ -10563,7 +10533,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
+                    await platform_to_thread(
                         mark_failed,
                         row["obligation_id"],
                         str(getattr(result, "error", "") or "send failed"),
@@ -14471,12 +14441,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         lease = current_platform_activity_lease()
         try:
+            spawn_kwargs: dict[str, Any] = {}
+            if os.name == "nt":
+                from hermes_cli._subprocess_compat import windows_hide_flags
+
+                spawn_kwargs["creationflags"] = (
+                    windows_hide_flags() | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+            else:
+                # The shell and every descendant form an owned process group.
+                # A bare Process.terminate() only stops the shell and can leave
+                # the actual command running after residency is released.
+                spawn_kwargs["start_new_session"] = True
             spawn = asyncio.create_task(
                 asyncio.create_subprocess_shell(
                     exec_cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=build_subprocess_env(),
+                    **spawn_kwargs,
                 )
             )
             if lease is None or not lease.active:
@@ -14488,34 +14471,94 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 process, cancelled_during_spawn = await await_platform_activity_task(spawn)
 
-                def stop_process(*, force: bool = False) -> None:
+                async def process_tree_live() -> bool:
+                    if os.name == "nt":
+                        return process.returncode is None
+                    try:
+                        import psutil
+
+                        for member in psutil.process_iter(["pid", "status"]):
+                            try:
+                                if (
+                                    os.getpgid(member.pid) == process.pid
+                                    and member.info["status"] != psutil.STATUS_ZOMBIE
+                                ):
+                                    return True
+                            except (OSError, psutil.Error):
+                                continue
+                    except Exception:
+                        try:
+                            os.killpg(process.pid, 0)  # windows-footgun: ok — POSIX branch
+                            return True
+                        except ProcessLookupError:
+                            pass
+                    return False
+
+                async def stop_process(*, force: bool = False) -> None:
                     if process.returncode is not None:
+                        if not await process_tree_live():
+                            return
+                    if os.name == "nt":
+                        # taskkill /T owns descendants; TerminateProcess on the
+                        # cmd.exe handle does not. Windows has no reliable async
+                        # graceful tree signal, so use its bounded tree stop.
+                        from hermes_cli._subprocess_compat import windows_hide_flags
+
+                        killer = await asyncio.create_subprocess_exec(
+                            "taskkill",
+                            "/PID",
+                            str(process.pid),
+                            "/T",
+                            "/F",
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                            creationflags=windows_hide_flags(),
+                        )
+                        await killer.wait()
                         return
                     try:
-                        process.kill() if force else process.terminate()
+                        os.killpg(  # windows-footgun: ok — POSIX branch
+                            process.pid,
+                            getattr(signal, "SIGKILL", signal.SIGTERM)
+                            if force
+                            else signal.SIGTERM,
+                        )
                     except ProcessLookupError:
                         pass
+
+                async def wait_for_process_tree_exit(timeout: float) -> bool:
+                    deadline = asyncio.get_running_loop().time() + timeout
+                    while await process_tree_live():
+                        if asyncio.get_running_loop().time() >= deadline:
+                            return False
+                        await asyncio.sleep(0.01)
+                    return True
 
                 async def communicate_to_exit():
                     communication = asyncio.create_task(process.communicate())
                     done, _ = await asyncio.wait({communication}, timeout=30)
                     timed_out = not done
                     if timed_out:
-                        stop_process()
+                        await stop_process()
                         done, _ = await asyncio.wait({communication}, timeout=5)
                         if not done:
-                            stop_process(force=True)
+                            await stop_process(force=True)
                     stdout, stderr = await communication
+                    if not await wait_for_process_tree_exit(5):
+                        await stop_process(force=True)
+                        await wait_for_process_tree_exit(5)
                     return stdout, stderr, timed_out
 
                 communication = asyncio.create_task(communicate_to_exit())
                 if cancelled_during_spawn:
-                    stop_process()
+                    stop_task = asyncio.create_task(stop_process())
+                    await await_platform_activity_task(stop_task)
                 try:
                     stdout, stderr, timed_out = await asyncio.shield(communication)
                     cancelled_during_communication = False
                 except asyncio.CancelledError:
-                    stop_process()
+                    stop_task = asyncio.create_task(stop_process())
+                    await await_platform_activity_task(stop_task)
                     (stdout, stderr, timed_out), _ = await await_platform_activity_task(
                         communication
                     )
@@ -14547,15 +14590,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Fence every work-bearing slash dispatch before it can start."""
         if (
             getattr(event, "internal", False)
-            or not _gateway_command_requires_platform_activity(event.get_command())
+            or not gateway_command_requires_platform_activity(event.get_command())
         ):
             return await self._handle_message_impl(event)
 
         from gateway.platform_activity import (
             PlatformActivityError,
             begin_platform_activity,
+            current_platform_activity_lease,
             platform_activity_scope,
         )
+
+        if current_platform_activity_lease() is not None:
+            return await self._handle_message_impl(event)
 
         try:
             lease = await begin_platform_activity()
@@ -15344,7 +15391,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
         if canonical == "new":
-            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+            if await platform_to_thread(self._is_telegram_topic_root_lobby, source):
                 return self._telegram_topic_root_new_message()
             async def _do_reset():
                 return await self._handle_reset_command(event)
@@ -15892,7 +15939,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
-        if not is_internal and await asyncio.to_thread(
+        if not is_internal and await platform_to_thread(
             self._is_telegram_topic_root_lobby, source
         ):
             # Debounce the lobby reminder so a user who forgets about
@@ -16184,7 +16231,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # ``/api/show`` capability probe for local servers — whose
                 # request timeout would otherwise stall the whole gateway event
                 # loop (every session) while a single image is routed.
-                _img_mode = await asyncio.to_thread(
+                _img_mode = await platform_to_thread(
                     self._decide_image_input_mode,
                     source=source,
                     session_key=session_key,
@@ -18615,7 +18662,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Mirrors ``_run_agent``'s gating so single-profile gateways never
         enter the scope.
 
-        Call via ``asyncio.to_thread`` from async handlers: under the scope,
+        Call via ``platform_to_thread`` from async handlers: under the scope,
         resolution can do blocking work (credential refresh, context-length
         HTTP probes) that must not run on the event loop. The scope is entered
         inside this method, so contextvars behave correctly in the worker
@@ -19600,7 +19647,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Ogg/Opus bytes for every provider. Others keep MP3.
             audio_path = build_auto_tts_output_path(event.source.platform)
 
-            result_json = await asyncio.to_thread(
+            result_json = await platform_to_thread(
                 text_to_speech_tool, text=tts_text, output_path=audio_path
             )
             try:
@@ -20249,7 +20296,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         markers (see _relay_auto_thread_info). When absent, the native
         marker-based lane supplies thread identity from the source itself.
         """
-        if relay_info is None and not await asyncio.to_thread(
+        if relay_info is None and not await platform_to_thread(
             self._is_discord_auto_thread_lane, source
         ):
             # Relay title turn with no feedback captured at schedule time:
@@ -20383,7 +20430,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
+        if not await platform_to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
             return
 
         # Operator can fully disable per-topic auto-rename via
@@ -20724,10 +20771,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            await platform_run_in_executor(None, shutdown_mcp_servers)
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await platform_run_in_executor(None, discover_mcp_tools)
 
             # Compute what changed
             with _lock:
