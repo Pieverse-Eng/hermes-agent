@@ -1,5 +1,7 @@
 """Residency belongs to executor work, including abandoned coroutine waits."""
 import asyncio
+import shlex
+import sys
 import threading
 from unittest.mock import AsyncMock, MagicMock
 
@@ -7,6 +9,7 @@ import pytest
 
 from gateway.platform_activity import (
     PlatformActivityError,
+    PlatformActivityClient,
     PlatformActivityLease,
     platform_activity_scope,
     platform_run_in_executor,
@@ -430,6 +433,150 @@ async def test_manual_compress_retains_topic_binding_worker(monkeypatch):
         await asyncio.gather(task, return_exceptions=True)
 
     client.finish.assert_awaited_once_with('compress-binding')
+
+
+@pytest.mark.asyncio
+async def test_quick_exec_requires_admission_and_retains_live_subprocess(monkeypatch):
+    """A cancelled quick command keeps residency until its process exits."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    child_code = (
+        "import sys; print('ready', flush=True); "
+        "sys.stdin.buffer.read(1); print('finished', flush=True)"
+    )
+    command = f'exec {shlex.quote(sys.executable)} -c {shlex.quote(child_code)}'
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+    runner.config.quick_commands = {'reviewexec': {'type': 'exec', 'command': command}}
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'quick-exec')
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
+
+    entered = asyncio.Event()
+    processes = []
+    original_spawn = asyncio.create_subprocess_shell
+
+    async def observed_spawn(*args, **kwargs):
+        process = await original_spawn(*args, stdin=asyncio.subprocess.PIPE, **kwargs)
+        # Keep the real child alive after request cancellation so the test can
+        # observe whether residency follows process exit rather than its waiter.
+        setattr(process, 'terminate', MagicMock())
+        processes.append(process)
+        assert process.stdout is not None
+        assert await process.stdout.readline() == b'ready\n'
+        entered.set()
+        return process
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_shell', observed_spawn)
+    event = MessageEvent(
+        text='/reviewexec',
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id='quick-exec',
+    )
+    task = asyncio.create_task(runner._handle_message(event))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        admission.assert_awaited_once()
+        task.cancel()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not task.done()
+        client.finish.assert_not_awaited()
+    finally:
+        for process in processes:
+            process.stdin.write(b'x')
+            await process.stdin.drain()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert processes[0].returncode == 0
+    getattr(processes[0], 'terminate').assert_called_once_with()
+    client.finish.assert_awaited_once_with('quick-exec')
+
+
+@pytest.mark.asyncio
+async def test_quick_exec_is_refused_by_real_hosted_drain(monkeypatch, tmp_path):
+    """A supervisor drain marker prevents a quick-command process from starting."""
+    from gateway import platform_activity
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    drain_path = tmp_path / 'drain-request.json'
+    drain_path.write_text('{}', encoding='utf-8')
+    monkeypatch.setenv('TENANT_RUNTIME_RUN_LEASE_REPORTING_ENABLED', 'true')
+    monkeypatch.setenv('TENANT_RUNTIME_ACTIVITY_SOCKET', str(tmp_path / 'activity.sock'))
+    monkeypatch.setenv('HERMES_DRAIN_REQUEST_PATH', str(drain_path))
+    monkeypatch.setattr(platform_activity, '_client', PlatformActivityClient())
+    process = MagicMock()
+    process.communicate = AsyncMock(return_value=(b'unexpected', b''))
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr(asyncio, 'create_subprocess_shell', spawn)
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+    runner.config.quick_commands = {
+        'reviewexec': {'type': 'exec', 'command': 'printf unexpected'}
+    }
+
+    result = await runner._handle_message(
+        MessageEvent(
+            text='/reviewexec',
+            message_type=MessageType.TEXT,
+            source=make_restart_source(),
+            message_id='quick-exec-drain',
+        )
+    )
+
+    assert result is not None
+    assert 'cannot accept new work' in result
+    spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_runs_under_residency(monkeypatch):
+    """A plugin command cannot bypass hosted activity admission."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def plugin_handler(_args):
+        entered.set()
+        await release.wait()
+        return 'plugin finished'
+
+    monkeypatch.setattr(
+        'hermes_cli.plugins.get_plugin_command_handler',
+        lambda command: plugin_handler if command == 'review-plugin' else None,
+    )
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'plugin-command')
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
+    task = asyncio.create_task(
+        runner._handle_message(
+            MessageEvent(
+                text='/review-plugin',
+                message_type=MessageType.TEXT,
+                source=make_restart_source(),
+                message_id='plugin-command',
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        admission.assert_awaited_once()
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+
+    assert await task == 'plugin finished'
+    client.finish.assert_awaited_once_with('plugin-command')
 
 
 @pytest.mark.asyncio

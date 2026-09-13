@@ -34,7 +34,7 @@ class PlatformActivityError(RuntimeError):
     """The hosted runtime could not obtain or finish its platform lease."""
 
 
-async def _await_task_through_cancellation(task: asyncio.Task[Any]) -> tuple[Any, bool]:
+async def await_platform_activity_task(task: asyncio.Task[Any]) -> tuple[Any, bool]:
     """Wait for an owned protocol task despite repeated caller cancellation."""
     cancelled = False
     while not task.done():
@@ -76,7 +76,7 @@ class PlatformActivityLease:
             return
         if self._finish_task is None:
             self._finish_task = asyncio.create_task(self._finish_when_idle())
-        _, cancelled = await _await_task_through_cancellation(self._finish_task)
+        _, cancelled = await await_platform_activity_task(self._finish_task)
         if cancelled:
             raise asyncio.CancelledError
 
@@ -167,7 +167,7 @@ class PlatformActivityClient:
                 "admissionId": str(uuid.uuid4()),
             })
         )
-        payload, cancelled = await _await_task_through_cancellation(request_task)
+        payload, cancelled = await await_platform_activity_task(request_task)
         handle = payload.get("activityHandle")
         if not isinstance(handle, str) or not handle:
             raise PlatformActivityError("platform activity start returned no handle")
@@ -176,7 +176,7 @@ class PlatformActivityClient:
             # being cancelled. Finish only that handle on the existing shared
             # stream; closing the stream would abandon unrelated live workers.
             finish_task = asyncio.create_task(self.finish(handle))
-            await _await_task_through_cancellation(finish_task)
+            await await_platform_activity_task(finish_task)
             raise asyncio.CancelledError
         return PlatformActivityLease(self, handle)
 
@@ -191,7 +191,7 @@ class PlatformActivityClient:
                 "activityHandle": handle,
             })
         )
-        _, cancelled = await _await_task_through_cancellation(request_task)
+        _, cancelled = await await_platform_activity_task(request_task)
         if cancelled:
             raise asyncio.CancelledError
 

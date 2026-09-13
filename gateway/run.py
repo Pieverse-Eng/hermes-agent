@@ -14426,6 +14426,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_goal_command(event)
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
+    async def _run_quick_command_exec(self, exec_cmd: str) -> str:
+        """Run one quick-command process under hosted residency protection."""
+        from gateway.platform_activity import (
+            PlatformActivityError,
+            await_platform_activity_task,
+            begin_platform_activity,
+        )
+        from tools.environments.local import build_subprocess_env
+
+        try:
+            lease = await begin_platform_activity()
+        except PlatformActivityError as exc:
+            logger.warning(
+                "Refusing quick command: platform activity lease unavailable: %s",
+                exc,
+            )
+            return (
+                "⏳ This agent is preparing its runtime and cannot accept new work yet. "
+                "Please retry shortly."
+            )
+
+        try:
+            spawn = asyncio.create_task(
+                asyncio.create_subprocess_shell(
+                    exec_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=build_subprocess_env(),
+                )
+            )
+            if not lease.active:
+                process = await spawn
+                try:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+                except asyncio.TimeoutError:
+                    return "Quick command timed out (30s)."
+            else:
+                process, cancelled_during_spawn = await await_platform_activity_task(spawn)
+
+                def stop_process(*, force: bool = False) -> None:
+                    if process.returncode is not None:
+                        return
+                    try:
+                        process.kill() if force else process.terminate()
+                    except ProcessLookupError:
+                        pass
+
+                async def communicate_to_exit():
+                    communication = asyncio.create_task(process.communicate())
+                    done, _ = await asyncio.wait({communication}, timeout=30)
+                    timed_out = not done
+                    if timed_out:
+                        stop_process()
+                        done, _ = await asyncio.wait({communication}, timeout=5)
+                        if not done:
+                            stop_process(force=True)
+                    stdout, stderr = await communication
+                    return stdout, stderr, timed_out
+
+                communication = asyncio.create_task(communicate_to_exit())
+                if cancelled_during_spawn:
+                    stop_process()
+                try:
+                    stdout, stderr, timed_out = await asyncio.shield(communication)
+                    cancelled_during_communication = False
+                except asyncio.CancelledError:
+                    stop_process()
+                    (stdout, stderr, timed_out), _ = await await_platform_activity_task(
+                        communication
+                    )
+                    cancelled_during_communication = True
+                if cancelled_during_spawn or cancelled_during_communication:
+                    raise asyncio.CancelledError
+                if timed_out:
+                    return "Quick command timed out (30s)."
+
+            output = (stdout or stderr).decode().strip()
+            if output:
+                from agent.redact import redact_sensitive_text
+
+                output = redact_sensitive_text(output)
+            return output if output else "Command returned no output."
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return f"Quick command error: {exc}"
+        finally:
+            try:
+                await lease.finish()
+            except PlatformActivityError as exc:
+                logger.warning("Failed to finish quick-command activity lease: %s", exc)
+
+    async def _run_plugin_command(self, handler, args: str) -> Optional[str]:
+        """Run one plugin command under hosted residency protection."""
+        from gateway.platform_activity import PlatformActivityError, begin_platform_activity
+
+        try:
+            lease = await begin_platform_activity()
+        except PlatformActivityError as exc:
+            logger.warning(
+                "Refusing plugin command: platform activity lease unavailable: %s",
+                exc,
+            )
+            return (
+                "⏳ This agent is preparing its runtime and cannot accept new work yet. "
+                "Please retry shortly."
+            )
+
+        try:
+            result = handler(args)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return str(result) if result else None
+        finally:
+            try:
+                await lease.finish()
+            except PlatformActivityError as exc:
+                logger.warning("Failed to finish plugin-command activity lease: %s", exc)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -15562,29 +15681,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
-                        try:
-                            # Sanitize env to prevent credential leakage —
-                            # quick commands run in the gateway process which
-                            # has all API keys in os.environ.
-                            from tools.environments.local import build_subprocess_env
-                            sanitized_env = build_subprocess_env()
-                            proc = await asyncio.create_subprocess_shell(
-                                exec_cmd,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                                env=sanitized_env,
-                            )
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                            output = (stdout or stderr).decode().strip()
-                            # Redact any remaining sensitive patterns in output
-                            if output:
-                                from agent.redact import redact_sensitive_text
-                                output = redact_sensitive_text(output)
-                            return output if output else "Command returned no output."
-                        except asyncio.TimeoutError:
-                            return "Quick command timed out (30s)."
-                        except Exception as e:
-                            return f"Quick command error: {e}"
+                        return await self._run_quick_command_exec(exec_cmd)
                     else:
                         return f"Quick command '/{command}' has no command defined."
                 elif qcmd.get("type") == "alias":
@@ -15611,10 +15708,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
-                    return str(result) if result else None
+                    return await self._run_plugin_command(plugin_handler, user_args)
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
 
