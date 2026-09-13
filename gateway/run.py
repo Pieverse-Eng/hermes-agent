@@ -15799,112 +15799,119 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
-        # Hosted Hermes must acquire the platform residency lease before it
-        # admits a user turn.  The supervisor owns the heartbeat and the
-        # platform fences stale owners; this runtime only brackets actual
-        # gateway work.  Ordinary Deployments have no configured socket, so
-        # `begin_platform_activity` is an inert no-op for their existing path.
+        _platform_activity_lease = None
+        _claimed_platform_turn = False
+        _run_generation = None
         try:
-            from gateway.platform_activity import PlatformActivityError, begin_platform_activity
-
-            _platform_activity_lease = await begin_platform_activity()
-        except PlatformActivityError as exc:
-            logger.warning("Refusing new turn: platform activity lease unavailable: %s", exc)
-            return (
-                "⏳ This agent is preparing its runtime and cannot accept a new turn yet. "
-                "Please resend shortly."
-            )
-
-        # ── Claim this session before any await ───────────────────────
-        # Between here and _run_agent registering the real AIAgent, there
-        # are numerous await points (hooks, vision enrichment, STT,
-        # session hygiene compression).  Without this sentinel a second
-        # message arriving during any of those yields would pass the
-        # "already running" guard and spin up a duplicate agent for the
-        # same session — corrupting the transcript.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(
-            _quick_key,
-            source,
-        )
-        if _limit_message is not None:
-            try:
-                await _platform_activity_lease.finish()
-            except PlatformActivityError as exc:
-                logger.warning("Failed to finish unused platform activity lease: %s", exc)
-            logger.info(
-                "Rejecting new active session %s: max_concurrent_sessions reached",
+            # ── Claim this session before any await ───────────────────────
+            # Between here and _run_agent registering the real AIAgent, there
+            # are numerous await points (hooks, vision enrichment, STT,
+            # session hygiene compression).  Without this sentinel a second
+            # message arriving during any of those yields would pass the
+            # "already running" guard and spin up a duplicate agent for the
+            # same session — corrupting the transcript.
+            _active_session_lease, _limit_message = self._claim_active_session_slot(
                 _quick_key,
+                source,
             )
-            return _limit_message
-        _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
-        _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
-        _claim_state.turn.started_ts = time.time()
-        self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+            if _limit_message is not None:
+                logger.info(
+                    "Rejecting new active session %s: max_concurrent_sessions reached",
+                    _quick_key,
+                )
+                return _limit_message
+            _claimed_platform_turn = True
+            _claim_state = self._session_state(_quick_key)
+            if _active_session_lease is not None:
+                _claim_state.turn.lease = _active_session_lease
+            _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _claim_state.turn.started_ts = time.time()
+            self._persist_active_agents()
+            _run_generation = self._begin_session_run_generation(_quick_key)
 
-        try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
-            # Goal continuation: after the agent returns a final response
-            # for this turn, check any standing /goal — the judge will
-            # either mark it done, pause it (budget), or enqueue a
-            # continuation prompt back through the adapter FIFO so the
-            # next turn makes more progress. Wrapped in try/except so a
-            # broken judge never breaks normal message handling.
+            # Hosted Hermes must acquire the platform residency lease before it
+            # admits a user turn.  The supervisor owns the heartbeat and the
+            # platform fences stale owners; this runtime only brackets actual
+            # gateway work.  Ordinary Deployments have no configured socket, so
+            # `begin_platform_activity` is an inert no-op for their existing path.
             try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
-                    try:
-                        session_entry = await self.async_session_store.get_or_create_session(source)
-                    except Exception:
-                        session_entry = None
-                    if session_entry is not None:
-                        await self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                        )
-            except Exception as _goal_exc:
-                logger.debug("goal continuation hook failed: %s", _goal_exc)
-            return _agent_result
-        finally:
-            # MoA one-shot restore must run on EVERY exit path, not just
-            # success. The restore data lives on the per-turn event object
-            # (_moa_restore_override), which is discarded once the event goes
-            # out of scope — so if _handle_message_with_agent raises, a restore
-            # in the try block would be skipped and the MoA override would leak
-            # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
-            # Turn lease (#64934): release THIS turn's lease token — keyed by
-            # (routing key, run generation) so this unwind can only ever free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
-            try:
-                await _platform_activity_lease.finish()
+                from gateway.platform_activity import PlatformActivityError, begin_platform_activity
+
+                _platform_activity_lease = await begin_platform_activity()
             except PlatformActivityError as exc:
-                # The supervisor will stop heartbeats after the stream loss and
-                # the platform expiry path owns recovery. Never let a failed
-                # terminal report mask the user's completed/cancelled result.
-                logger.warning("Failed to finish platform activity lease: %s", exc)
+                logger.warning("Refusing new turn: platform activity lease unavailable: %s", exc)
+                return (
+                    "⏳ This agent is preparing its runtime and cannot accept a new turn yet. "
+                    "Please resend shortly."
+                )
+
+            from gateway.platform_activity import platform_activity_scope
+
+            with platform_activity_scope(_platform_activity_lease):
+                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                # Goal continuation: after the agent returns a final response
+                # for this turn, check any standing /goal — the judge will
+                # either mark it done, pause it (budget), or enqueue a
+                # continuation prompt back through the adapter FIFO so the
+                # next turn makes more progress. Wrapped in try/except so a
+                # broken judge never breaks normal message handling.
+                try:
+                    _final_text = ""
+                    if isinstance(_agent_result, dict):
+                        _final_text = str(_agent_result.get("final_response") or "")
+                    elif isinstance(_agent_result, str):
+                        _final_text = _agent_result
+                    # Skip for empty responses (interrupted / errored) — the
+                    # judge would almost always say "continue" and we'd loop
+                    # on error. Let the user drive the next turn.
+                    if _final_text.strip():
+                        try:
+                            session_entry = await self.async_session_store.get_or_create_session(source)
+                        except Exception:
+                            session_entry = None
+                        if session_entry is not None:
+                            await self._post_turn_goal_continuation(
+                                session_entry=session_entry,
+                                source=source,
+                                final_response=_final_text,
+                            )
+                except Exception as _goal_exc:
+                    logger.debug("goal continuation hook failed: %s", _goal_exc)
+                return _agent_result
+        finally:
+            try:
+                if _claimed_platform_turn:
+                    # MoA one-shot restore must run on EVERY exit path, not just
+                    # success. The restore data lives on the per-turn event object
+                    # (_moa_restore_override), which is discarded once the event goes
+                    # out of scope — so if _handle_message_with_agent raises, a restore
+                    # in the try block would be skipped and the MoA override would leak
+                    # permanently (every later message silently fans out through MoA).
+                    # Putting it in finally guarantees the revert on success, exception,
+                    # and interrupt alike.
+                    self._restore_moa_one_shot(event, _quick_key)
+                    self._restore_pending_one_turn_model_override(_quick_key)
+                    # Unconditional release covers every exit path. _release_running_agent_state
+                    # is idempotent (pop-on-absent is harmless) and, called without a
+                    # run_generation guard, always clears the slot regardless of which
+                    # generation it holds. This evicts the zombie left when session_reset
+                    # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
+                    # inside _run_agent returns False, and the old sentinel-only check here
+                    # missed the leftover real agent — locking the session out forever (#28686).
+                    self._release_running_agent_state(_quick_key)
+                    # Turn lease (#64934): release THIS turn's lease token — keyed by
+                    # (routing key, run generation) so this unwind can only ever free
+                    # the lease its own turn acquired, never a newer turn's.
+                    self._release_turn_lease(_quick_key, _run_generation)
+            finally:
+                try:
+                    if _platform_activity_lease is not None:
+                        await _platform_activity_lease.finish()
+                except PlatformActivityError as exc:
+                    # The supervisor will stop heartbeats after the stream loss and
+                    # the platform expiry path owns recovery. Never let a failed
+                    # terminal report mask the user's completed/cancelled result.
+                    logger.warning("Failed to finish platform activity lease: %s", exc)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -17101,9 +17108,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
-                                    loop = asyncio.get_running_loop()
+                                    from gateway.platform_activity import platform_run_in_executor
+
                                     _hyg_commit_fence = CompressionCommitFence()
-                                    _hyg_future = loop.run_in_executor(
+                                    _hyg_future = platform_run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
@@ -21544,9 +21552,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""
-        loop = asyncio.get_running_loop()
+        from gateway.platform_activity import platform_run_in_executor
+
         ctx = copy_context()
-        return await loop.run_in_executor(
+        return await platform_run_in_executor(
             self._get_executor(),
             ctx.run,
             func,

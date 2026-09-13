@@ -6750,7 +6750,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._inflight_agent_runs += 1
         try:
             executor_future = loop.run_in_executor(None, _run)
-            return await _await_executor_completion(executor_future)
+            if platform_activity_lease.active:
+                return await _await_executor_completion(executor_future)
+            return await executor_future
         finally:
             self._inflight_agent_runs -= 1
             try:
@@ -7146,7 +7148,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 executor_future = asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                result, usage = await _await_executor_completion(executor_future)
+                if platform_activity_lease.active:
+                    result, usage = await _await_executor_completion(executor_future)
+                else:
+                    result, usage = await executor_future
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",

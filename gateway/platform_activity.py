@@ -16,12 +16,17 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 _LOG = logging.getLogger(__name__)
 _PROTOCOL_VERSION = 1
 _SOCKET_TIMEOUT_SECONDS = 5.0
+_current_lease: ContextVar[Optional["PlatformActivityLease"]] = ContextVar(
+    "platform_activity_lease", default=None
+)
 
 
 class PlatformActivityError(RuntimeError):
@@ -38,6 +43,10 @@ async def _await_task_through_cancellation(task: asyncio.Task[Any]) -> tuple[Any
             if task.cancelled():
                 raise
             cancelled = True
+        except Exception:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
     return task.result(), cancelled
 
 
@@ -54,15 +63,52 @@ class PlatformActivityLease:
 
     _client: "PlatformActivityClient"
     _handle: Optional[str]
+    _workers: set[asyncio.Future[Any]] = field(default_factory=set)
+    _finish_task: Optional[asyncio.Task[None]] = None
 
     @property
     def active(self) -> bool:
         return self._handle is not None
 
     async def finish(self) -> None:
-        handle, self._handle = self._handle, None
-        if handle is not None:
-            await self._client.finish(handle)
+        if self._handle is None:
+            return
+        if self._finish_task is None:
+            self._finish_task = asyncio.create_task(self._finish_when_idle())
+        _, cancelled = await _await_task_through_cancellation(self._finish_task)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _finish_when_idle(self) -> None:
+        # Executor wrappers can time out or be cancelled without stopping their
+        # threads. Ownership stays here until every actual worker has exited.
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+        if self._handle is not None:
+            await self._client.finish(self._handle)
+            self._handle = None
+
+
+@contextmanager
+def platform_activity_scope(lease: PlatformActivityLease):
+    """Propagate a turn's existing admission to its executor work."""
+    token = _current_lease.set(lease)
+    try:
+        yield
+    finally:
+        _current_lease.reset(token)
+
+
+def platform_run_in_executor(executor, func, *args) -> asyncio.Future[Any]:
+    """Submit work under the current lease without cancelling its real future."""
+    lease = _current_lease.get()
+    if lease is not None and lease.active and lease._finish_task is not None:
+        raise PlatformActivityError("platform activity is already finishing")
+    future = asyncio.get_running_loop().run_in_executor(executor, func, *args)
+    if lease is not None and lease.active:
+        lease._workers.add(future)
+        return asyncio.shield(future)
+    return future
 
 
 class PlatformActivityClient:
@@ -81,7 +127,11 @@ class PlatformActivityClient:
         self._connect_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._requests: dict[str, dict[str, Any]] = {}
         self._reader_task: Optional[asyncio.Task[None]] = None
+        self._active_handles: set[str] = set()
+        self._closing = False
+        self._failed = False
 
     @property
     def enabled(self) -> bool:
@@ -90,6 +140,8 @@ class PlatformActivityClient:
     async def start(self) -> PlatformActivityLease:
         if not self.enabled:
             return PlatformActivityLease(self, None)
+        if self._failed:
+            raise PlatformActivityError("platform activity producer has failed")
         # The supervisor writes the supported drain marker before it starts
         # waiting for active handles. Checking it at this exact lease-admission
         # boundary closes the watcher race: work without a lease cannot enter
@@ -136,6 +188,7 @@ class PlatformActivityClient:
             raise asyncio.CancelledError
 
     async def close(self) -> None:
+        self._closing = True
         writer, self._writer = self._writer, None
         self._reader = None
         task, self._reader_task = self._reader_task, None
@@ -155,34 +208,37 @@ class PlatformActivityClient:
         loop = asyncio.get_running_loop()
         response: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending[request_id] = response
-        transmission_started = False
+        self._requests[request_id] = request
         try:
-            async with self._write_lock:
-                writer = self._writer
-                if writer is None or writer.is_closing():
-                    raise PlatformActivityError("platform activity stream is unavailable")
-                # From this point onward a failed or cancelled wait has an
-                # ambiguous server-side outcome. The supervisor may have
-                # created a lease even when its acknowledgement never reaches
-                # this caller.
-                transmission_started = True
-                writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
-                await writer.drain()
-            return await asyncio.wait_for(response, timeout=_SOCKET_TIMEOUT_SECONDS)
-        except asyncio.CancelledError:
-            if transmission_started:
-                await self.close()
-            raise
+            wire = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+            while True:
+                async with self._write_lock:
+                    writer = self._writer
+                    if writer is None or writer.is_closing():
+                        raise PlatformActivityError("platform activity stream is unavailable")
+                    writer.write(wire)
+                    await writer.drain()
+                try:
+                    # A deadline is not a negative acknowledgement. Keep the
+                    # correlation future alive and replay identical bytes on the
+                    # same stream; the supervisor deduplicates this request ID.
+                    return await asyncio.wait_for(
+                        asyncio.shield(response), timeout=_SOCKET_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    continue
         except PlatformActivityError:
             raise
         except Exception as exc:
-            if transmission_started:
-                await self.close()
+            self._fail_producer(exc)
             raise PlatformActivityError(f"platform activity request failed: {exc}") from exc
         finally:
             self._pending.pop(request_id, None)
+            self._requests.pop(request_id, None)
 
     async def _ensure_connected(self) -> None:
+        if self._failed or self._closing:
+            raise PlatformActivityError("platform activity producer is closed")
         if self._writer is not None and not self._writer.is_closing():
             return
         async with self._connect_lock:
@@ -214,9 +270,20 @@ class PlatformActivityClient:
                 future = self._pending.get(request_id) if isinstance(request_id, str) else None
                 if future is None or future.done():
                     continue
+                request = self._requests[request_id]
+                if (payload.get("version") != _PROTOCOL_VERSION
+                        or payload.get("operation") != request["operation"]):
+                    raise PlatformActivityError("platform activity response does not match request")
                 if payload.get("ok") is not True:
                     future.set_exception(PlatformActivityError(str(payload.get("error") or "platform activity refused")))
                 else:
+                    if payload.get("operation") == "start":
+                        handle = payload.get("activityHandle")
+                        if not isinstance(handle, str) or not handle:
+                            raise PlatformActivityError("platform activity start returned no handle")
+                        self._active_handles.add(handle)
+                    elif payload.get("operation") == "finish":
+                        self._active_handles.discard(request["activityHandle"])
                     future.set_result(payload)
         except asyncio.CancelledError:
             raise
@@ -224,10 +291,26 @@ class PlatformActivityClient:
             failure = exc if isinstance(exc, PlatformActivityError) else PlatformActivityError(str(exc))
             _LOG.warning("platform activity stream failed: %s", failure)
         finally:
+            writer.close()
             if self._writer is writer:
                 self._writer = None
                 self._reader = None
             self._fail_pending(failure)
+            if not self._closing:
+                self._fail_producer(failure)
+
+    def _fail_producer(self, error: Exception) -> None:
+        if self._failed:
+            return
+        self._failed = True
+        if self._writer is not None:
+            self._writer.close()
+        if self._active_handles:
+            # Stream loss stops supervisor heartbeats. Python cancellation cannot
+            # stop executor threads; the hosted process must not keep executing
+            # after losing the only authority that protects it from reclaim.
+            _LOG.critical("Hosted activity protection lost; terminating runtime: %s", error)
+            os._exit(1)
 
     def _fail_pending(self, error: Exception) -> None:
         for future in list(self._pending.values()):
