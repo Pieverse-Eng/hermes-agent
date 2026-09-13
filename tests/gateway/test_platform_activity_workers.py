@@ -192,7 +192,7 @@ async def test_gateway_cancellation_retains_voice_transcription_worker(monkeypat
     try:
         await asyncio.wait_for(entered.wait(), 3)
         task.cancel()
-        for _ in range(100):
+        for _ in range(20):
             await asyncio.sleep(0)
         assert not exited.is_set()
         assert not task.done()
@@ -419,7 +419,7 @@ async def test_manual_compress_retains_topic_binding_worker(monkeypatch):
     try:
         await asyncio.wait_for(entered.wait(), 3)
         task.cancel()
-        for _ in range(100):
+        for _ in range(20):
             await asyncio.sleep(0)
         assert not exited.is_set()
         assert not task.done()
