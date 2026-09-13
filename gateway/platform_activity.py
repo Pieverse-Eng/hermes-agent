@@ -17,8 +17,9 @@ import logging
 import os
 import uuid
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Optional
 
 _LOG = logging.getLogger(__name__)
@@ -109,6 +110,13 @@ def platform_run_in_executor(executor, func, *args) -> asyncio.Future[Any]:
         lease._workers.add(future)
         return asyncio.shield(future)
     return future
+
+
+async def platform_to_thread(func, /, *args, **kwargs) -> Any:
+    """Run blocking turn work while retaining its real worker for residency."""
+    context = copy_context()
+    call = partial(context.run, func, *args, **kwargs)
+    return await platform_run_in_executor(None, call)
 
 
 class PlatformActivityClient:
@@ -302,13 +310,18 @@ class PlatformActivityClient:
     def _fail_producer(self, error: Exception) -> None:
         if self._failed:
             return
+        if not self._active_handles and not self._pending:
+            # A fully settled producer owns no supervisor state. Its successor
+            # stream can safely establish a fresh session after an idle EOF.
+            return
         self._failed = True
         if self._writer is not None:
             self._writer.close()
-        if self._active_handles:
+        if self._active_handles or self._pending:
             # Stream loss stops supervisor heartbeats. Python cancellation cannot
-            # stop executor threads; the hosted process must not keep executing
-            # after losing the only authority that protects it from reclaim.
+            # stop executor threads, and an unresolved request may have committed
+            # without its acknowledgement reaching us. The hosted process cannot
+            # safely continue after losing that ownership information.
             _LOG.critical("Hosted activity protection lost; terminating runtime: %s", error)
             os._exit(1)
 

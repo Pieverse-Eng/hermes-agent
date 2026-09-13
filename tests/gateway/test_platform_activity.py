@@ -313,11 +313,63 @@ async def test_stream_loss_with_live_handles_fails_closed(activity_env, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_idle_stream_loss_reconnects_after_all_requests_settle(activity_env):
+    """A fully idle producer can establish a new supervisor stream safely."""
+    disconnect = asyncio.Event()
+    connected = 0
+
+    async def handler(reader, writer):
+        nonlocal connected
+        connected += 1
+        connection = connected
+        try:
+            while raw := await reader.readline():
+                request = json.loads(raw)
+                response = {
+                    'version': 1,
+                    'ok': True,
+                    'operation': request['operation'],
+                    'requestId': request['requestId'],
+                }
+                if request['operation'] == 'start':
+                    response['activityHandle'] = request['admissionId']
+                writer.write((json.dumps(response) + '\n').encode())
+                await writer.drain()
+                if connection == 1 and request['operation'] == 'finish':
+                    await disconnect.wait()
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+        finally:
+            writer.close()
+
+    server = await asyncio.start_unix_server(handler, str(activity_env))
+    client = PlatformActivityClient()
+    try:
+        first = await client.start()
+        await first.finish()
+        disconnect.set()
+        await asyncio.wait_for(client._reader_task, 2)
+
+        second = await client.start()
+        assert second.active
+        await second.finish()
+        assert connected == 2
+    finally:
+        disconnect.set()
+        await client.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('invalid', [
     {'version': 2}, {'operation': 'finish'}, {'activityHandle': ''},
 ])
-async def test_invalid_admission_ack_closes_unusable_producer(activity_env, invalid):
+async def test_invalid_admission_ack_closes_unusable_producer(activity_env, invalid, monkeypatch):
     disconnected = asyncio.Event()
+    exit_codes = []
+    monkeypatch.setattr('gateway.platform_activity.os._exit', exit_codes.append)
 
     async def handler(reader, writer):
         request = json.loads(await reader.readline())
@@ -339,6 +391,7 @@ async def test_invalid_admission_ack_closes_unusable_producer(activity_env, inva
         with pytest.raises(PlatformActivityError):
             await client.start()
         await asyncio.wait_for(disconnected.wait(), 2)
+        assert exit_codes == [1]
         with pytest.raises(PlatformActivityError, match='producer has failed'):
             await client.start()
     finally:

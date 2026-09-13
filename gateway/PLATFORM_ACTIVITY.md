@@ -10,8 +10,9 @@ executor cancellation behavior.
 
 A message turn acquires residency before entering the agent path. Its
 `platform_activity_scope` propagates that admission to blocking work submitted
-through `platform_run_in_executor`, including the normal gateway executor and
-pre-turn context compression. Cancelling or timing out an executor *wait* does
+through `platform_run_in_executor` or `platform_to_thread`, including message
+preparation, the normal gateway executor and pre-turn context compression.
+Cancelling or timing out an executor *wait* does
 not stop the Python thread. The lease therefore retains the actual executor
 future and finishes only after all of its workers exit. Once finishing begins,
 that scope refuses additional submissions before scheduling a worker.
@@ -30,6 +31,8 @@ terminal failure and closes its event stream.
 | Start/finish ACK deadline | Replay identical bytes and request ID on the existing stream. |
 | Sibling admission/cancellation | Preserve every other handle and its heartbeat ownership. |
 | Permanent producer stream failure with live handles | Exit the hosted process with status 1. |
+| Idle stream EOF after every request settles | Reconnect on the next admission. |
+| Stream loss with an unresolved request | Exit because commit state is uncertain. |
 
 ## Why response deadlines do not close the stream
 
@@ -44,14 +47,15 @@ settlement continues waiting conservatively; a cancelled caller can also remain
 in settlement until the result is known.
 
 Permanent connection loss is different: the supervisor stops renewing that
-producer's handles. Python cannot forcibly cancel a running executor thread.
-Continuing the hosted process would therefore allow real work to outlive its
-residency protection. The client fails closed with `os._exit(1)` when live
-handles lose the stream; the platform owns restart/recovery and expiry of the
-old leases. This bypasses Python shutdown cleanup intentionally, since cleanup
-cannot guarantee that executor threads stop. The public client's explicit
-`close()` is for callers that have already stopped their workers (including test
-teardown), not recovery of an uncertain request.
+producer's handles. Python cannot forcibly cancel a running executor thread,
+and a request without an acknowledgement may already have committed. The client
+fails closed with `os._exit(1)` when a live handle or unresolved request loses
+the stream; the platform owns restart/recovery and expiry of the old leases.
+This bypasses Python shutdown cleanup intentionally, since cleanup cannot
+guarantee that executor threads stop. A stream that closes after all requests
+and handles settle owns no remote state, so the next admission reconnects. The
+public client's explicit `close()` is for callers that have already stopped
+their workers (including test teardown), not recovery of an uncertain request.
 
 The owning behavior suites are `test_platform_activity.py`,
 `test_platform_activity_workers.py`, `test_api_server.py`, and

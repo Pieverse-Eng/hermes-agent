@@ -77,6 +77,57 @@ async def test_gateway_cancellation_retains_actual_worker(monkeypatch, cancel_co
 
 
 @pytest.mark.asyncio
+async def test_gateway_cancellation_retains_message_preparation_worker(monkeypatch):
+    """Cancellation cannot release residency while pre-agent thread work continues."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    entered = asyncio.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    loop = asyncio.get_running_loop()
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+
+    def recover_topic(source):
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            release.wait(10)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(runner, '_recover_telegram_topic_thread_id', recover_topic)
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'turn')
+    monkeypatch.setattr(
+        'gateway.platform_activity.begin_platform_activity',
+        AsyncMock(return_value=lease),
+    )
+    event = MessageEvent(
+        text='hello',
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id='preparation-review',
+    )
+    task = asyncio.create_task(runner._handle_message(event))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        task.cancel()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not exited.is_set()
+        assert not task.done()
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.to_thread(exited.wait, 3)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    client.finish.assert_awaited_once_with('turn')
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('worker_fails', [False, True])
 async def test_abandoned_wait_and_cancelled_finish_keep_worker(worker_fails):
     entered = asyncio.Event()

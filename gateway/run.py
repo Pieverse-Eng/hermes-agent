@@ -16446,6 +16446,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        from gateway.platform_activity import platform_to_thread
+
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -16461,7 +16463,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
         # last-active topic so a cross-topic Reply or stripped plain reply
         # doesn't fragment the conversation across sessions.
-        recovered = await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
+        recovered = await platform_to_thread(self._recover_telegram_topic_thread_id, source)
         if recovered is not None:
             logger.info(
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
@@ -16487,7 +16489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+        if await platform_to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
@@ -16535,13 +16537,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     bound_session_id
                     and bound_session_id != str(binding.get("session_id") or "")
                 ):
-                    await asyncio.to_thread(
+                    await platform_to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compression-tip-walk",
                     )
             else:
                 try:
-                    await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
+                    await platform_to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
         # Capture and immediately consume was_auto_reset so it does not
@@ -16682,7 +16684,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = await asyncio.to_thread(
+                            session_info = await platform_to_thread(
                                 self._reset_notice_session_info, source
                             )
                             if session_info:
@@ -17345,7 +17347,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _quick_key, run_generation, _hyg_new_sid
                                             )
                                             await self.async_session_store._save()
-                                            await asyncio.to_thread(
+                                            await platform_to_thread(
                                                 self._sync_telegram_topic_binding,
                                                 source, session_entry,
                                                 reason="hygiene-compression",
@@ -17868,7 +17870,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key,
                         source,
                     )
-                    await asyncio.to_thread(
+                    await platform_to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="agent-result-compression",
                     )
@@ -18111,7 +18113,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # forever (#35809 — regression of the #9893/#10063 auto-reset).
                     # No-op on non-topic lanes.
                     session_entry = new_entry
-                    await asyncio.to_thread(
+                    await platform_to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compression-exhausted-reset",
                     )
