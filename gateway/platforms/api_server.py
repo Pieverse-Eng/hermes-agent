@@ -46,7 +46,7 @@ import hmac
 import itertools
 import json
 from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from functools import wraps
 import logging
 import os
@@ -6743,13 +6743,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # no provider/tool work can begin without the supervisor's fenced
         # platform lease.  Outside hosted lifecycle mode this is an inert
         # no-op and preserves the ordinary API behaviour.
-        from gateway.platform_activity import begin_platform_activity
+        from gateway.platform_activity import (
+            begin_platform_activity,
+            platform_activity_scope,
+        )
 
         platform_activity_lease = await begin_platform_activity()
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
-            executor_future = loop.run_in_executor(None, _run)
+            with platform_activity_scope(platform_activity_lease):
+                context = copy_context()
+                executor_future = loop.run_in_executor(None, context.run, _run)
             if platform_activity_lease.active:
                 return await _await_executor_completion(executor_future)
             return await executor_future
@@ -7147,7 +7152,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                executor_future = asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                from gateway.platform_activity import platform_activity_scope
+                with platform_activity_scope(platform_activity_lease):
+                    context = copy_context()
+                    executor_future = asyncio.get_running_loop().run_in_executor(
+                        None, context.run, _run_sync
+                    )
                 if platform_activity_lease.active:
                     result, usage = await _await_executor_completion(executor_future)
                 else:

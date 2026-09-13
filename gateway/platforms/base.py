@@ -20,6 +20,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from gateway.platform_activity import (
@@ -5478,6 +5479,97 @@ class BasePlatformAdapter(ABC):
             return
         self._start_session_processing(pending_event, session_key)
 
+    async def _send_platform_activity_refusal(self, event: MessageEvent) -> None:
+        """Tell the caller that this message lost admission without running it."""
+        try:
+            await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=(
+                    "⏳ This agent is preparing its runtime and cannot accept new work yet. "
+                    "Please retry shortly."
+                ),
+                reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(
+                    _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                ),
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to deliver platform activity refusal: %s", self.name, exc)
+
+    @asynccontextmanager
+    async def _message_platform_activity(
+        self,
+        event: MessageEvent,
+        *,
+        requires_activity: Optional[bool] = None,
+    ):
+        """Own one admission decision for one complete adapter operation."""
+        from gateway.platform_activity import (
+            PlatformActivityError,
+            begin_platform_activity,
+            platform_activity_scope,
+        )
+
+        if requires_activity is None:
+            command = event.get_command()
+            requires_activity = (
+                not command or gateway_command_requires_platform_activity(command)
+            )
+        if not requires_activity:
+            with platform_activity_scope(None):
+                yield True
+            return
+
+        try:
+            lease = await begin_platform_activity()
+        except PlatformActivityError:
+            with platform_activity_scope(None):
+                await self._send_platform_activity_refusal(event)
+                yield False
+            return
+
+        try:
+            with platform_activity_scope(lease):
+                yield True
+        finally:
+            try:
+                await lease.finish()
+            except PlatformActivityError as exc:
+                logger.warning("[%s] Failed to finish message activity lease: %s", self.name, exc)
+
+    async def _dispatch_inline_message(
+        self,
+        event: MessageEvent,
+        *,
+        requires_activity: Optional[bool] = None,
+    ) -> None:
+        """Dispatch and deliver a busy-session message under one admission."""
+        async with self._message_platform_activity(
+            event, requires_activity=requires_activity,
+        ) as admitted:
+            if not admitted:
+                return
+            thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+            handler = self._message_handler
+            if handler is None:
+                return
+            response = await handler(event)
+            text, ephemeral_ttl = self._unwrap_ephemeral(response)
+            if not text:
+                return
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=text,
+                reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(thread_meta),
+            )
+            if ephemeral_ttl > 0 and result.success and result.message_id:
+                self._schedule_ephemeral_delete(
+                    chat_id=event.source.chat_id,
+                    message_id=result.message_id,
+                    ttl_seconds=ephemeral_ttl,
+                )
+
     async def _dispatch_active_session_command(
         self,
         event: MessageEvent,
@@ -5503,57 +5595,56 @@ class BasePlatformAdapter(ABC):
             session_key,
         )
 
-        current_guard = self._active_sessions.get(session_key)
-        command_guard = asyncio.Event()
-        self._active_sessions[session_key] = command_guard
-        thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        async with self._message_platform_activity(event) as admitted:
+            if not admitted:
+                return
+            current_guard = self._active_sessions.get(session_key)
+            command_guard = asyncio.Event()
+            self._active_sessions[session_key] = command_guard
+            thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
-        try:
-            response = await self._message_handler(event)
-            _text, _eph_ttl = self._unwrap_ephemeral(response)
-            # Send the response BEFORE cancelling the old task so the send
-            # cannot be affected by task-cancellation side effects (race
-            # condition fix — issue #18912).  Previously the send happened
-            # after cancel_session_processing, which could silently drop the
-            # "/new" confirmation when an agent was actively running.
-            if _text:
-                logger.info(
-                    "[%s] Sending command '/%s' response (%d chars) to %s",
-                    self.name,
-                    cmd,
-                    len(_text),
-                    event.source.chat_id,
-                )
-                _r = await self._send_with_retry(
-                    chat_id=event.source.chat_id,
-                    content=_text,
-                    reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
-                )
-                if _eph_ttl > 0 and _r.success and _r.message_id:
-                    self._schedule_ephemeral_delete(
-                        chat_id=event.source.chat_id,
-                        message_id=_r.message_id,
-                        ttl_seconds=_eph_ttl,
+            try:
+                response = await self._message_handler(event)
+                _text, _eph_ttl = self._unwrap_ephemeral(response)
+                # Send the response BEFORE cancelling the old task so the send
+                # cannot be affected by task-cancellation side effects (race
+                # condition fix — issue #18912).  Previously the send happened
+                # after cancel_session_processing, which could silently drop the
+                # "/new" confirmation when an agent was actively running.
+                if _text:
+                    logger.info(
+                        "[%s] Sending command '/%s' response (%d chars) to %s",
+                        self.name,
+                        cmd,
+                        len(_text),
+                        event.source.chat_id,
                     )
-            # Old adapter task (if any) is cancelled AFTER the response has
-            # been sent — keeps ordering deterministic and avoids the race.
-            await self.cancel_session_processing(
-                session_key,
-                release_guard=False,
-                discard_pending=False,
-            )
-        except Exception:
-            # On failure, restore the original guard if one still exists so
-            # we don't leave the session in a half-reset state.
-            if self._active_sessions.get(session_key) is command_guard:
-                if session_key in self._session_tasks and current_guard is not None:
-                    self._active_sessions[session_key] = current_guard
-                else:
-                    self._release_session_guard(session_key, guard=command_guard)
-            raise
+                    _r = await self._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=_text,
+                        reply_to=_reply_anchor_for_event(event),
+                        metadata=_mark_notify_metadata(thread_meta),
+                    )
+                    if _eph_ttl > 0 and _r.success and _r.message_id:
+                        self._schedule_ephemeral_delete(
+                            chat_id=event.source.chat_id,
+                            message_id=_r.message_id,
+                            ttl_seconds=_eph_ttl,
+                        )
+                await self.cancel_session_processing(
+                    session_key,
+                    release_guard=False,
+                    discard_pending=False,
+                )
+            except Exception:
+                if self._active_sessions.get(session_key) is command_guard:
+                    if session_key in self._session_tasks and current_guard is not None:
+                        self._active_sessions[session_key] = current_guard
+                    else:
+                        self._release_session_guard(session_key, guard=command_guard)
+                raise
 
-        await self._drain_pending_after_session_command(session_key, command_guard)
+            await self._drain_pending_after_session_command(session_key, command_guard)
 
     async def handle_message(self, event: MessageEvent) -> None:
         """
@@ -5577,7 +5668,10 @@ class BasePlatformAdapter(ABC):
             and event.source.chat_type == "dm"
         )
         if needs_topic_recovery:
-            await platform_to_thread(self._apply_topic_recovery, event)
+            async with self._message_platform_activity(event) as admitted:
+                if not admitted:
+                    return
+                await platform_to_thread(self._apply_topic_recovery, event)
 
         session_key = build_session_key(
             event.source,
@@ -5636,22 +5730,7 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                    response = await self._message_handler(event)
-                    _text, _eph_ttl = self._unwrap_ephemeral(response)
-                    if _text:
-                        _r = await self._send_with_retry(
-                            chat_id=event.source.chat_id,
-                            content=_text,
-                            reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
-                        )
-                        if _eph_ttl > 0 and _r.success and _r.message_id:
-                            self._schedule_ephemeral_delete(
-                                chat_id=event.source.chat_id,
-                                message_id=_r.message_id,
-                                ttl_seconds=_eph_ttl,
-                            )
+                    await self._dispatch_inline_message(event)
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -5687,24 +5766,9 @@ class BasePlatformAdapter(ABC):
                         self.name, session_key,
                     )
                     try:
-                        _thread_meta = _thread_metadata_for_source(
-                            event.source, _reply_anchor_for_event(event)
+                        await self._dispatch_inline_message(
+                            event, requires_activity=False,
                         )
-                        response = await self._message_handler(event)
-                        _text, _eph_ttl = self._unwrap_ephemeral(response)
-                        if _text:
-                            _r = await self._send_with_retry(
-                                chat_id=event.source.chat_id,
-                                content=_text,
-                                reply_to=_reply_anchor_for_event(event),
-                                metadata=_mark_notify_metadata(_thread_meta),
-                            )
-                            if _eph_ttl > 0 and _r.success and _r.message_id:
-                                self._schedule_ephemeral_delete(
-                                    chat_id=event.source.chat_id,
-                                    message_id=_r.message_id,
-                                    ttl_seconds=_eph_ttl,
-                                )
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
@@ -5789,44 +5853,10 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Own hosted residency through processing, delivery, and cleanup."""
-        from gateway.platform_activity import (
-            PlatformActivityError,
-            begin_platform_activity,
-            platform_activity_scope,
-        )
-
-        command = event.get_command()
-        requires_activity = (
-            not command or gateway_command_requires_platform_activity(command)
-        )
-        if not requires_activity:
-            # Control messages intentionally run without a new lease during
-            # drain. They still need a fresh ContextVar boundary because a
-            # queued child task may have copied the prior message's lease.
-            with platform_activity_scope(None):
-                return await self._process_message_background_impl(event, session_key)
-
-        try:
-            lease = await begin_platform_activity()
-        except PlatformActivityError:
-            # The runner owns the established user-facing refusal response.
-            # A queued child task inherits its parent's ContextVars. Explicitly
-            # clear that copied lease before the runner retries admission, or a
-            # completed parent lease can authorize this new message.
-            with platform_activity_scope(None):
-                return await self._process_message_background_impl(event, session_key)
-        try:
-            with platform_activity_scope(lease):
-                return await self._process_message_background_impl(event, session_key)
-        finally:
-            try:
-                await lease.finish()
-            except PlatformActivityError as exc:
-                logger.warning(
-                    "[%s] Failed to finish message-delivery activity lease: %s",
-                    self.name,
-                    exc,
-                )
+        async with self._message_platform_activity(event) as admitted:
+            if not admitted:
+                return
+            return await self._process_message_background_impl(event, session_key)
 
     async def _process_message_background_impl(
         self, event: MessageEvent, session_key: str

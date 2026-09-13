@@ -26,7 +26,12 @@ even when their result is primarily diagnostic. A hosted quick-command cancellat
 terminates its owned process group and retains residency until the shell and
 all live descendants have actually exited; its existing timeout likewise settles them before reporting
 completion. Fire-and-forget background agents acquire their own independent
-admission for their complete execution and delivery lifetime.
+admission for their complete execution and delivery lifetime. A tracked
+`terminal(background=true)` process reserves its originating turn's lease until
+the process registry records its exit. If the gateway respawns while a tracked
+local process survives, startup reacquires one fail-closed lease for the recovered
+process set before serving users. Detached subagent executor futures reserve their
+parent admission through durable completion publication.
 Cancelling or timing out an executor *wait* does
 not stop the Python thread. The lease therefore retains the actual executor
 future and finishes only after all of its workers exit. Once finishing begins,
@@ -36,10 +41,21 @@ independent admission for that message. Failed admission explicitly clears copie
 context before producing the refusal response, and a finishing or completed
 hosted lease rejects any worker that reaches it.
 
+The adapter owns one admission decision for each complete message operation. A
+refusal is terminal for that operation: nested runner and slash handlers do not
+retry, because a later retry could protect only the inner work and release before
+adapter delivery. Busy-session commands use the same adapter envelope through
+inline delivery. Telegram topic recovery uses an admitted preparation envelope
+before session keying. Clarify replies and the four drain controls settle work
+that is already admitted, so they remain available without opening a second
+handle after drain has paused new starts.
+
 API chat/response work and `/v1/runs` keep their own admitted executor lifetimes.
 Hosted API cancellation waits through repeated cancellation until the actual
-worker exits. An accepted `/v1/runs` request whose admission fails receives a
-terminal failure and closes its event stream.
+worker exits. Both executor paths propagate the admitted scope, so detached
+terminal processes and subagents created by API work retain residency too. An
+accepted `/v1/runs` request whose admission fails receives a terminal failure
+and closes its event stream.
 
 | Event | Required behavior |
 | --- | --- |

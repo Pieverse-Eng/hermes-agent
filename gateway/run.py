@@ -11099,7 +11099,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
+                from gateway.platform_activity import (
+                    begin_platform_activity,
+                    platform_activity_enabled,
+                )
+                if platform_activity_enabled():
+                    recovery_lease = await begin_platform_activity()
+                    retained = process_registry.retain_running_with_platform_activity(
+                        recovery_lease
+                    )
+                    if retained:
+                        finish_recovery_lease = asyncio.create_task(recovery_lease.finish())
+                        self._background_tasks.add(finish_recovery_lease)
+                        finish_recovery_lease.add_done_callback(self._background_tasks.discard)
+                        logger.info(
+                            "Protected %d recovered background process(es) with "
+                            "hosted runtime activity",
+                            retained,
+                        )
+                    else:
+                        await recovery_lease.finish()
         except Exception as e:
+            from gateway.platform_activity import platform_activity_enabled
+            if platform_activity_enabled():
+                raise
             logger.warning("Process checkpoint recovery: %s", e)
 
         # Suspend sessions that were active when the gateway last exited.

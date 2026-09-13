@@ -438,9 +438,13 @@ class TestAgentExecution:
         loop = asyncio.get_running_loop()
         mock_agent = MagicMock()
         lease = MagicMock()
+        lease.active = True
         lease.finish = AsyncMock()
+        worker_leases = []
 
         def _run(**_kwargs):
+            from gateway.platform_activity import current_platform_activity_lease
+            worker_leases.append(current_platform_activity_lease())
             loop.call_soon_threadsafe(entered.set)
             try:
                 release.wait(timeout=5)
@@ -479,6 +483,7 @@ class TestAgentExecution:
             with pytest.raises(asyncio.CancelledError):
                 await task
             assert exited.is_set()
+            assert worker_leases == [lease]
             lease.finish.assert_awaited_once_with()
 
 

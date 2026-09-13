@@ -15,11 +15,12 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 _LOG = logging.getLogger(__name__)
 _PROTOCOL_VERSION = 1
@@ -93,9 +94,11 @@ class PlatformActivityLease:
     _workers: set[asyncio.Future[Any]] = field(default_factory=set)
     _finish_task: Optional[asyncio.Task[None]] = None
     _was_admitted: bool = field(init=False)
+    _loop: asyncio.AbstractEventLoop = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._was_admitted = self._handle is not None
+        self._loop = asyncio.get_running_loop()
 
     @property
     def active(self) -> bool:
@@ -124,12 +127,70 @@ class PlatformActivityLease:
 
     async def _finish_when_idle(self) -> None:
         # Executor wrappers can time out or be cancelled without stopping their
-        # threads. Ownership stays here until every actual worker has exited.
-        if self._workers:
-            await asyncio.gather(*self._workers, return_exceptions=True)
+        # threads. A live worker can also retain a detached child immediately
+        # before it exits, so re-read the set until no registered work remains.
+        while pending := [worker for worker in self._workers if not worker.done()]:
+            await asyncio.gather(*pending, return_exceptions=True)
         if self._handle is not None:
             await self._client.finish(self._handle)
             self._handle = None
+
+    def reserve(self) -> Callable[[], None]:
+        """Retain this lease for detached work registered from a worker thread."""
+        if not self._was_admitted:
+            return lambda: None
+
+        registered = threading.Event()
+        holder: dict[str, Any] = {}
+
+        def register() -> None:
+            if self.stale:
+                holder["error"] = PlatformActivityError(
+                    "platform activity is already finishing or finished"
+                )
+            else:
+                future = self._loop.create_future()
+                self._workers.add(future)
+                holder["future"] = future
+            registered.set()
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is self._loop:
+            register()
+        else:
+            self._loop.call_soon_threadsafe(register)
+            if not registered.wait(timeout=5):
+                raise PlatformActivityError(
+                    "timed out registering detached platform activity"
+                )
+
+        error = holder.get("error")
+        if error is not None:
+            raise error
+        future = holder["future"]
+        release_lock = threading.Lock()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            with release_lock:
+                if released:
+                    return
+                released = True
+
+            def settle() -> None:
+                if not future.done():
+                    future.set_result(None)
+
+            try:
+                self._loop.call_soon_threadsafe(settle)
+            except RuntimeError:
+                pass
+
+        return release
 
 
 @contextmanager
@@ -164,6 +225,14 @@ async def platform_to_thread(func, /, *args, **kwargs) -> Any:
         lease._workers.add(worker)
         return await asyncio.shield(worker)
     return await worker
+
+
+def reserve_platform_activity() -> Callable[[], None]:
+    """Reserve the current lease until a detached operation calls the result."""
+    lease = _current_lease.get()
+    if lease is None or not lease.active:
+        return lambda: None
+    return lease.reserve()
 
 
 class PlatformActivityClient:

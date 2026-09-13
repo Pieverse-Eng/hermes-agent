@@ -45,7 +45,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -138,6 +138,7 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _platform_activity_release: Optional[Callable[[], None]] = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -723,6 +724,8 @@ class ProcessRegistry:
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        from gateway.platform_activity import reserve_platform_activity
+        session._platform_activity_release = reserve_platform_activity()
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -778,19 +781,26 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {safe_command}"],
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                [user_shell, "-lic", f"set +m; {safe_command}"],
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                **_popen_kwargs,
+            )
+        except Exception:
+            release_activity = session._platform_activity_release
+            if release_activity is not None:
+                release_activity()
+            session._platform_activity_release = None
+            raise
 
         session.process = proc
         session.pid = proc.pid
@@ -831,6 +841,10 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            release_activity = session._platform_activity_release
+            if release_activity is not None:
+                release_activity()
+            session._platform_activity_release = None
             raise
 
         return session
@@ -865,6 +879,8 @@ class ProcessRegistry:
             env_ref=env,
             pid_scope="sandbox",
         )
+        from gateway.platform_activity import reserve_platform_activity
+        session._platform_activity_release = reserve_platform_activity()
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
@@ -932,6 +948,10 @@ class ProcessRegistry:
 
         if not session.exited:
             self._write_checkpoint()
+        elif session._platform_activity_release is not None:
+            release_activity = session._platform_activity_release
+            release_activity()
+            session._platform_activity_release = None
 
         return session
 
@@ -1189,6 +1209,8 @@ class ProcessRegistry:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         session._completion_event.set()
+        release_activity = session._platform_activity_release
+        session._platform_activity_release = None
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
@@ -1211,6 +1233,8 @@ class ProcessRegistry:
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
             })
+        if release_activity is not None:
+            release_activity()
 
     # ----- Query Methods -----
 
@@ -1952,6 +1976,31 @@ class ProcessRegistry:
 
         with self._lock:
             return any(not s.exited for s in self._running.values())
+
+    def retain_running_with_platform_activity(self, lease) -> int:
+        """Attach recovered live processes to one newly admitted hosted lease."""
+        with self._lock:
+            sessions = [
+                session
+                for session in self._running.values()
+                if not session.exited and session._platform_activity_release is None
+            ]
+
+        retained = 0
+        for session in sessions:
+            release = lease.reserve()
+            with self._lock:
+                current = self._running.get(session.id)
+                if (
+                    current is session
+                    and not session.exited
+                    and session._platform_activity_release is None
+                ):
+                    session._platform_activity_release = release
+                    retained += 1
+                    continue
+            release()
+        return retained
 
     def snapshot_running_ids(self, task_id: str) -> frozenset[str]:
         """Capture running process IDs owned by ``task_id``.

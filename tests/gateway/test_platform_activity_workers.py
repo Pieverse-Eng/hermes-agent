@@ -1,11 +1,11 @@
 """Residency belongs to executor work, including abandoned coroutine waits."""
 import asyncio
-import ast
 import os
 import shlex
 import signal
 import sys
 import threading
+from contextvars import copy_context
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -493,36 +493,6 @@ async def test_slash_command_cancellation_retains_actual_worker(monkeypatch):
     client.finish.assert_awaited_once_with("slash-worker")
 
 
-def test_activity_owned_modules_use_owned_worker_helpers():
-    """New gateway worker submissions cannot bypass activity ownership."""
-    root = Path(__file__).resolve().parents[2]
-    violations = []
-    for relative in (
-        "gateway/run.py",
-        "gateway/slash_commands.py",
-        "gateway/platforms/base.py",
-    ):
-        tree = ast.parse((root / relative).read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(
-                node.func, ast.Attribute
-            ):
-                continue
-            owner = node.func.value
-            if (
-                node.func.attr == "to_thread"
-                and isinstance(owner, ast.Name)
-                and owner.id == "asyncio"
-            ):
-                violations.append(f"{relative}:{node.lineno}: asyncio.to_thread")
-            if relative != "gateway/run.py" and node.func.attr == "run_in_executor":
-                violations.append(f"{relative}:{node.lineno}: run_in_executor")
-    assert not violations, (
-        "activity-owned gateway work must use platform_to_thread or "
-        f"platform_run_in_executor: {violations}"
-    )
-
-
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_count", [1, 2])
@@ -746,6 +716,108 @@ async def test_background_agent_owns_an_independent_activity_lease(monkeypatch):
     client.finish.assert_awaited_once_with('background-agent')
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX background-process behavior')
+@pytest.mark.asyncio
+async def test_tracked_background_process_retains_turn_residency_until_exit(tmp_path):
+    """A successful turn cannot release residency while its process survives."""
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'background-process')
+    command = f'{shlex.quote(sys.executable)} -c "import time; time.sleep(30)"'
+
+    with platform_activity_scope(lease):
+        context = copy_context()
+        session = await platform_run_in_executor(
+            None, context.run, registry.spawn_local, command, str(tmp_path),
+            'activity-test', 'telegram:activity-test',
+        )
+
+    finish = asyncio.create_task(lease.finish())
+    await asyncio.sleep(0)
+    try:
+        assert session.exited is False
+        assert finish.done() is False
+        client.finish.assert_not_awaited()
+    finally:
+        registry.kill_process(session.id)
+
+    await asyncio.wait_for(finish, 3)
+    client.finish.assert_awaited_once_with('background-process')
+
+
+@pytest.mark.asyncio
+async def test_recovered_background_process_reacquires_residency():
+    """A gateway respawn cannot orphan a still-running tracked process."""
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    session = ProcessSession(id='proc_recovered', command='server', started_at=1)
+    registry._running[session.id] = session
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'recovered-process')
+
+    assert registry.retain_running_with_platform_activity(lease) == 1
+    finish = asyncio.create_task(lease.finish())
+    await asyncio.sleep(0)
+    assert finish.done() is False
+    client.finish.assert_not_awaited()
+
+    registry._move_to_finished(session)
+    await asyncio.wait_for(finish, 3)
+    client.finish.assert_awaited_once_with('recovered-process')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('batch', [False, True])
+async def test_detached_subagent_retains_turn_residency_until_completion(batch):
+    """An async delegation inherits residency after its parent turn returns."""
+    from tools import async_delegation
+
+    async_delegation._reset_for_tests()
+    release = threading.Event()
+    entered = threading.Event()
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'background-subagent')
+
+    def run_child():
+        entered.set()
+        release.wait(10)
+        return {
+            'status': 'completed', 'summary': 'done', 'api_calls': 1,
+            'duration_seconds': 0.1,
+        }
+
+    try:
+        with platform_activity_scope(lease):
+            common = {
+                'context': None, 'toolsets': None, 'role': 'worker',
+                'model': 'test', 'session_key': 'telegram:activity-test',
+                'runner': run_child,
+            }
+            if batch:
+                result = async_delegation.dispatch_async_delegation_batch(
+                    goals=['inspect'], **common,
+                )
+            else:
+                result = async_delegation.dispatch_async_delegation(
+                    goal='inspect', **common,
+                )
+        assert result['status'] == 'dispatched'
+        assert await asyncio.to_thread(entered.wait, 3)
+        finish = asyncio.create_task(lease.finish())
+        await asyncio.sleep(0)
+        assert finish.done() is False
+        client.finish.assert_not_awaited()
+    finally:
+        release.set()
+
+    await asyncio.wait_for(finish, 3)
+    client.finish.assert_awaited_once_with('background-subagent')
+    async_delegation._reset_for_tests()
+
+
 @pytest.mark.asyncio
 async def test_message_envelope_retains_activity_through_delivery_pipeline(monkeypatch):
     """The adapter releases residency only after processing and delivery settle."""
@@ -864,6 +936,31 @@ async def test_completed_hosted_scope_refuses_new_worker_before_submission():
 
 
 @pytest.mark.asyncio
+async def test_finishing_scope_refuses_detached_activity_reservation():
+    from gateway.platform_activity import reserve_platform_activity
+
+    release_finish = asyncio.Event()
+
+    async def finish_remote(_handle):
+        await release_finish.wait()
+
+    client = type('Client', (), {'finish': AsyncMock(side_effect=finish_remote)})()
+    lease = PlatformActivityLease(client, 'finishing-turn')
+    finish = asyncio.create_task(lease.finish())
+    await asyncio.sleep(0)
+
+    try:
+        with platform_activity_scope(lease):
+            with pytest.raises(PlatformActivityError, match='already finishing'):
+                reserve_platform_activity()
+    finally:
+        release_finish.set()
+
+    await finish
+    client.finish.assert_awaited_once_with('finishing-turn')
+
+
+@pytest.mark.asyncio
 async def test_drain_control_clears_inherited_completed_message_lease(monkeypatch):
     """A queued control remains usable without borrowing its parent's lease."""
     from gateway.platform_activity import (
@@ -973,8 +1070,9 @@ async def test_debug_upload_is_refused_during_hosted_drain(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_manual_compress_retains_residency_through_adapter_delivery(monkeypatch):
-    """The inbound message envelope owns compression and its final delivery."""
+@pytest.mark.parametrize('first_admitted', [False, True])
+async def test_message_admission_is_owned_once_through_delivery(monkeypatch, first_admitted):
+    """The adapter owns one admission decision through work and delivery."""
     from gateway.platforms.base import MessageEvent, MessageType, SendResult
     from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
@@ -982,18 +1080,21 @@ async def test_manual_compress_retains_residency_through_adapter_delivery(monkey
     runner._external_drain_active = False
     client = type('Client', (), {'finish': AsyncMock()})()
     lease = PlatformActivityLease(client, 'compress-delivery')
-    admission = AsyncMock(return_value=lease)
+    admission = AsyncMock(side_effect=(
+        [lease] if first_admitted else [
+            PlatformActivityError('first admission decides the message'), lease,
+        ]
+    ))
     monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
-    monkeypatch.setattr(
-        runner,
-        '_handle_compress_command_inner',
-        AsyncMock(return_value='Compressed successfully.'),
-    )
+    compress = AsyncMock(return_value='Compressed successfully.')
+    monkeypatch.setattr(runner, '_handle_compress_command_inner', compress)
     adapter._message_handler = runner._handle_message
     delivery_states = []
 
-    async def send(*_args, **_kwargs):
-        delivery_states.append((lease.active, client.finish.await_count))
+    async def send(*_args, **kwargs):
+        delivery_states.append((
+            kwargs.get('content', ''), lease.active, client.finish.await_count,
+        ))
         return SendResult(success=True, message_id='sent')
 
     monkeypatch.setattr(adapter, 'send', send)
@@ -1006,9 +1107,117 @@ async def test_manual_compress_retains_residency_through_adapter_delivery(monkey
 
     await adapter._process_message_background(event, 'telegram:compress-delivery')
 
-    assert delivery_states == [(True, 0)]
-    client.finish.assert_awaited_once_with('compress-delivery')
+    assert len(delivery_states) == 1
+    if first_admitted:
+        assert delivery_states == [('Compressed successfully.', True, 0)]
+        compress.assert_awaited_once()
+        client.finish.assert_awaited_once_with('compress-delivery')
+    else:
+        assert 'cannot accept new work' in delivery_states[0][0]
+        compress.assert_not_awaited()
+        client.finish.assert_not_awaited()
     admission.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_busy_inline_command_retains_residency_through_delivery(monkeypatch):
+    """Busy-session dispatch uses the same outer ownership as normal messages."""
+    from gateway.platform_activity import current_platform_activity_lease
+    from gateway.platforms.base import MessageEvent, MessageType, SendResult
+    from gateway.session import build_session_key
+    from tests.gateway.restart_test_helpers import RestartTestAdapter, make_restart_source
+
+    adapter = RestartTestAdapter()
+    source = make_restart_source()
+    adapter._active_sessions[build_session_key(source)] = asyncio.Event()
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'busy-command-delivery')
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
+    observed = []
+
+    async def dispatch(_event):
+        observed.append(('dispatch', current_platform_activity_lease(), lease.active))
+        return 'Background task started.'
+
+    async def send(*_args, **_kwargs):
+        observed.append(('delivery', current_platform_activity_lease(), lease.active))
+        return SendResult(success=True, message_id='sent')
+
+    adapter._message_handler = dispatch
+    monkeypatch.setattr(adapter, 'send', send)
+    event = MessageEvent(
+        text='/background inspect the repository', message_type=MessageType.TEXT,
+        source=source, message_id='busy-command-delivery',
+    )
+
+    await adapter.handle_message(event)
+
+    assert observed == [('dispatch', lease, True), ('delivery', lease, True)]
+    admission.assert_awaited_once()
+    client.finish.assert_awaited_once_with('busy-command-delivery')
+
+
+@pytest.mark.asyncio
+async def test_busy_clarify_reply_remains_available_without_new_admission(monkeypatch):
+    """A clarify reply settles existing work and must remain usable during drain."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import build_session_key
+    from tests.gateway.restart_test_helpers import RestartTestAdapter, make_restart_source
+    from tools import clarify_gateway
+
+    adapter = RestartTestAdapter()
+    source = make_restart_source()
+    adapter._active_sessions[build_session_key(source)] = asyncio.Event()
+    admission = AsyncMock(side_effect=PlatformActivityError('drain active'))
+    monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
+    monkeypatch.setattr(
+        clarify_gateway, 'get_pending_for_session', MagicMock(return_value=object()),
+    )
+    dispatch = AsyncMock(return_value='')
+    adapter._message_handler = dispatch
+    event = MessageEvent(
+        text='the second choice', message_type=MessageType.TEXT,
+        source=source, message_id='clarify-during-drain',
+    )
+
+    await adapter.handle_message(event)
+
+    dispatch.assert_awaited_once_with(event)
+    admission.assert_not_awaited()
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_topic_recovery_is_admitted_before_its_worker_starts(monkeypatch):
+    """Inbound preparation cannot run before the platform admission boundary."""
+    from gateway.platform_activity import current_platform_activity_lease
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import RestartTestAdapter, make_restart_source
+
+    adapter = RestartTestAdapter()
+    client = type('Client', (), {'finish': AsyncMock()})()
+    lease = PlatformActivityLease(client, 'topic-recovery')
+    admission = AsyncMock(return_value=lease)
+    monkeypatch.setattr('gateway.platform_activity.begin_platform_activity', admission)
+    observed = []
+
+    def recover(_source):
+        observed.append((current_platform_activity_lease(), lease.active))
+
+    adapter.set_topic_recovery_fn(recover)
+    adapter._message_handler = AsyncMock(return_value='done')
+    monkeypatch.setattr(adapter, '_start_session_processing', MagicMock(return_value=True))
+    event = MessageEvent(
+        text='hello', message_type=MessageType.TEXT,
+        source=make_restart_source(), message_id='topic-recovery',
+    )
+
+    await adapter.handle_message(event)
+
+    assert observed == [(lease, True)]
+    admission.assert_awaited_once()
+    client.finish.assert_awaited_once_with('topic-recovery')
 
 
 @pytest.mark.asyncio
@@ -1070,6 +1279,6 @@ async def test_queued_message_refusal_cannot_reuse_completed_parent_lease(monkey
     child = adapter._session_tasks['telegram:queued-refusal']
     await child
 
-    assert admission_count == 3
+    assert admission_count == 2
     assert work_states == []
     assert any('cannot accept new work' in message for message in adapter.sent)

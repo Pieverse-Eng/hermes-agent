@@ -778,6 +778,8 @@ def dispatch_async_delegation(
 
     _persist_dispatch(record)
     executor = _get_executor(max_async_children)
+    from gateway.platform_activity import reserve_platform_activity
+    release_platform_activity = reserve_platform_activity()
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -801,8 +803,10 @@ def dispatch_async_delegation(
     try:
         # Propagate the dispatching profile so the detached child resolves
         # get_hermes_home() under the right profile.
-        executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_worker))
+        future.add_done_callback(lambda _future: release_platform_activity())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
+        release_platform_activity()
         with _records_lock:
             _records.pop(delegation_id, None)
         _delete_durable_delegation(delegation_id)
@@ -1014,6 +1018,8 @@ def dispatch_async_delegation_batch(
 
     _persist_dispatch(record)
     executor = _get_executor(max_async_children)
+    from gateway.platform_activity import reserve_platform_activity
+    release_platform_activity = reserve_platform_activity()
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
@@ -1042,8 +1048,10 @@ def dispatch_async_delegation_batch(
 
     try:
         # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_worker))
+        future.add_done_callback(lambda _future: release_platform_activity())
     except Exception as exc:  # pragma: no cover
+        release_platform_activity()
         with _records_lock:
             _records.pop(delegation_id, None)
         _delete_durable_delegation(delegation_id)

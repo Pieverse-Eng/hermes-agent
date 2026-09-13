@@ -128,7 +128,15 @@ class TestStartRun:
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
                 mock_agent = MagicMock()
-                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                worker_leases = []
+
+                def run_conversation(**_kwargs):
+                    worker_leases.append(
+                        platform_activity.current_platform_activity_lease()
+                    )
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = run_conversation
                 mock_agent.session_prompt_tokens = 10
                 mock_agent.session_completion_tokens = 5
                 mock_agent.session_total_tokens = 15
@@ -139,6 +147,9 @@ class TestStartRun:
                 data = await resp.json()
                 assert data["status"] == "started"
                 assert data["run_id"].startswith("run_")
+                await adapter._active_run_tasks[data["run_id"]]
+                assert len(worker_leases) == 1
+                assert worker_leases[0] is not None
 
                 status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
                 assert status_resp.status == 200
