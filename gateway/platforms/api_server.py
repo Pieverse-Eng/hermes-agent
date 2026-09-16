@@ -2024,6 +2024,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users),
             ("POST", "/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users),
             ("POST", "/internal/platform/gateway/reload", self._handle_internal_gateway_reload),
+            ("POST", "/internal/platform/skills/reload", self._handle_internal_skills_reload),
             ("POST", "/internal/platform/gateway/prewarm-session", self._handle_internal_gateway_prewarm_session),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
@@ -3432,6 +3433,43 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.exception("internal platform approved-users sync failed")
             return web.json_response(_openai_error("approved-users sync failed", err_type="server_error"), status=500)
         return web.json_response({"ok": True, "platform": "telegram", "users": users})
+
+    async def _handle_internal_skills_reload(self, request: "web.Request") -> "web.Response":
+        """Authenticated Skill Store activation; never request a gateway restart."""
+        if not self._expected_api_key():
+            return web.json_response(_openai_error("API_SERVER_KEY is required"), status=401)
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err is not None:
+            return err
+        skill = body.get("skill")
+        if skill is not None and (
+            not isinstance(skill, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]*(?::[a-z0-9][a-z0-9-]*)?", skill)
+        ):
+            return web.json_response(_openai_error("Invalid skill slug"), status=400)
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return web.json_response(_openai_error("gateway runner is not attached"), status=503)
+        from gateway.platform_activity import begin_platform_activity, platform_activity_scope
+        from gateway.platform_skill_reload import SkillActivationError, reload_platform_skills
+
+        lease = None
+        try:
+            lease = await begin_platform_activity()
+            with platform_activity_scope(lease):
+                result = await reload_platform_skills(runner, skill)
+            return web.json_response({"ok": True, **result})
+        except SkillActivationError as exc:
+            return web.json_response(_openai_error(str(exc)), status=422)
+        except Exception:
+            logger.exception("internal platform skills reload failed")
+            return web.json_response(_openai_error("Skill reload failed", err_type="server_error"), status=503)
+        finally:
+            if lease is not None:
+                await lease.finish()
 
     async def _handle_internal_gateway_reload(self, request: "web.Request") -> "web.Response":
         """POST /internal/platform/gateway/reload — request a gateway restart/reload."""
