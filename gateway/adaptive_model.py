@@ -12,6 +12,7 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -61,15 +62,18 @@ def adaptive_observability_headers(decision: dict[str, Any] | None) -> dict[str,
 
 def _task_id(ctx: Any) -> str:
     session_id = str(ctx.session_id or ctx.session_key or "unknown-session")
-    inbound_id = ctx.event_message_id
+    inbound_id = ctx.inbound_message_id
     if not inbound_id:
-        inbound_id = (
-            "restore"
-            if not str(ctx.message or "").strip()
-            else f"run-{ctx.run_generation}"
-        )
-    inbound_id = str(inbound_id)
-    return f"hermes:{session_id}:{inbound_id}"[:256]
+        # Generations are process-local and shared by completed queued turns.
+        # Latch a fresh identity for this turn; the request is persisted before
+        # scoring so explicit recovery can replay it after a restart.
+        inbound_id = f"synthetic-{uuid.uuid4().hex}"
+        ctx.inbound_message_id = inbound_id
+    task_id = f"hermes:{session_id}:{inbound_id}"
+    if len(task_id) > 256:
+        # Keep long native IDs distinct instead of truncating their suffixes.
+        task_id = f"hermes:{uuid.uuid5(uuid.NAMESPACE_URL, task_id).hex}"
+    return task_id
 
 
 def _semantic_text(content: Any) -> str | None:
@@ -269,10 +273,14 @@ def resolve_adaptive_model(
     stored = (
         session_store.get_session_metadata(ctx.session_key, _METADATA_KEY, {}) or {}
     )
-    # Startup auto-resume has no inbound event/message of its own.  It is the
-    # same native task, so replay the exact persisted request identity rather
-    # than synthesizing a generic "restore" task.
-    if not str(ctx.message or "").strip() and stored.get("request"):
+    # Both blank startup restoration and a real message with the native
+    # resume-pending marker continue the saved task. Replay only a receipt for
+    # the same session; arbitrary post-completion messages start a new task.
+    if (
+        (ctx.adaptive_resume_pending or not str(ctx.message or "").strip())
+        and stored.get("request", {}).get("sessionId")
+        == str(ctx.session_id or ctx.session_key or "unknown-session")[:256]
+    ):
         request = stored["request"]
         if stored.get("decision") is not None:
             decision = _validate_decision(
@@ -291,7 +299,7 @@ def resolve_adaptive_model(
     # Persist before network I/O so either a concrete decision or the local
     # scoring-unavailable fallback remains bound to the original task identity.
     persisted = session_store.set_session_metadata(
-        ctx.session_key, _METADATA_KEY, {"request": request}
+        ctx.session_key, _METADATA_KEY, {"request": request}, require_primary=True
     )
     if not persisted:
         raise AdaptiveResolutionError(
@@ -315,6 +323,7 @@ def resolve_adaptive_model(
         ctx.session_key,
         _METADATA_KEY,
         {"request": request, "decision": decision},
+        require_primary=True,
     )
     if not persisted:
         raise AdaptiveResolutionError("adaptive routing could not persist the decision")

@@ -1475,10 +1475,10 @@ class SessionStore:
         if stale_keys or recovered_keys:
             self._save()
 
-    def _save(self) -> None:
+    def _save(self, *, require_primary: bool = False) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        self._persist_routing_data(data, generation, require_primary=require_primary)
 
     def _next_routing_generation_locked(self) -> int:
         """Bump and return the shared routing counter. Caller holds ``_lock``.
@@ -1499,7 +1499,9 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self, data: Dict[str, Any], generation: int, *, require_primary: bool = False
+    ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
@@ -1530,11 +1532,22 @@ class SessionStore:
                         )
                         db_saved = True
                     except Exception as exc:
+                        if require_primary:
+                            raise
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+            if require_primary and not db_saved:
+                raise RuntimeError("authoritative session database is unavailable")
             if getattr(self, "_write_sessions_json", True) or not db_saved:
-                self._save_sessions_json(data)
+                try:
+                    self._save_sessions_json(data)
+                except Exception:
+                    if not require_primary:
+                        raise
+                    # The DB commit is authoritative. A failed legacy mirror
+                    # must not turn a committed receipt into a reported failure.
+                    logger.warning("gateway.session: legacy routing mirror save failed")
             self._persisted_routing_generation = generation
             # This rewrite supersedes fast records at or below its
             # generation; newer ones stay for the next delayed full writer.
@@ -2689,21 +2702,42 @@ class SessionStore:
         session_key: str,
         key: str,
         value: Any,
+        *,
+        require_primary: bool = False,
     ) -> bool:
         """Persist a metadata value on a live session entry.
 
         Values must be small and JSON-serializable — they are written into
         the routing index (state.db gateway_routing table + the legacy
-        sessions.json mirror) so they survive gateway restarts.
+        sessions.json mirror) so they survive gateway restarts. With
+        ``require_primary``, success requires the authoritative SQLite commit;
+        failure restores the prior in-memory metadata and skips the mirror.
         """
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
+            previous_metadata = entry.metadata
+            previous_updated_at = entry.updated_at
+            if require_primary:
+                # An older _save_entries snapshot can still hold this dict.
+                # Isolate the tentative write so rollback cannot leave the
+                # rejected value reachable through that delayed writer.
+                entry.metadata = dict(previous_metadata)
             entry.metadata[key] = value
             entry.updated_at = _now()
-            self._save()
+            try:
+                if require_primary:
+                    self._save(require_primary=True)
+                else:
+                    self._save()
+            except Exception:
+                if not require_primary:
+                    raise
+                entry.metadata = previous_metadata
+                entry.updated_at = previous_updated_at
+                return False
             return True
 
     def set_model_override(

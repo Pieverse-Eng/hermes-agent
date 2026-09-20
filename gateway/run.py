@@ -4409,6 +4409,30 @@ class TurnRunner:
                     ctx._cleanup_msg_ids.append(str(mid))
             _fut.add_done_callback(_track_status_id)
 
+    def _fresh_resume_pending_entry(self):
+        """Use the native recovery marker only for this live session and window."""
+        ctx = self._ctx
+        # A completed queued turn is new work, even while the outer recovery
+        # marker awaits cleanup. Interrupted recursion already carries its snapshot.
+        if not ctx.session_key or ctx._interrupt_depth > 0:
+            return None
+        entry = self._runner.session_store._entries.get(ctx.session_key)
+        if (
+            entry is None
+            or entry.session_id != ctx.session_id
+            or getattr(entry, "suspended", False)
+            or not getattr(entry, "resume_pending", False)
+        ):
+            return None
+        window = _auto_continue_freshness_window()
+        if _is_fresh_gateway_interruption(
+            _last_transcript_timestamp(ctx.history), window_secs=window
+        ) or _is_fresh_gateway_interruption(
+            getattr(entry, "last_resume_marked_at", None), window_secs=window
+        ):
+            return entry
+        return None
+
     def _resolve_native_turn_route(self, model: str, runtime_kwargs: dict) -> dict:
         """Resolve the native turn's primary before signature/construction."""
         ctx = self._ctx
@@ -4417,6 +4441,7 @@ class TurnRunner:
                 ctx.message, model, runtime_kwargs
             )
 
+        ctx.adaptive_resume_pending = self._fresh_resume_pending_entry() is not None
         if ctx.adaptive_snapshot:
             decision = dict(ctx.adaptive_snapshot["decision"])
             selected_model = decision["model"]
@@ -18045,6 +18070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                inbound_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
@@ -24658,6 +24684,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
         _adaptive_snapshot: Optional[dict] = None,
+        inbound_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -24678,6 +24705,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
                 _adaptive_snapshot=_adaptive_snapshot,
+                inbound_message_id=inbound_message_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -24691,6 +24719,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
                 _adaptive_snapshot=_adaptive_snapshot,
+                inbound_message_id=inbound_message_id,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24814,6 +24843,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
         _adaptive_snapshot: Optional[dict] = None,
+        inbound_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -25103,6 +25133,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event_message_id=event_message_id,
             native_modalities=tuple(_native_modalities),
             adaptive_snapshot=_adaptive_snapshot,
+            inbound_message_id=inbound_message_id,
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
@@ -26316,6 +26347,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
+                    inbound_message_id=(pending_event.message_id if pending_event else None),
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
                     _adaptive_snapshot=TurnRunner._adaptive_snapshot_for_followup(

@@ -14,13 +14,14 @@ import threading
 import time
 import types
 from collections import OrderedDict
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, SessionStore
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -384,8 +385,9 @@ async def test_adaptive_turn_evicts_cached_fallback_before_first_inference(
     "interrupted,expected_resolutions",
     [(True, 1), (False, 2)],
 )
+@pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.FEISHU])
 async def test_adaptive_queued_recursion_preserves_only_interrupted_decision(
-    monkeypatch, tmp_path, interrupted, expected_resolutions
+    monkeypatch, tmp_path, interrupted, expected_resolutions, platform
 ):
     """Drive the real queued recursion branch and count native resolutions."""
     calls = []
@@ -424,18 +426,13 @@ async def test_adaptive_queued_recursion_preserves_only_interrupted_decision(
         def close(self):
             return None
 
-    metadata = {}
-    store = SimpleNamespace(
-        _entries={},
-        get_session_metadata=lambda session_key, key, default=None: metadata.get(
-            (session_key, key), default
-        ),
-        set_session_metadata=lambda session_key, key, value: (
-            metadata.__setitem__((session_key, key), value) is None
-        ),
-        clear_resume_pending=lambda *args, **kwargs: None,
-        _save=lambda: None,
-    )
+    import hermes_state
+    from gateway.adaptive_model import resolve_adaptive_model
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=platform, chat_id="1", chat_type="group", thread_id="topic")
+    entry = store.get_or_create_session(source)
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -444,12 +441,11 @@ async def test_adaptive_queued_recursion_preserves_only_interrupted_decision(
     fake_run_agent.AIAgent = RecursiveAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = ProgressCaptureAdapter()
-    session_key = "adaptive-recursion"
+    adapter = ProgressCaptureAdapter(platform)
+    session_key = entry.session_key
     adapter._pending_messages[session_key] = MessageEvent(
-        text="queued follow-up",
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
-        message_id="event-2",
+        text="queued follow-up", source=source, message_id="event-2",
+        reply_to_message_id="parent",
     )
     runner = _make_runner(adapter)
     runner.session_store = store
@@ -464,35 +460,40 @@ async def test_adaptive_queued_recursion_preserves_only_interrupted_decision(
         },
     )
     runner._agent_config_signature = lambda *args, **kwargs: "sig"
+    runner._session_run_generation[session_key] = 1
 
-    def fake_resolve(**kwargs):
-        calls.append(kwargs["ctx"].message)
-        number = len(calls)
-        decision = {
-            "taskId": f"hermes:sess-recursion:decision-{number}",
-            "sessionId": "sess-recursion",
-            "model": f"selected-{number}",
-            "provider": "pieverse",
+    def post(_url, _key, payload):
+        calls.append(payload)
+        return {
+            "taskId": payload["taskId"], "sessionId": payload["sessionId"],
+            "model": f"selected-{len(calls)}", "provider": "pieverse",
+            "policyVersion": 1, "rubricVersion": 1, "tier": "normal",
+            "reason": "scored", "decidedAt": "now",
         }
-        snapshot = {"request": {"taskId": decision["taskId"]}, "decision": decision}
-        metadata[(session_key, "adaptive_model_task")] = snapshot
-        return SimpleNamespace(model=decision["model"], decision=decision)
 
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "resolve_adaptive_model", fake_resolve)
+    monkeypatch.setattr(gateway_run, "resolve_adaptive_model", partial(resolve_adaptive_model, post_json=post))
 
     result = await runner._run_agent(
         message="first task",
         context_prompt="",
         history=[],
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
-        session_id="sess-recursion",
+        source=source,
+        session_id=entry.session_id,
         session_key=session_key,
-        event_message_id="event-1",
+        event_message_id=None if platform == Platform.TELEGRAM else "parent",
+        inbound_message_id="event-1",
+        run_generation=1,
     )
 
     assert result["final_response"] == "answer-2"
     assert run_count == 2
     assert len(calls) == expected_resolutions
+
+    saved = store.get_session_metadata(session_key, "adaptive_model_task")
+    assert saved["decision"]["model"] == f"selected-{expected_resolutions}"
+    if not interrupted:
+        assert calls[0]["taskId"] != calls[1]["taskId"]
+    store._db.close()

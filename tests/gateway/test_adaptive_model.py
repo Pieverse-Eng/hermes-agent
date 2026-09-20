@@ -20,11 +20,12 @@ from gateway.turn_context import TurnContext
 class _MetadataStore:
     def __init__(self):
         self.values = {}
+        self._entries = {}
 
     def get_session_metadata(self, session_key, key, default=None):
         return self.values.get((session_key, key), default)
 
-    def set_session_metadata(self, session_key, key, value):
+    def set_session_metadata(self, session_key, key, value, *, require_primary=False):
         self.values[(session_key, key)] = value
         return True
 
@@ -40,7 +41,7 @@ def _ctx(**overrides):
         context_prompt="system context",
         session_id="session-1",
         session_key="discord:1",
-        event_message_id="event-9",
+        inbound_message_id="event-9",
         run_generation=3,
         enabled_toolsets=["terminal"],
         native_modalities=("text", "image"),
@@ -163,7 +164,7 @@ def test_scoring_http_unavailability_persists_auto_paid_and_replays(status):
         post_json=post,
     )
     restored = resolve_adaptive_model(
-        ctx=_ctx(message="", event_message_id=None, history=[]),
+        ctx=_ctx(message="", inbound_message_id=None, history=[]),
         session_store=store,
         base_url="https://ai.example/v1",
         api_key="sk-pv-test",
@@ -205,7 +206,7 @@ def test_scoring_network_unavailability_is_task_local_and_new_task_scores_again(
         api_key="sk-pv-test", max_output_tokens=1000, post_json=post,
     )
     selected = resolve_adaptive_model(
-        ctx=_ctx(event_message_id="event-10"), session_store=store,
+        ctx=_ctx(inbound_message_id="event-10"), session_store=store,
         base_url="https://ai.example/v1", api_key="sk-pv-test",
         max_output_tokens=1000, post_json=post,
     )
@@ -219,7 +220,7 @@ def test_fallback_log_is_emitted_only_after_durable_persistence(caplog):
     store = _MetadataStore()
     writes = 0
 
-    def reject_decision(_session_key, _key, value):
+    def reject_decision(_session_key, _key, value, **_kwargs):
         nonlocal writes
         writes += 1
         if writes == 2:
@@ -510,7 +511,7 @@ def test_interrupted_continuation_reuses_latched_snapshot_at_native_route_seam(
         "gateway.run.resolve_adaptive_model",
         lambda **_: pytest.fail("interrupted continuation must not reclassify"),
     )
-    ctx = _ctx(event_message_id="interrupting-event", adaptive_snapshot=snapshot)
+    ctx = _ctx(inbound_message_id="interrupting-event", adaptive_snapshot=snapshot)
 
     route = TurnRunner(runner, ctx)._resolve_native_turn_route(
         "auto/adaptive",
@@ -584,7 +585,7 @@ def test_empty_startup_restore_reuses_persisted_active_task_identity():
         post_json=post,
     )
     restored = resolve_adaptive_model(
-        ctx=_ctx(message="", event_message_id=None, history=[]),
+        ctx=_ctx(message="", inbound_message_id=None, history=[]),
         session_store=store,
         base_url="https://ai.example/v1",
         api_key="sk-pv-test",
@@ -627,7 +628,7 @@ def test_independent_turns_can_select_simple_strong_simple():
 
     models = [
         resolve_adaptive_model(
-            ctx=_ctx(event_message_id=f"event-{number}"),
+            ctx=_ctx(inbound_message_id=f"event-{number}"),
             session_store=store,
             base_url="https://ai.example/v1",
             api_key="sk-pv-test",
