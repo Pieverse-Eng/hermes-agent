@@ -132,6 +132,7 @@ def test_successful_fallback_survives_restart_without_scoring(stores):
     first = resolve(store, ctx, unavailable)
     restarted = stores()
     restored = context(entry, MessageEvent(text="", source=source()))
+    restored.adaptive_resume_pending = True
     second = resolve(restarted, restored, lambda *_: pytest.fail("must not rescore"))
     assert first == second
     assert first.model == "auto/paid"
@@ -180,8 +181,9 @@ def test_completed_no_id_tasks_get_fresh_durable_identity_across_restart(stores)
 
 
 @pytest.mark.parametrize("fallback", [False, True])
-def test_real_user_resume_pending_reuses_saved_decision_before_routing(
-    stores, monkeypatch, fallback
+@pytest.mark.parametrize("message,inbound_id", [("continue", "102"), ("", None)])
+def test_resume_pending_reuses_saved_decision_before_routing(
+    stores, monkeypatch, fallback, message, inbound_id
 ):
     from gateway import run
 
@@ -204,7 +206,7 @@ def test_real_user_resume_pending_reuses_saved_decision_before_routing(
     store.mark_resume_pending(entry.session_key)
     restarted = stores()
     restarted._ensure_loaded()
-    ctx = context(entry, MessageEvent(text="continue", source=origin, message_id="102"))
+    ctx = context(entry, MessageEvent(text=message, source=origin, message_id=inbound_id))
     runner = SimpleNamespace(
         session_store=restarted,
         _resolve_turn_agent_config=lambda message, model, runtime: {"model": model},
@@ -272,9 +274,11 @@ def test_legacy_mirror_failure_does_not_undo_a_committed_receipt(stores, monkeyp
     monkeypatch.setattr(store, "_save_sessions_json", fail_mirror)
     first = resolve(store, ctx, lambda _url, _key, payload: decision(payload))
     restarted = stores()
+    restored = context(entry, MessageEvent(text="", source=source()))
+    restored.adaptive_resume_pending = True
     replay = resolve(
         restarted,
-        context(entry, MessageEvent(text="", source=source())),
+        restored,
         lambda *_: pytest.fail("committed decision must replay"),
     )
     assert replay == first
@@ -385,3 +389,77 @@ def test_failed_strict_decision_cannot_leak_through_an_older_delayed_snapshot(
         restarted.get_session_metadata(entry.session_key, "adaptive_model_task")
         == request_receipt
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "has_previous_task,resume_pending", [(False, False), (True, False), (True, True)]
+)
+async def test_captionless_native_image_gets_new_task_unless_explicitly_resuming(
+    stores, monkeypatch, has_previous_task, resume_pending
+):
+    """A photo is new work; only a live recovery marker can replay old work."""
+    from gateway import run
+    from gateway.platforms.base import MessageType
+
+    store = stores()
+    origin = SessionSource(platform=Platform.TELEGRAM, chat_id="photo", chat_type="dm")
+    entry = store.get_or_create_session(origin)
+    calls = []
+
+    def post(_url, _key, payload):
+        calls.append(payload)
+        model = "image-model" if "image" in payload["modalities"] else "text-model"
+        return decision(payload, model)
+
+    if has_previous_task:
+        resolve(
+            store,
+            context(
+                entry, MessageEvent(text="old greeting", source=origin, message_id="101")
+            ),
+            post,
+        )
+    if resume_pending:
+        store.mark_resume_pending(entry.session_key)
+
+    runner = run.GatewayRunner.__new__(run.GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.session_store = store
+    # Avoid external capability lookup; exercise the supported native image path.
+    runner._decide_image_input_mode = lambda **_: "native"
+    event = MessageEvent(
+        text="",
+        source=origin,
+        message_id="102",
+        message_type=MessageType.PHOTO,
+        media_urls=["/tmp/captionless-photo.png"],
+        media_types=["image/png"],
+    )
+    ctx = context(entry, event)
+    if has_previous_task:
+        ctx.history = [{"role": "user", "content": "old greeting"}]
+    ctx.message = await runner._prepare_inbound_message_text(
+        event=event, source=origin, history=ctx.history, session_key=entry.session_key
+    )
+    assert ctx.message == ""
+    assert runner._peek_session_state(entry.session_key).persistent.native_image_paths
+    ctx.native_modalities = ("text", "image")
+    monkeypatch.setattr(
+        run, "resolve_adaptive_model", partial(resolve_adaptive_model, post_json=post)
+    )
+    route = run.TurnRunner(runner, ctx)._resolve_native_turn_route(
+        "auto/adaptive", {"base_url": "https://ai.example/v1", "api_key": "sk-pv-test"}
+    )
+    saved = stores().get_session_metadata(entry.session_key, "adaptive_model_task")
+    if resume_pending:
+        assert route["model"] == "text-model"
+        assert len(calls) == 1
+        assert saved["request"]["taskId"].endswith(":101")
+    else:
+        assert route["model"] == "image-model"
+        assert len(calls) == (2 if has_previous_task else 1)
+        assert saved["request"]["taskId"].endswith(":102")
+        assert saved["request"]["modalities"] == ["text", "image"]
+        assert saved["request"]["goal"].strip()
+        assert saved["request"]["goal"] != "old greeting"

@@ -104,12 +104,16 @@ def build_adaptive_request(ctx: Any, *, max_output_tokens: int) -> dict[str, Any
             history.append({"role": item["role"], "content": content})
     history = history[-12:]
     goal = str(ctx.message or "").strip()
-    if not goal:
-        # Native startup restoration has no new inbound text.  Preserve the last
-        # semantic user goal without inventing a lifecycle inference.
+    if not goal and ctx.adaptive_resume_pending:
+        # The native runner validates the live recovery marker before setting
+        # this flag. Empty user input alone never identifies a resumed task.
         goal = next(
             (m["content"] for m in reversed(history) if m["role"] == "user"), ""
         )
+    if not goal and "image" in (ctx.native_modalities or ()):
+        # Pixels are attached after routing. Describe this new input without
+        # borrowing an unrelated previous user goal or inventing image content.
+        goal = "The user sent an image without a caption."
     if not goal:
         raise AdaptiveResolutionError("adaptive routing requires a non-empty task goal")
     goal = goal[:32000]
@@ -273,11 +277,11 @@ def resolve_adaptive_model(
     stored = (
         session_store.get_session_metadata(ctx.session_key, _METADATA_KEY, {}) or {}
     )
-    # Both blank startup restoration and a real message with the native
-    # resume-pending marker continue the saved task. Replay only a receipt for
-    # the same session; arbitrary post-completion messages start a new task.
+    # Startup restoration and real messages continue a saved task only when
+    # the native runner has validated its explicit resume-pending marker.
+    # Captionless media are new tasks, even though their text is also empty.
     if (
-        (ctx.adaptive_resume_pending or not str(ctx.message or "").strip())
+        ctx.adaptive_resume_pending
         and stored.get("request", {}).get("sessionId")
         == str(ctx.session_id or ctx.session_key or "unknown-session")[:256]
     ):

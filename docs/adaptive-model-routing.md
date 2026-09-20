@@ -16,7 +16,10 @@ retains the original request and decision when a real user message resumes
 work. Freshness uses the same transcript-or-marker window as native recovery.
 A stale marker, suspended/replaced session, or completed queued turn cannot
 reuse that marker to inherit the previous task. Blank startup restoration
-replays a saved receipt only for the same session.
+uses that same explicit marker and replays a saved receipt only for the same
+session. Empty text alone never identifies recovery: a captionless native image
+starts a new task with image modality and a neutral image-input goal. Existing
+voice transcription and audio/video attachment text preparation stay unchanged.
 
 Adaptive metadata writes opt into authoritative SQLite persistence. If the
 primary request write fails, scoring does not start. If the decision write

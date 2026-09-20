@@ -164,7 +164,9 @@ def test_scoring_http_unavailability_persists_auto_paid_and_replays(status):
         post_json=post,
     )
     restored = resolve_adaptive_model(
-        ctx=_ctx(message="", inbound_message_id=None, history=[]),
+        ctx=_ctx(
+            message="", inbound_message_id=None, history=[], adaptive_resume_pending=True
+        ),
         session_store=store,
         base_url="https://ai.example/v1",
         api_key="sk-pv-test",
@@ -585,7 +587,9 @@ def test_empty_startup_restore_reuses_persisted_active_task_identity():
         post_json=post,
     )
     restored = resolve_adaptive_model(
-        ctx=_ctx(message="", inbound_message_id=None, history=[]),
+        ctx=_ctx(
+            message="", inbound_message_id=None, history=[], adaptive_resume_pending=True
+        ),
         session_store=store,
         base_url="https://ai.example/v1",
         api_key="sk-pv-test",
