@@ -254,8 +254,15 @@ async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selected_model,decision_extra",
+    [
+        ("selected-model", {}),
+        ("auto/paid", {"localFallback": "scoring_unavailable"}),
+    ],
+)
 async def test_adaptive_turn_evicts_cached_fallback_before_first_inference(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, selected_model, decision_extra
 ):
     """The native run path must never infer on a cached fallback model."""
     created = []
@@ -301,7 +308,7 @@ async def test_adaptive_turn_evicts_cached_fallback_before_first_inference(
         session_id="sess-adaptive",
         fallback_model=[{"model": "fallback-model", "provider": "anthropic"}],
     )
-    cached._primary_runtime = {"model": "selected-model", "provider": "pieverse"}
+    cached._primary_runtime = {"model": selected_model, "provider": "pieverse"}
     cached._fallback_activated = True
     cached._rate_limited_until = float("inf")
     created.clear()
@@ -341,10 +348,11 @@ async def test_adaptive_turn_evicts_cached_fallback_before_first_inference(
         gateway_run,
         "resolve_adaptive_model",
         lambda **_: SimpleNamespace(
-            model="selected-model",
+            model=selected_model,
             decision={
                 "taskId": "hermes:sess-adaptive:event-1",
                 "sessionId": "sess-adaptive",
+                **decision_extra,
             },
         ),
     )
@@ -363,7 +371,7 @@ async def test_adaptive_turn_evicts_cached_fallback_before_first_inference(
     assert len(created) == 1
     assert conversations == [
         (
-            "selected-model",
+            selected_model,
             "pieverse",
             [],
             "hermes:sess-adaptive:event-1",

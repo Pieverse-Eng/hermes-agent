@@ -7,7 +7,10 @@ the allowed candidate set remain in the Pieverse AI Gateway.
 from __future__ import annotations
 
 import json
+import http.client
+import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -17,10 +20,16 @@ _METADATA_KEY = "adaptive_model_task"
 _ADAPTIVE_MODELS = frozenset({"auto/adaptive", "pieverse/auto/adaptive"})
 _TIERS = frozenset({"light", "normal", "strong", "fallback"})
 _REASONS = frozenset({"scored", "disabled", "classifier_unavailable"})
+_LOCAL_FALLBACK_MODEL = "auto/paid"
+logger = logging.getLogger(__name__)
 
 
 class AdaptiveResolutionError(RuntimeError):
     """Adaptive routing failed before any model invocation."""
+
+
+class AdaptiveScoringUnavailable(AdaptiveResolutionError):
+    """The scoring service is transiently unavailable for this native task."""
 
 
 @dataclass(frozen=True)
@@ -139,6 +148,21 @@ def _adaptive_url(base_url: str) -> str:
         raise AdaptiveResolutionError(
             "adaptive routing requires the Pieverse AI Gateway base URL"
         )
+    try:
+        parsed = urllib.parse.urlsplit(base)
+        port = parsed.port
+    except ValueError as exc:
+        raise AdaptiveResolutionError("invalid Pieverse AI Gateway URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise AdaptiveResolutionError("invalid Pieverse AI Gateway URL")
     if base.endswith("/v1"):
         return f"{base}/adaptive/resolve"
     return f"{base}/v1/adaptive/resolve"
@@ -156,10 +180,20 @@ def _post_json(url: str, api_key: str, payload: dict[str, Any]) -> dict[str, Any
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError, urllib.error.HTTPError) as exc:
+            raw_body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429 or exc.code >= 500:
+            raise AdaptiveScoringUnavailable(f"http_{exc.code}") from exc
         raise AdaptiveResolutionError(
-            f"adaptive model resolution failed: {exc}"
+            f"adaptive model resolution failed with HTTP {exc.code}"
+        ) from exc
+    except (OSError, http.client.IncompleteRead) as exc:
+        raise AdaptiveScoringUnavailable("network") from exc
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AdaptiveResolutionError(
+            "adaptive model resolution returned invalid JSON"
         ) from exc
     if not isinstance(body, dict):
         raise AdaptiveResolutionError(
@@ -168,7 +202,12 @@ def _post_json(url: str, api_key: str, payload: dict[str, Any]) -> dict[str, Any
     return body
 
 
-def _validate_decision(decision: Any, request: dict[str, Any]) -> dict[str, Any]:
+def _validate_decision(
+    decision: Any,
+    request: dict[str, Any],
+    *,
+    allow_local_fallback: bool = False,
+) -> dict[str, Any]:
     if not isinstance(decision, dict):
         raise AdaptiveResolutionError(
             "adaptive model resolution returned an invalid decision"
@@ -188,10 +227,17 @@ def _validate_decision(decision: Any, request: dict[str, Any]) -> dict[str, Any]
         raise AdaptiveResolutionError(
             "adaptive model resolution returned no concrete model"
         )
-    if _is_auto_alias(decision["model"]):
+    local_fallback = (
+        allow_local_fallback
+        and decision.get("localFallback") == "scoring_unavailable"
+        and decision["model"] == _LOCAL_FALLBACK_MODEL
+    )
+    if _is_auto_alias(decision["model"]) and not local_fallback:
         raise AdaptiveResolutionError(
             "adaptive model resolution returned an auto alias, not a concrete model"
         )
+    if local_fallback:
+        return dict(decision)
     if decision.get("tier") not in _TIERS or decision.get("reason") not in _REASONS:
         raise AdaptiveResolutionError(
             "adaptive model resolution returned an unknown policy result"
@@ -229,17 +275,21 @@ def resolve_adaptive_model(
     if not str(ctx.message or "").strip() and stored.get("request"):
         request = stored["request"]
         if stored.get("decision") is not None:
-            decision = _validate_decision(stored["decision"], request)
+            decision = _validate_decision(
+                stored["decision"], request, allow_local_fallback=True
+            )
             return AdaptiveSelection(model=decision["model"], decision=decision)
     else:
         request = build_adaptive_request(ctx, max_output_tokens=max_output_tokens)
     if stored.get("request", {}).get("taskId") == request["taskId"]:
         request = stored["request"]
         if stored.get("decision") is not None:
-            decision = _validate_decision(stored["decision"], request)
+            decision = _validate_decision(
+                stored["decision"], request, allow_local_fallback=True
+            )
             return AdaptiveSelection(model=decision["model"], decision=decision)
-    # Persist before network I/O.  An uncertain response can therefore retry
-    # the identical request and identity, never minting a replacement task.
+    # Persist before network I/O so either a concrete decision or the local
+    # scoring-unavailable fallback remains bound to the original task identity.
     persisted = session_store.set_session_metadata(
         ctx.session_key, _METADATA_KEY, {"request": request}
     )
@@ -247,9 +297,20 @@ def resolve_adaptive_model(
         raise AdaptiveResolutionError(
             "adaptive routing could not persist the task before resolution"
         )
-    decision = _validate_decision(
-        post_json(_adaptive_url(base_url), api_key, request), request
-    )
+    local_fallback = False
+    try:
+        decision = _validate_decision(
+            post_json(_adaptive_url(base_url), api_key, request), request
+        )
+    except AdaptiveScoringUnavailable:
+        local_fallback = True
+        decision = {
+            "taskId": request["taskId"],
+            "sessionId": request["sessionId"],
+            "model": _LOCAL_FALLBACK_MODEL,
+            "provider": "pieverse",
+            "localFallback": "scoring_unavailable",
+        }
     persisted = session_store.set_session_metadata(
         ctx.session_key,
         _METADATA_KEY,
@@ -257,4 +318,13 @@ def resolve_adaptive_model(
     )
     if not persisted:
         raise AdaptiveResolutionError("adaptive routing could not persist the decision")
+    if local_fallback:
+        logger.warning(
+            "Adaptive scoring unavailable; using auto/paid",
+            extra={
+                "adaptive_reason": "scoring_unavailable",
+                "task_id": request["taskId"],
+                "session_id": request["sessionId"],
+            },
+        )
     return AdaptiveSelection(model=decision["model"], decision=decision)

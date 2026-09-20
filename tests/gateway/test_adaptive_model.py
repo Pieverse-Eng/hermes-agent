@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import http.client
 from types import SimpleNamespace
 
 import pytest
 
 from gateway.adaptive_model import (
     AdaptiveResolutionError,
+    AdaptiveScoringUnavailable,
+    _adaptive_url,
+    _post_json,
     build_adaptive_request,
     is_adaptive_model,
     resolve_adaptive_model,
@@ -138,6 +142,193 @@ def test_resolution_persists_request_before_network_and_replays_decision():
     assert first == second
     assert first.model == "strong-model"
     assert calls[0][0] == "https://ai.example/v1/adaptive/resolve"
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_scoring_http_unavailability_persists_auto_paid_and_replays(status):
+    store = _MetadataStore()
+    calls = 0
+
+    def post(_url, _key, _payload):
+        nonlocal calls
+        calls += 1
+        raise AdaptiveScoringUnavailable(f"http_{status}")
+
+    first = resolve_adaptive_model(
+        ctx=_ctx(),
+        session_store=store,
+        base_url="https://ai.example/v1",
+        api_key="sk-pv-test",
+        max_output_tokens=1000,
+        post_json=post,
+    )
+    restored = resolve_adaptive_model(
+        ctx=_ctx(message="", event_message_id=None, history=[]),
+        session_store=store,
+        base_url="https://ai.example/v1",
+        api_key="sk-pv-test",
+        max_output_tokens=1000,
+        post_json=lambda *_: pytest.fail("fallback must replay without scoring"),
+    )
+
+    assert first == restored
+    assert first.model == "auto/paid"
+    assert first.decision["localFallback"] == "scoring_unavailable"
+    assert first.decision["taskId"] == "hermes:session-1:event-9"
+    assert first.decision["sessionId"] == "session-1"
+    assert calls == 1
+
+
+def test_scoring_network_unavailability_is_task_local_and_new_task_scores_again():
+    store = _MetadataStore()
+    calls = 0
+
+    def post(_url, _key, payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise AdaptiveScoringUnavailable("network")
+        return {
+            "taskId": payload["taskId"],
+            "sessionId": payload["sessionId"],
+            "model": "model-a",
+            "provider": "pieverse",
+            "policyVersion": 1,
+            "rubricVersion": 1,
+            "tier": "normal",
+            "reason": "scored",
+            "decidedAt": "now",
+        }
+
+    fallback = resolve_adaptive_model(
+        ctx=_ctx(), session_store=store, base_url="https://ai.example/v1",
+        api_key="sk-pv-test", max_output_tokens=1000, post_json=post,
+    )
+    selected = resolve_adaptive_model(
+        ctx=_ctx(event_message_id="event-10"), session_store=store,
+        base_url="https://ai.example/v1", api_key="sk-pv-test",
+        max_output_tokens=1000, post_json=post,
+    )
+
+    assert fallback.model == "auto/paid"
+    assert selected.model == "model-a"
+    assert calls == 2
+
+
+def test_fallback_log_is_emitted_only_after_durable_persistence(caplog):
+    store = _MetadataStore()
+    writes = 0
+
+    def reject_decision(_session_key, _key, value):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            return False
+        store.values[("discord:1", "adaptive_model_task")] = value
+        return True
+
+    store.set_session_metadata = reject_decision
+    with pytest.raises(AdaptiveResolutionError, match="persist the decision"):
+        resolve_adaptive_model(
+            ctx=_ctx(), session_store=store, base_url="https://ai.example/v1",
+            api_key="sk-pv-test", max_output_tokens=1000,
+            post_json=lambda *_: (_ for _ in ()).throw(AdaptiveScoringUnavailable("network")),
+        )
+
+    assert "using auto/paid" not in caplog.text
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403])
+def test_transport_keeps_permission_and_request_failures_as_errors(monkeypatch, status):
+    import urllib.error
+
+    def fail(*_args, **_kwargs):
+        raise urllib.error.HTTPError("https://ai.example", status, "private", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    with pytest.raises(AdaptiveResolutionError):
+        _post_json("https://ai.example", "sk-pv-test", {"taskId": "one"})
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_transport_classifies_only_scoring_availability_http_failures(monkeypatch, status):
+    import urllib.error
+
+    def fail(*_args, **_kwargs):
+        raise urllib.error.HTTPError("https://ai.example", status, "private", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    with pytest.raises(AdaptiveScoringUnavailable):
+        _post_json("https://ai.example", "sk-pv-test", {"taskId": "one"})
+
+
+@pytest.mark.parametrize(
+    "error", [http.client.IncompleteRead(b"partial"), TimeoutError("body timeout")]
+)
+def test_transport_classifies_premature_body_disconnect_as_unavailable(
+    monkeypatch, error
+):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            raise error
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    with pytest.raises(AdaptiveScoringUnavailable):
+        _post_json("https://ai.example", "sk-pv-test", {"taskId": "one"})
+
+
+def test_premature_body_disconnect_persists_and_replays_local_fallback(monkeypatch):
+    store = _MetadataStore()
+    calls = 0
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            raise http.client.IncompleteRead(b"partial")
+
+    def urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    first = resolve_adaptive_model(
+        ctx=_ctx(),
+        session_store=store,
+        base_url="https://ai.example/v1",
+        api_key="sk-pv-test",
+        max_output_tokens=1000,
+    )
+    replay = resolve_adaptive_model(
+        ctx=_ctx(),
+        session_store=store,
+        base_url="https://ai.example/v1",
+        api_key="sk-pv-test",
+        max_output_tokens=1000,
+    )
+
+    assert first == replay
+    assert first.model == "auto/paid"
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "base_url", ["htts://gateway.test/v1", "https:///v1", "https://gateway.test:bad/v1"]
+)
+def test_adaptive_url_rejects_invalid_local_endpoint_config(base_url):
+    with pytest.raises(AdaptiveResolutionError, match="Gateway URL"):
+        _adaptive_url(base_url)
 
 
 @pytest.mark.parametrize(
