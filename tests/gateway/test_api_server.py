@@ -2846,6 +2846,47 @@ class TestRouteWithoutModelKeepsDefault:
         assert captured["api_key"] == "sk-route"
 
 
+class TestAdaptiveModelCompatibility:
+    @pytest.mark.parametrize("configured", ["auto/adaptive", "pieverse/auto/adaptive"])
+    def test_api_server_maps_adaptive_default_to_existing_paid_selector(
+        self, monkeypatch, configured
+    ):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: configured)
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(session_id="api-session")
+
+        assert captured["model"] == "auto/paid"
+
+    def test_api_server_preserves_explicit_fixed_request_model(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_gateway_model", lambda: "auto/adaptive"
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(
+            session_id="api-session", requested_model="fixed/model"
+        )
+
+        assert captured["model"] == "fixed/model"
+
+
 # ---------------------------------------------------------------------------
 # Empty-model recovery + provider-auth error typing in _create_agent
 # (salvaged from PR #57947 by @FvanW)

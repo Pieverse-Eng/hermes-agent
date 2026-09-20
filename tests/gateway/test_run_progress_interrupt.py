@@ -10,14 +10,16 @@ response — making the interrupt feel ignored.
 
 import importlib
 import sys
+import threading
 import time
 import types
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -249,3 +251,240 @@ async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_pa
             f"event '{leaked_query}' leaked into the UI after interrupt — "
             f"progress_callback / drain loop is not checking is_interrupted"
         )
+
+
+@pytest.mark.asyncio
+async def test_adaptive_turn_evicts_cached_fallback_before_first_inference(
+    monkeypatch, tmp_path
+):
+    """The native run path must never infer on a cached fallback model."""
+    created = []
+    conversations = []
+
+    class AdaptiveAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.session_id = kwargs.get("session_id")
+            self.tools = []
+            self._primary_runtime = {
+                "model": self.model,
+                "provider": self.provider,
+            }
+            self._fallback_activated = False
+            self._fallback_chain = list(kwargs.get("fallback_model") or [])
+            self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+            self._fallback_index = 0
+            created.append(self)
+
+        @property
+        def is_interrupted(self):
+            return False
+
+        def run_conversation(self, message, **kwargs):
+            conversations.append(
+                (self.model, self.provider, list(self._fallback_chain), kwargs["task_id"])
+            )
+            return {
+                "final_response": "selected primary answered",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+        def close(self):
+            return None
+
+    cached = AdaptiveAgent(
+        model="fallback-model",
+        provider="anthropic",
+        session_id="sess-adaptive",
+        fallback_model=[{"model": "fallback-model", "provider": "anthropic"}],
+    )
+    cached._primary_runtime = {"model": "selected-model", "provider": "pieverse"}
+    cached._fallback_activated = True
+    cached._rate_limited_until = float("inf")
+    created.clear()
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = AdaptiveAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    runner.session_store = SimpleNamespace(
+        _entries={},
+        get_session_metadata=lambda *args, **kwargs: None,
+        set_session_metadata=lambda *args, **kwargs: True,
+        clear_resume_pending=lambda *args, **kwargs: None,
+        _save=lambda: None,
+    )
+    runner._agent_cache = OrderedDict({"adaptive-session": (cached, "sig")})
+    runner._agent_cache_lock = threading.Lock()
+    runner._resolve_session_agent_runtime = lambda **_: (
+        "auto/adaptive",
+        {
+            "api_key": "sk-pv-test",
+            "base_url": "https://ai.example/v1",
+            "provider": "pieverse",
+        },
+    )
+    runner._agent_config_signature = lambda *args, **kwargs: "sig"
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run,
+        "resolve_adaptive_model",
+        lambda **_: SimpleNamespace(
+            model="selected-model",
+            decision={
+                "taskId": "hermes:sess-adaptive:event-1",
+                "sessionId": "sess-adaptive",
+            },
+        ),
+    )
+
+    result = await runner._run_agent(
+        message="use the selected model",
+        context_prompt="",
+        history=[],
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
+        session_id="sess-adaptive",
+        session_key="adaptive-session",
+        event_message_id="event-1",
+    )
+
+    assert result["final_response"] == "selected primary answered"
+    assert len(created) == 1
+    assert conversations == [
+        (
+            "selected-model",
+            "pieverse",
+            [],
+            "hermes:sess-adaptive:event-1",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "interrupted,expected_resolutions",
+    [(True, 1), (False, 2)],
+)
+async def test_adaptive_queued_recursion_preserves_only_interrupted_decision(
+    monkeypatch, tmp_path, interrupted, expected_resolutions
+):
+    """Drive the real queued recursion branch and count native resolutions."""
+    calls = []
+    run_count = 0
+
+    class RecursiveAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.session_id = kwargs.get("session_id")
+            self.tools = []
+            self._primary_runtime = {
+                "model": self.model,
+                "provider": self.provider,
+            }
+            self._fallback_activated = False
+            self._fallback_chain = list(kwargs.get("fallback_model") or [])
+            self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+            self._fallback_index = 0
+
+        @property
+        def is_interrupted(self):
+            return False
+
+        def run_conversation(self, message, **kwargs):
+            nonlocal run_count
+            run_count += 1
+            return {
+                "final_response": f"answer-{run_count}",
+                "messages": [],
+                "api_calls": 1,
+                "completed": not (run_count == 1 and interrupted),
+                "interrupted": run_count == 1 and interrupted,
+            }
+
+        def close(self):
+            return None
+
+    metadata = {}
+    store = SimpleNamespace(
+        _entries={},
+        get_session_metadata=lambda session_key, key, default=None: metadata.get(
+            (session_key, key), default
+        ),
+        set_session_metadata=lambda session_key, key, value: (
+            metadata.__setitem__((session_key, key), value) is None
+        ),
+        clear_resume_pending=lambda *args, **kwargs: None,
+        _save=lambda: None,
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RecursiveAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter()
+    session_key = "adaptive-recursion"
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="queued follow-up",
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
+        message_id="event-2",
+    )
+    runner = _make_runner(adapter)
+    runner.session_store = store
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    runner._resolve_session_agent_runtime = lambda **_: (
+        "auto/adaptive",
+        {
+            "api_key": "sk-pv-test",
+            "base_url": "https://ai.example/v1",
+            "provider": "pieverse",
+        },
+    )
+    runner._agent_config_signature = lambda *args, **kwargs: "sig"
+
+    def fake_resolve(**kwargs):
+        calls.append(kwargs["ctx"].message)
+        number = len(calls)
+        decision = {
+            "taskId": f"hermes:sess-recursion:decision-{number}",
+            "sessionId": "sess-recursion",
+            "model": f"selected-{number}",
+            "provider": "pieverse",
+        }
+        snapshot = {"request": {"taskId": decision["taskId"]}, "decision": decision}
+        metadata[(session_key, "adaptive_model_task")] = snapshot
+        return SimpleNamespace(model=decision["model"], decision=decision)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "resolve_adaptive_model", fake_resolve)
+
+    result = await runner._run_agent(
+        message="first task",
+        context_prompt="",
+        history=[],
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
+        session_id="sess-recursion",
+        session_key=session_key,
+        event_message_id="event-1",
+    )
+
+    assert result["final_response"] == "answer-2"
+    assert run_count == 2
+    assert len(calls) == expected_resolutions

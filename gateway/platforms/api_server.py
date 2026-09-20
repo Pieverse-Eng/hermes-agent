@@ -154,6 +154,16 @@ def _get_scoped_secret(name, default=None):
 logger = logging.getLogger(__name__)
 
 
+def _api_server_compatible_model(model: Any) -> Any:
+    """Keep AX/Web Chat on its existing paid selector for adaptive config."""
+    if isinstance(model, str) and model.strip().lower() in {
+        "auto/adaptive",
+        "pieverse/auto/adaptive",
+    }:
+        return "auto/paid"
+    return model
+
+
 def _hermes_version() -> str:
     """Return the canonical Hermes Agent version string.
 
@@ -2792,6 +2802,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     route_provider or "",
                     request_provider or "",
                 )
+
+        # AX/Web Chat constructs agents independently of the native Message App
+        # TurnRunner.  It intentionally keeps the existing gateway-owned paid
+        # selector rather than duplicating adaptive classification in Hermes.
+        model = _api_server_compatible_model(model)
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
