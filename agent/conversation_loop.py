@@ -2219,6 +2219,14 @@ def run_conversation(
                         api_messages,
                         tools_for_api=tools_for_api,
                     )
+                _adaptive_headers = getattr(
+                    agent, "_adaptive_observability_headers", None
+                )
+                if _adaptive_headers:
+                    api_kwargs["extra_headers"] = {
+                        **dict(api_kwargs.get("extra_headers") or {}),
+                        **_adaptive_headers,
+                    }
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":

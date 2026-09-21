@@ -88,6 +88,15 @@ class TurnContext:
     process_baseline: frozenset[str] = field(default_factory=frozenset)
     _interrupt_depth: int = 0
     event_message_id: Optional[str] = None
+    # Native inbound identity is distinct from the outbound reply anchor above.
+    inbound_message_id: Optional[str] = None
+    adaptive_resume_pending: bool = False
+    # Non-consuming inbound modality projection used before AIAgent creation.
+    native_modalities: tuple[str, ...] = ("text",)
+    # Immutable selected-primary policy record for this native turn.
+    adaptive_selection: Optional[dict] = None
+    adaptive_snapshot: Optional[dict] = None
+    adaptive_disable_fallback: bool = False
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None

@@ -2388,6 +2388,12 @@ from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
+from gateway.adaptive_model import (
+    AdaptiveResolutionError,
+    adaptive_observability_headers,
+    is_adaptive_model,
+    resolve_adaptive_model,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -4403,6 +4409,85 @@ class TurnRunner:
                     ctx._cleanup_msg_ids.append(str(mid))
             _fut.add_done_callback(_track_status_id)
 
+    def _fresh_resume_pending_entry(self):
+        """Use the native recovery marker only for this live session and window."""
+        ctx = self._ctx
+        # A completed queued turn is new work, even while the outer recovery
+        # marker awaits cleanup. Interrupted recursion already carries its snapshot.
+        if not ctx.session_key or ctx._interrupt_depth > 0:
+            return None
+        entry = self._runner.session_store._entries.get(ctx.session_key)
+        if (
+            entry is None
+            or entry.session_id != ctx.session_id
+            or getattr(entry, "suspended", False)
+            or not getattr(entry, "resume_pending", False)
+        ):
+            return None
+        window = _auto_continue_freshness_window()
+        if _is_fresh_gateway_interruption(
+            _last_transcript_timestamp(ctx.history), window_secs=window
+        ) or _is_fresh_gateway_interruption(
+            getattr(entry, "last_resume_marked_at", None), window_secs=window
+        ):
+            return entry
+        return None
+
+    def _resolve_native_turn_route(self, model: str, runtime_kwargs: dict) -> dict:
+        """Resolve the native turn's primary before signature/construction."""
+        ctx = self._ctx
+        if not is_adaptive_model(model):
+            return self._runner._resolve_turn_agent_config(
+                ctx.message, model, runtime_kwargs
+            )
+
+        ctx.adaptive_resume_pending = self._fresh_resume_pending_entry() is not None
+        if ctx.adaptive_snapshot:
+            decision = dict(ctx.adaptive_snapshot["decision"])
+            selected_model = decision["model"]
+        else:
+            max_output_tokens = runtime_kwargs.get("max_tokens")
+            if not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
+                max_output_tokens = 8192
+            selection = resolve_adaptive_model(
+                ctx=ctx,
+                session_store=self._runner.session_store,
+                base_url=runtime_kwargs.get("base_url"),
+                api_key=runtime_kwargs.get("api_key"),
+                max_output_tokens=max_output_tokens,
+            )
+            decision = dict(selection.decision)
+            selected_model = selection.model
+            ctx.adaptive_snapshot = self._runner.session_store.get_session_metadata(
+                ctx.session_key, "adaptive_model_task", None
+            )
+        ctx.adaptive_selection = decision
+        ctx.adaptive_disable_fallback = True
+        return self._runner._resolve_turn_agent_config(
+            ctx.message, selected_model, runtime_kwargs
+        )
+
+    @staticmethod
+    def _adaptive_cached_agent_matches_route(agent: Any, turn_route: dict) -> bool:
+        """Only reuse an agent that is still serving the selected primary."""
+        if agent is None or getattr(agent, "_fallback_activated", False):
+            return False
+        selected_model = str(turn_route.get("model") or "")
+        runtime = turn_route.get("runtime") or {}
+        selected_provider = str(runtime.get("provider") or "")
+        primary = getattr(agent, "_primary_runtime", None) or {}
+        return (
+            str(getattr(agent, "model", "") or "") == selected_model
+            and str(primary.get("model") or "") == selected_model
+            and str(getattr(agent, "provider", "") or "") == selected_provider
+            and str(primary.get("provider") or "") == selected_provider
+        )
+
+    @staticmethod
+    def _adaptive_snapshot_for_followup(result: dict, ctx: TurnContext) -> dict | None:
+        """Pin interrupted recursion; normal queued turns start a new task."""
+        return ctx.adaptive_snapshot if result.get("interrupted") else None
+
     def run_sync(self):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
@@ -4574,7 +4659,16 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
-        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        try:
+            turn_route = self._resolve_native_turn_route(model, runtime_kwargs)
+        except AdaptiveResolutionError as exc:
+            logger.error("Adaptive model resolution failed: %s", exc)
+            return {
+                "final_response": f"⚠️ Adaptive model routing failed: {exc}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -4701,7 +4795,27 @@ class TurnRunner:
                         and _cached_sid_is_dead
                         and _cached_sid == _peek_cached_sid
                     )
-                    if _stale_dead_sid_reuse:
+                    _adaptive_identity_mismatch = (
+                        ctx.adaptive_disable_fallback
+                        and not self._adaptive_cached_agent_matches_route(
+                            cached[0], turn_route
+                        )
+                    )
+                    if _adaptive_identity_mismatch:
+                        logger.info(
+                            "Agent cache invalidated for adaptive session %s: "
+                            "cached live runtime does not match selected primary",
+                            ctx.session_key,
+                        )
+                        evicted = self._runner._agent_cache.pop(ctx.session_key, None)
+                        _ev_agent = (
+                            evicted[0]
+                            if isinstance(evicted, tuple) and evicted
+                            else None
+                        )
+                        if _ev_agent and _ev_agent is not _AGENT_PENDING_SENTINEL:
+                            _xproc_evicted_agent = _ev_agent
+                    elif _stale_dead_sid_reuse:
                         # #54878 x #54947 interaction: the routing key
                         # was just self-healed away from a session that
                         # state.db already marked ended, but the cached
@@ -4789,7 +4903,12 @@ class TurnRunner:
         # serialization (_running_agents) keeps this safe post-lock.
         if reused_cached_agent and agent is not None:
             self._runner._apply_fallback_chain_to_agent(
-                agent, self._runner._refresh_fallback_model(),
+                agent,
+                (
+                    None
+                    if ctx.adaptive_disable_fallback
+                    else self._runner._refresh_fallback_model()
+                ),
             )
 
         # Lock released — now schedule cleanup of any cross-process-evicted
@@ -4861,6 +4980,8 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            if ctx.adaptive_disable_fallback:
+                self._runner._apply_fallback_chain_to_agent(agent, None)
             if (
                 prewarmed_system_prompt
                 and getattr(agent, "_cached_system_prompt", None) is None
@@ -4888,6 +5009,9 @@ class TurnRunner:
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
+        agent._adaptive_observability_headers = adaptive_observability_headers(
+            ctx.adaptive_selection
+        )
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
         # rather than tool_progress alone: the progress_callback also relays
         # _thinking assistant scratch text, which is gated on
@@ -5466,7 +5590,11 @@ class TurnRunner:
             )
             _conversation_kwargs = {
                 "conversation_history": agent_history,
-                "task_id": ctx.session_id,
+                "task_id": (
+                    ctx.adaptive_selection["taskId"]
+                    if ctx.adaptive_selection
+                    else ctx.session_id
+                ),
             }
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
@@ -17942,6 +18070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                inbound_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
@@ -24554,6 +24683,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        _adaptive_snapshot: Optional[dict] = None,
+        inbound_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -24573,6 +24704,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                _adaptive_snapshot=_adaptive_snapshot,
+                inbound_message_id=inbound_message_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -24585,6 +24718,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                _adaptive_snapshot=_adaptive_snapshot,
+                inbound_message_id=inbound_message_id,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24707,6 +24842,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        _adaptive_snapshot: Optional[dict] = None,
+        inbound_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24949,6 +25086,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        _native_modalities = ["text"]
+        _native_state = self._peek_session_state(session_key)
+        _native_persistent = getattr(_native_state, "persistent", None)
+        if getattr(_native_persistent, "native_image_paths", None):
+            _native_modalities.append("image")
+
         turn_ctx = TurnContext(
             source=source,
             _run_still_current=_run_still_current,
@@ -24988,6 +25131,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation=run_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
+            native_modalities=tuple(_native_modalities),
+            adaptive_snapshot=_adaptive_snapshot,
+            inbound_message_id=inbound_message_id,
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
@@ -26201,8 +26347,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
+                    inbound_message_id=(pending_event.message_id if pending_event else None),
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    _adaptive_snapshot=TurnRunner._adaptive_snapshot_for_followup(
+                        result, turn_ctx
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
