@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from collections import OrderedDict
 
@@ -35,6 +36,33 @@ def _make_app(adapter: APIServerAdapter) -> web.Application:
 
 def _auth() -> dict[str, str]:
     return {"Authorization": "Bearer sk-test"}
+
+
+@pytest.mark.asyncio
+async def test_internal_reload_uses_service_restart_exit_code(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+    from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _ = make_restart_runner()
+    # The production container's shell supervisor owns the relaunch, not systemd.
+    monkeypatch.setattr(runner, "_launch_systemd_restart_shortcut", lambda: None)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-test"}))
+    adapter.gateway_runner = runner
+    async with TestClient(TestServer(_make_app(adapter))) as cli:
+        unauthorized = await cli.post("/internal/platform/gateway/reload")
+        assert unauthorized.status == 401
+        assert not runner._restart_task_started
+        response = await cli.post("/internal/platform/gateway/reload", headers=_auth())
+        assert response.status == 202
+        assert (await response.json())["accepted"] is True
+        await asyncio.wait_for(runner._restart_task, timeout=5)
+        assert runner.exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+        assert runner._shutdown_event.is_set()
+        repeated = await cli.post("/internal/platform/gateway/reload", headers=_auth())
+        assert repeated.status == 200
+        assert (await repeated.json())["accepted"] is False
 
 
 def test_api_server_adapter_gets_gateway_runner_backref():

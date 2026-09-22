@@ -3495,7 +3495,9 @@ class APIServerAdapter(BasePlatformAdapter):
         runner = getattr(self, "gateway_runner", None)
         if runner is None or not hasattr(runner, "request_restart"):
             return web.json_response(_openai_error("gateway runner is not attached", err_type="server_error"), status=503)
-        started = bool(runner.request_restart(detached=False, via_service=False))
+        # Match SIGUSR1: the platform supervisor relaunches exit 75 in-place.
+        # A clean exit would stop the container and discard its served identity.
+        started = bool(runner.request_restart(detached=False, via_service=True))
         return web.json_response({
             "ok": True,
             "accepted": started,
