@@ -622,3 +622,91 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
     second.release_session_turn_lease("shared", next_holder)
     first.close()
     second.close()
+
+
+def _live_agent(db, session_id="chat"):
+    agent = _agent_with_db(db, session_id=session_id, platform="api_server")
+    agent._session_db_created = db.get_session(session_id) is not None
+    agent._session_init_model_config = {}
+    agent._cached_system_prompt = None
+    agent._session_persist_lock = None
+    agent._save_session_log = lambda messages: None
+    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+    return agent
+
+
+def test_first_native_turn_serializes_before_session_creation(tmp_path, monkeypatch):
+    """Two callers choosing one absent ID must serialize load/run/flush."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    first = SessionDB(tmp_path / "state.db")
+    second = SessionDB(tmp_path / "state.db")
+    first_agent = _live_agent(first)
+    second_agent = _live_agent(second)
+    first_entered = threading.Event()
+    second_waiting_or_entered = threading.Event()
+    first_finished = threading.Event()
+    observed = {}
+    seed = [{"role": "user", "content": "initial context"}]
+    second_agent.status_callback = lambda *_: second_waiting_or_entered.set()
+
+    def conversation_loop(agent, message, system, history, *args, **kwargs):
+        if message == "first":
+            observed["first_holder"] = getattr(agent, "_active_session_turn_lease_holder", None)
+            observed["seed"] = history
+            first_entered.set()
+            assert second_waiting_or_entered.wait(5)
+        else:
+            observed["serialized"] = first_finished.is_set()
+            observed["second_history"] = [m["content"] for m in (history or [])]
+            second_waiting_or_entered.set()
+        messages = list(history or []) + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": message + " answer"},
+        ]
+        agent._persist_session(messages, history)
+        if message == "first":
+            first_finished.set()
+        return {"completed": True, "final_response": message + " answer"}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", conversation_loop)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            one = pool.submit(first_agent.run_conversation, "first", conversation_history=seed, reload_session_history=True)
+            assert first_entered.wait(5)
+            two = pool.submit(second_agent.run_conversation, "second", reload_session_history=True)
+            assert one.result(timeout=10)["completed"] is True
+            assert two.result(timeout=10)["completed"] is True
+        assert observed["first_holder"]
+        assert observed["seed"] is seed
+        assert observed["serialized"] is True
+        assert observed["second_history"] == ["first", "first answer"]
+        assert [m["content"] for m in first.get_messages("chat")] == [
+            "first", "first answer", "second", "second answer",
+        ]
+    finally:
+        first.close()
+        second.close()
+
+
+def test_non_lease_persistence_failure_preserves_existing_error(tmp_path, monkeypatch):
+    """The lease fence must not replace unrelated storage failure reporting."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("chat", "api_server")
+    agent = _live_agent(db)
+
+    def disk_full(*args, **kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    def conversation_loop(agent, message, system, history, *args, **kwargs):
+        agent._persist_session([{"role": "user", "content": message}], history)
+        return {"completed": False, "failed": True, "error": "storage unavailable"}
+
+    monkeypatch.setattr(db, "append_messages_batch", disk_full)
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", conversation_loop)
+    try:
+        result = agent.run_conversation("hello", reload_session_history=True)
+        assert agent._last_persistence_error_cause == "disk"
+        assert result == {"completed": False, "failed": True, "error": "storage unavailable"}
+    finally:
+        db.close()

@@ -353,3 +353,66 @@ async def test_real_agent_lease_loss_is_interrupted_in_status_events_and_retry(t
         successor.release_session_turn_lease("chat", "successor")
         db.close()
         successor.close()
+
+
+@pytest.mark.asyncio
+async def test_final_fenced_flush_cannot_complete_native_run(tmp_path, monkeypatch):
+    """Lease takeover at final persist must reach HTTP/events/durable retry."""
+    from tests.run_agent.test_cross_process_turn_lease import _live_agent
+
+    db = SessionDB(tmp_path / "state.db")
+    successor = SessionDB(tmp_path / "state.db")
+    db.create_session("chat", "api_server")
+    adapter = _make_adapter()
+    adapter._session_db = db
+    agent = _live_agent(db)
+    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: agent)
+
+    def conversation_loop(agent, message, system, history, *args, **kwargs):
+        if message == "followup":
+            agent._persist_session(list(history) + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "saved answer"},
+            ], history)
+            return {"completed": True, "final_response": "saved answer"}
+        messages = [{"role": "user", "content": message}]
+        agent._persist_session(messages, history)
+        db.release_session_turn_lease("chat", agent._active_session_turn_lease_holder)
+        assert successor.try_acquire_session_turn_lease("chat", "successor", ttl_seconds=30)
+        messages.append({"role": "assistant", "content": "unsaved answer"})
+        agent._persist_session(messages, history)
+        return {"completed": True, "final_response": "unsaved answer", "messages": messages}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", conversation_loop)
+    try:
+        async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+            payload = {"input": "continue", "session_id": "chat"}
+            headers = {"Idempotency-Key": "final-fence"}
+            response = await cli.post("/v1/runs", json=payload, headers=headers)
+            run_id = (await response.json())["run_id"]
+            task = adapter._active_run_tasks.get(run_id)
+            if task:
+                await task
+            assert [m["content"] for m in db.get_messages("chat")] == ["continue"]
+            status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+            assert status["status"] == "failed"
+            assert "session_turn_lease_lost" in status["error"]
+            stream = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+            assert "run.failed" in stream
+            assert "run.completed" not in stream
+            replay = await (await cli.post("/v1/runs", json=payload, headers=headers)).json()
+            assert replay["run_id"] == run_id
+            assert replay["status"] == "failed"
+            durable = adapter._run_idempotency_store.status_for_run(adapter._run_idempotency_scope(None), run_id)
+            assert durable["status"]["status"] == "failed"
+            successor.release_session_turn_lease("chat", "successor")
+            followup = await cli.post("/v1/runs", json={"input": "followup", "session_id": "chat"})
+            followup_id = (await followup.json())["run_id"]
+            await settle(adapter, followup_id)
+            assert [m["content"] for m in db.get_messages("chat")] == [
+                "continue", "followup", "saved answer",
+            ]
+    finally:
+        successor.release_session_turn_lease("chat", "successor")
+        db.close()
+        successor.close()

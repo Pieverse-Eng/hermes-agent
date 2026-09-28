@@ -2290,6 +2290,10 @@ class AIAgent:
             self._db_flush_scan_prefix = None
             from hermes_state import classify_persistence_error
             self._last_persistence_error_cause = classify_persistence_error(e)
+            if self._last_persistence_error_cause == "turn_lease":
+                # Keep this sticky for the turn: a later persist attempt must
+                # not turn a rejected transcript into a successful response.
+                self._session_turn_lease_lost = True
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
@@ -7824,6 +7828,7 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        self._session_turn_lease_lost = False
 
         def _stop_durable_turn_lease_refresher() -> None:
             nonlocal durable_turn_lease_turn_active
@@ -7883,11 +7888,10 @@ class AIAgent:
                 _turn_db is not None
                 and session_id
                 and not getattr(self, "_persist_disabled", False)
-                # A fresh session id is process-unique and has no durable
-                # transcript to race over. More importantly, subagent/new-turn
-                # callers may intentionally supply an in-memory seed before the
-                # row exists; reloading an absent row would erase that seed.
-                and _durable_session_exists
+                # API callers may share even an absent session ID. Admit the
+                # first turn under the same lease as every continuation. Fresh
+                # subordinate agents retain their independent seed semantics.
+                and (_durable_session_exists or task_context["platform"] != "subagent")
                 # Test doubles and third-party DB shims may accept arbitrary
                 # MagicMock attributes without implementing the protocol. Check
                 # the concrete type so only real implementations opt in.
@@ -7895,10 +7899,6 @@ class AIAgent:
                     getattr(type(_turn_db), "acquire_session_turn_lease", None)
                 )
             ):
-                # Resumed agents also defer their create check until the turn
-                # prologue. We just proved this row exists, so suppress the
-                # redundant create attempt after acquiring it.
-                self._session_db_created = True
                 _durable_holder = (
                     f"pid={os.getpid()}:turn={relay_turn_id}:platform="
                     f"{task_context['platform'] or 'unknown'}"
@@ -7997,6 +7997,13 @@ class AIAgent:
                 durable_turn_lease = _durable_holder
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
+                # Another first turn may have created/persisted the session
+                # while we waited. An absent row after admission still needs
+                # lazy creation and must retain the caller's seed history.
+                if not _durable_session_exists:
+                    _durable_session_exists = _turn_db.get_session(session_id) is not None
+                if _durable_session_exists:
+                    self._session_db_created = True
                 if _lease_waited:
                     self._emit_status(
                         "Session is free; loading the latest transcript..."
@@ -8010,7 +8017,7 @@ class AIAgent:
                 if latest_session_id:
                     self.session_id = latest_session_id
                     task_context["session_id"] = latest_session_id
-                if reload_session_history or conversation_history is None:
+                if _durable_session_exists and (reload_session_history or conversation_history is None):
                     conversation_history = _turn_db.get_messages_as_conversation(
                         self.session_id,
                         repair_alternation=True,
@@ -8147,6 +8154,18 @@ class AIAgent:
                     _stop_durable_turn_lease_refresher()
                     _clear_durable_turn_lease_interrupt()
             terminal = result if isinstance(result, dict) else {}
+            if getattr(self, "_session_turn_lease_lost", False):
+                terminal.update(
+                    completed=False,
+                    failed=True,
+                    error=f"session_turn_lease_lost:{self.session_id}",
+                    final_response=(
+                        "This turn lost ownership of the session and could not "
+                        "save its complete transcript. Please check the session "
+                        "before continuing."
+                    ),
+                )
+                result = terminal
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
             elif terminal.get("failed") is True:
