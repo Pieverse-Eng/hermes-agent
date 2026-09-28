@@ -92,7 +92,7 @@ def _make_slow_agent(**kwargs):
 
     mock_agent.interrupt = MagicMock(side_effect=_do_interrupt)
 
-    def _slow_run(user_message=None, conversation_history=None, task_id=None):
+    def _slow_run(user_message=None, conversation_history=None, task_id=None, reload_session_history=False):
         ready.set()
         # Block until interrupt() is called
         interrupted.wait(timeout=10)
@@ -185,8 +185,10 @@ class TestStartRun:
                 status = await status_response.json()
                 assert status["status"] == "failed"
                 assert run_id not in adapter._active_run_tasks
-                assert adapter._run_streams[run_id].get_nowait()["event"] == "run.failed"
-                assert adapter._run_streams[run_id].get_nowait() is None
+                stream = adapter._run_streams[run_id]
+                _, replay = stream.attach()
+                assert replay[0][1]["event"] == "run.failed"
+                assert replay[1][1] is None
         finally:
             await client.close()
 
@@ -204,7 +206,7 @@ class TestStartRun:
             with patch.object(adapter, "_create_agent") as mock_create:
                 mock_agent = MagicMock()
 
-                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                def _capture_run(user_message=None, conversation_history=None, task_id=None, reload_session_history=False):
                     from tools.async_delegation import _current_origin_session_id
 
                     captured["origin_session_id"] = _current_origin_session_id()

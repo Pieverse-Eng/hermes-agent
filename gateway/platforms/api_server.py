@@ -45,7 +45,7 @@ import hashlib
 import hmac
 import itertools
 import json
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar, copy_context
 from functools import wraps
 import logging
@@ -116,6 +116,8 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from gateway.platforms.api_server_runs import _RunStream, _RUN_STREAM_SUBSCRIBER_OVERFLOW, _RUN_STREAM_WRITE_TIMEOUT
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -226,7 +228,7 @@ class ThreadSafeAsyncQueue(asyncio.Queue):
         self._loop_ref = asyncio.get_running_loop()
 
 
-def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True) -> bytes:
+def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True, id: int = None) -> bytes:
     """Encode one SSE frame: optional ``event:`` line, then ``data: <json>\n\n``.
 
     The single source of truth for SSE frame serialization across every
@@ -244,7 +246,7 @@ def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True) -> by
     option exists so every writer shares one helper without changing any
     existing byte stream.
     """
-    prefix = f"event: {event}\n" if event else ""
+    prefix = (f"id: {id}\n" if id is not None else "") + (f"event: {event}\n" if event else "")
     return f"{prefix}data: {json.dumps(data, ensure_ascii=ensure_ascii)}\n\n".encode()
 
 
@@ -1454,8 +1456,17 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Durable reservations and bounded, replayable run event streams.
+        self._run_idempotency_store = RunIdempotencyStore()
+        self._run_idempotency_ids: set[str] = set()
+        self._run_owners: Dict[str, str] = {}
+        self._run_owner_pid = os.getpid()
+        try:
+            from gateway.status import get_process_start_time
+            self._run_owner_started = int(get_process_start_time(self._run_owner_pid) or 0)
+        except Exception:
+            self._run_owner_started = 0
+        self._run_streams: Dict[str, _RunStream] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
@@ -3665,10 +3676,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "runs_idempotency": {
+                    "supported": True,
+                    "durable": self._run_idempotency_store.durable,
+                    "retention_seconds": RunIdempotencyStore.RETENTION_SECONDS,
+                },
+                "run_session_history": True,
+                "run_events_replay": True,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "run_approval_request_id": True,
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
@@ -6827,6 +6846,57 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    def _run_idempotency_scope(self, request) -> str:
+        # Official upstream profile + bearer scope; never persist credentials.
+        profile = _api_request_profile.get() or "default"
+        identity = self._expected_api_key() or "unauthenticated-test-listener"
+        return hashlib.sha256(f"{profile}\0{identity}".encode()).hexdigest()
+
+    def _durable_run_status(self, request, run_id):
+        scope = self._run_idempotency_scope(request)
+        owner = self._run_owners.get(run_id)
+        if owner is not None and owner != scope:
+            return None
+        status = self._run_statuses.get(run_id)
+        if status is not None and (
+            run_id in self._active_run_tasks
+            or run_id not in self._run_idempotency_ids
+            or status.get("status") in {"completed", "failed", "cancelled", "interrupted"}
+        ):
+            return status
+        # A status hydrated from another worker is only a snapshot. Refresh it
+        # until terminal so completion and owner death cannot stay cached away.
+        record = self._run_idempotency_store.status_for_run(scope, run_id)
+        if record is None:
+            return None
+        status = dict(record["status"])
+        from gateway.status import _pid_exists, get_process_start_time
+        pid = record["owner_pid"]
+        started = record["owner_started"]
+        alive = pid > 0 and _pid_exists(pid) and (
+            not started or int(get_process_start_time(pid) or 0) == started)
+        if status.get("status") not in {"completed", "failed", "cancelled", "interrupted"} and not alive:
+            status.update(status="interrupted", error="The gateway restarted before this run settled.",
+                          last_event="run.interrupted", updated_at=time.time())
+            self._run_idempotency_store.update_status(run_id, status)
+        self._run_statuses[run_id] = status
+        self._run_owners[run_id] = scope
+        self._run_idempotency_ids.add(run_id)
+        return status
+
+    def _run_replay_response(self, request, outcome, record, gateway_session_key):
+        if outcome == "conflict":
+            return web.json_response(_openai_error(
+                "Idempotency-Key was already used with a different request payload",
+                code="idempotency_key_conflict"), status=409)
+        run_id = record["run_id"]
+        status = self._durable_run_status(request, run_id) or record["status"]
+        headers = {"Idempotency-Replayed": "true"}
+        if gateway_session_key:
+            headers["X-Hermes-Session-Key"] = gateway_session_key
+        return web.json_response({"run_id": run_id, "status": status.get("status", "queued"),
+                                  "replayed": True}, status=202, headers=headers)
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
@@ -6840,6 +6910,8 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        if run_id in self._run_idempotency_ids:
+            self._run_idempotency_store.update_status(run_id, current)
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -6943,16 +7015,29 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
+            return web.json_response(_openai_error("Idempotency-Key must be 1-255 visible ASCII characters",
+                                     code="invalid_idempotency_key"), status=400)
+        idempotency_scope = self._run_idempotency_scope(request)
+        idempotency_fingerprint = hashlib.sha256(json.dumps(
+            {"body": body, "gateway_session_key": gateway_session_key or ""},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        if idempotency_key:
+            outcome, record = self._run_idempotency_store.lookup(
+                idempotency_scope, idempotency_key, idempotency_fingerprint)
+            if outcome != "missing":
+                return self._run_replay_response(request, outcome, record, gateway_session_key)
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
 
         raw_input = body.get("input")
         if not raw_input:
@@ -7023,6 +7108,22 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        native_session_continuation = bool(
+            session_id and not conversation_history and not previous_response_id
+            and "conversation_history" not in body
+        )
+        if native_session_continuation:
+            db = await self._ensure_session_db_async()
+            if db is None:
+                return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+            try:
+                session_id = await asyncio.to_thread(db.resolve_resume_session_id, str(session_id))
+                conversation_history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            except Exception:
+                logger.exception("Native run history could not be loaded")
+                return web.json_response(_openai_error(
+                    "Session history unavailable", code="session_db_unavailable"), status=503)
+        self._run_owners[run_id] = idempotency_scope
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -7032,7 +7133,7 @@ class APIServerAdapter(BasePlatformAdapter):
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        q = _RunStream()
         created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
@@ -7061,13 +7162,24 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        self._set_run_status(
+        initial_status = self._set_run_status(
             run_id,
             "queued",
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
         )
+
+        if idempotency_key:
+            outcome, record = self._run_idempotency_store.reserve(
+                idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
+                owner_pid=self._run_owner_pid, owner_started=self._run_owner_started)
+            if outcome != "created":
+                for mapping in (self._run_streams, self._run_streams_created,
+                                self._run_approval_sessions, self._run_statuses, self._run_owners):
+                    mapping.pop(run_id, None)
+                return self._run_replay_response(request, outcome, record, gateway_session_key)
+            self._run_idempotency_ids.add(run_id)
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
@@ -7179,6 +7291,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
+                                **({"reload_session_history": True} if native_session_continuation else {}),
                             )
                         finally:
                             # Worker finished (interrupted or complete) —
@@ -7227,6 +7340,19 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
+                    )
+                elif isinstance(result, dict) and result.get("interrupted"):
+                    reason = _redact_api_error_text(
+                        result.get("interrupt_message") or result.get("error") or "Agent run interrupted")
+                    _put_event_if_active({
+                        "event": "run.interrupted",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "error": reason,
+                    })
+                    self._set_run_status(
+                        run_id, "interrupted", error=reason,
+                        last_event="run.interrupted", usage=usage,
                     )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
@@ -7371,7 +7497,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
+        status = self._durable_run_status(request, run_id)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -7380,54 +7506,88 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-
         run_id = request.match_info["run_id"]
-
-        # Allow subscribing slightly before the run is registered (race condition window)
+        if self._run_owners.get(run_id, self._run_idempotency_scope(request)) != self._run_idempotency_scope(request):
+            return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
+        # Allow subscribing slightly before the run is registered (race window).
         for _ in range(20):
             if run_id in self._run_streams:
                 break
             await asyncio.sleep(0.05)
         else:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-
-        q = self._run_streams[run_id]
-        self._run_stream_subscribers.add(run_id)
-
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-        await response.prepare(request)
-
+            return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
+        stream = self._run_streams[run_id]
+        raw_last_seq = request.headers.get("Last-Event-ID") or request.query.get("last_seq")
         try:
+            last_seq = max(-1, int(str(raw_last_seq).strip())) if raw_last_seq is not None else -1
+        except (TypeError, ValueError):
+            last_seq = -1
+        q, replay = stream.attach(last_seq)
+        self._run_stream_subscribers.add(run_id)
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+        async def _write(data: bytes) -> None:
+            try:
+                async with asyncio.timeout(_RUN_STREAM_WRITE_TIMEOUT):
+                    await response.write(data)
+            except TimeoutError:
+                with suppress(Exception):
+                    response.force_close()
+                raise
+
+        async def _write_event(seq: int, event: Dict[str, Any]) -> None:
+            payload = dict(event)
+            payload["seq"] = seq
+            await _write(_sse_frame(payload, id=seq))
+
+        prepared = False
+        try:
+            await response.prepare(request)
+            prepared = True
+            # Flush the response head before waiting on the queue: aiohttp holds the headers
+            # until the first body write, so a subscriber that connects before the run's first
+            # event (e.g. before `approval.request`) sees no bytes and fetch()/EventSource never
+            # resolve. A comment frame is ignored by every conforming SSE consumer.
+            await _write(b": open\n\n")
+            if replay and replay[0][0] > last_seq + 1:
+                truncation = {"run_id": run_id, "event": "replay.truncated", "oldest_retained_seq": replay[0][0]}
+                if raw_last_seq is not None:
+                    truncation["requested_seq"] = last_seq
+                await _write(_sse_frame(truncation))
+            for seq, event in replay:
+                if event is None:
+                    await _write(b": stream closed\n\n")
+                    return response
+                await _write_event(seq, event)
+            if stream.terminal and q.empty():
+                await _write(b": stream closed\n\n")
+                return response
             while True:
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    seq, event = await asyncio.wait_for(
+                        q.get(), timeout=30.0)
                 except asyncio.TimeoutError:
-                    await response.write(b": keepalive\n\n")
+                    await _write(b": keepalive\n\n")
                     continue
-                if event is None:
-                    # Run finished — send final SSE comment and close
-                    await response.write(b": stream closed\n\n")
+                if event is _RUN_STREAM_SUBSCRIBER_OVERFLOW:
+                    logger.debug("[api_server] closing slow SSE subscriber for run %s", run_id)
                     break
-                payload = _sse_frame(event)
-                await response.write(payload)
+                if event is None:  # run finished
+                    await _write(b": stream closed\n\n")
+                    break
+                await _write_event(seq, event)
         except Exception as exc:
+            if not prepared:
+                raise
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
-
+            stream.detach(q)
+            if not stream.subscribers:
+                self._run_stream_subscribers.discard(run_id)
         return response
 
 
@@ -7438,6 +7598,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        if self._run_owners.get(run_id, self._run_idempotency_scope(request)) != self._run_idempotency_scope(request):
+            return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
         status = self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(
@@ -7484,6 +7646,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                request_id=body.get("request_id") or None,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -7526,6 +7689,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        if self._run_owners.get(run_id, self._run_idempotency_scope(request)) != self._run_idempotency_scope(request):
+            return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
         agent = self._active_run_agents.get(run_id)
         task = self._active_run_tasks.get(run_id)
 
@@ -7593,11 +7758,14 @@ class APIServerAdapter(BasePlatformAdapter):
         stale_statuses = [
             run_id
             for run_id, status in list(self._run_statuses.items())
-            if status.get("status") in {"completed", "failed", "cancelled"}
+            if status.get("status") in {"completed", "failed", "cancelled", "interrupted"}
             and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_idempotency_ids.discard(run_id)
+            if run_id not in self._run_streams and run_id not in self._active_run_tasks:
+                self._run_owners.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -7815,6 +7983,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._response_store is not None:
             try:
                 self._response_store.close()
+                self._run_idempotency_store.close()
             except Exception:
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
