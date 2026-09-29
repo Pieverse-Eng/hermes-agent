@@ -941,7 +941,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
         # Find all skills the model may choose on its own; skills marked
         # disable-model-invocation are reached through their wrapper.
-        all_skills = [s for s in _find_all_skills() if s["model_invocable"]]
+        all_skills = [s for s in _find_all_skills() if s.get("model_invocable", True)]
 
         if not all_skills:
             return json.dumps(
@@ -1363,7 +1363,7 @@ def skill_view(
 
         if not skill_md or not skill_md.exists():
             available = [
-                s["name"] for s in _sort_skills(_find_all_skills()) if s["model_invocable"]
+                s["name"] for s in _sort_skills(_find_all_skills()) if s.get("model_invocable", True)
             ][:20]
             return json.dumps(
                 {
