@@ -85,6 +85,16 @@ logger = logging.getLogger(__name__)
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
+# Compression continuations inherit model_config. A fork marker only makes
+# this row independent when it points at this row's immediate parent.
+_COMPRESSION_CONTINUATION_FILTER_SQL = (
+    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._branched_from') "
+    "IS NOT {a}.parent_session_id "
+    "AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._delegate_from') "
+    "IS NOT {a}.parent_session_id "
+    "AND COALESCE({a}.source, '') != 'tool'"
+)
+
 
 def _system_prompt_hash(system_prompt: str) -> str:
     return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
@@ -3542,7 +3552,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ):
                 return None
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
                            AS _system_prompt_resolved
@@ -3550,9 +3560,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.parent_session_id = ?
                   AND s.ended_at IS NULL
-                  AND json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(s.source, '') != 'tool'
+                  AND {_COMPRESSION_CONTINUATION_FILTER_SQL.format(a='s')}
                 ORDER BY s.started_at ASC
                 LIMIT 2
                 """,
@@ -4247,7 +4255,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         A prior ``get_session`` failure must not compute a child id that the
         later write then persists: refresh would walk to the parent and
         fail-close. Markers bind to ``parent_session_id`` (same contract as
-        ``_NON_CONTINUATION_CHILD_FILTER_SQL``). Lock errors propagate so
+        ``_COMPRESSION_CONTINUATION_FILTER_SQL``). Lock errors propagate so
         ``_execute_write`` / ``acquire_session_turn_lease`` can retry.
         """
         if not session_id:
@@ -6040,9 +6048,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
+                      AND {_COMPRESSION_CONTINUATION_FILTER_SQL.format(a='child')}
                     ORDER BY
                       CASE
                         WHEN child.end_reason = 'compression' THEN 0
@@ -7578,12 +7584,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # run). This mirrors the child-exclusion in ``get_compression_tip``.
                 try:
                     child_row = self._conn.execute(
-                        "SELECT id FROM sessions "
-                        "WHERE parent_session_id = ? "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND COALESCE(source, '') != 'tool' "
-                        "ORDER BY started_at DESC, id DESC LIMIT 1",
+                        "SELECT child.id FROM sessions child "
+                        "WHERE child.parent_session_id = ? "
+                        f"AND {_COMPRESSION_CONTINUATION_FILTER_SQL.format(a='child')} "
+                        "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
                         (current,),
                     ).fetchone()
                 except Exception:
@@ -8271,7 +8275,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``agent._session_init_model_config``), so a delegate's continuation
         carries ``_delegate_from=<the delegate's own parent>``. Presence-only
         matching would treat that real continuation as a fork — the same
-        misclassification ``_NON_CONTINUATION_CHILD_FILTER_SQL`` already
+        misclassification ``_COMPRESSION_CONTINUATION_FILTER_SQL`` already
         avoids by binding both markers to the queried parent.
         """
         if session.get("source") == "tool":

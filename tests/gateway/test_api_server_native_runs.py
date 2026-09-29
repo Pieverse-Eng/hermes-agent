@@ -110,12 +110,20 @@ def test_stale_approval_id_cannot_approve_next_request():
         approval.unregister_gateway_notify("native-test")
 
 @pytest.mark.asyncio
-async def test_continuation_reads_compressed_tip(tmp_path):
+@pytest.mark.parametrize("fork_marker", [None, "_branched_from", "_delegate_from"])
+async def test_continuation_reads_compressed_tip(tmp_path, fork_marker):
     db = SessionDB(tmp_path / "state.db")
-    db.create_session("parent", "api_server")
-    db.end_session("parent", "compression")
-    db.create_session("tip", "api_server", parent_session_id="parent")
-    db.append_message("tip", "user", "compressed context")
+    config = {fork_marker: "origin"} if fork_marker else None
+    db.create_session("origin", "api_server")
+    db.create_session("parent", "api_server", parent_session_id="origin", model_config=config)
+    db.append_message("parent", "user", "before compression")
+    assert db.try_acquire_compression_lock("parent", "compressor")
+    db.publish_compression_child(
+        parent_session_id="parent", child_session_id="tip", source="api_server",
+        messages=[{"role": "user", "content": "compressed context"}],
+        model_config=config, compression_lock_holder="compressor",
+    )
+    db.release_compression_lock("parent", "compressor")
     adapter = _make_adapter()
     adapter._session_db = db
     agent = RecordingAgent()

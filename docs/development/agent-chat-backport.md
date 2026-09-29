@@ -132,3 +132,18 @@ request to reload native context.
 The review-round broader run covered 184 files: 1667 passed, 1 failed. Its only remaining failure is
 the same independently reproduced baseline primary-runtime fixture described
 above; no native-chat, API, persistence, or lease regression failed.
+
+## Database-focused follow-up review
+
+Compression children inherit their parent model configuration. Branch/delegate
+markers therefore identify an independent fork only when they name that row's
+immediate parent; they must not hide later compression continuations. The three
+SessionDB continuation queries now share this parent-bound predicate. Real SQLite
+and native Runs HTTP tests verify that original branches stay independent while
+compressed branch/delegate sessions resume the compacted history. The expanded
+focused regression run passed 143 tests across 10 files.
+
+The upstream durable-run store retains a few unused acknowledgement/retention
+helpers. They are not additional services or exposed custom chat endpoints; they
+remain with the upstream implementation to keep the backport auditable rather
+than introducing a second privately redesigned store.
