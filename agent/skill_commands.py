@@ -405,7 +405,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files, skill_user_invocable
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
@@ -429,6 +429,10 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # Skip skills not relevant to the current runtime env
                     # (kanban/docker/s6). Offer-time only; explicit load bypasses.
                     if not skill_matches_environment(frontmatter):
+                        continue
+                    # Agent Skills marked user-invocable: false get no slash
+                    # command; skipping before dedup lets a wrapper keep the name.
+                    if not skill_user_invocable(frontmatter):
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)
                     if name in seen_names:

@@ -381,6 +381,82 @@ class TestBuildSkillsSystemPrompt:
         assert "always-on" in second
         assert "kanban-worker" not in second
 
+    @staticmethod
+    def _wrapper_with_hidden_helper(skills_root):
+        wrapper = skills_root / "venues" / "okx"
+        helper = wrapper / "vendor" / "okx-agentic-wallet"
+        helper.mkdir(parents=True)
+        (wrapper / "SKILL.md").write_text("---\nname: okx\ndescription: OKX wrapper\n---\n")
+        (helper / "SKILL.md").write_text(
+            "---\n"
+            "name: okx-agentic-wallet\n"
+            "description: Vendored wallet reference\n"
+            "disable-model-invocation: true\n"
+            "user-invocable: false\n"
+            "---\n"
+        )
+
+    def test_excludes_model_hidden_skills_on_scan_and_snapshot(self, monkeypatch, tmp_path):
+        """Skills marked disable-model-invocation stay out of the index on both paths."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._wrapper_with_hidden_helper(tmp_path / "skills")
+
+        first = build_skills_system_prompt()
+        assert "okx" in first
+        assert "okx-agentic-wallet" not in first
+
+        prompt_globals = build_skills_system_prompt.__globals__
+        prompt_globals["clear_skills_system_prompt_cache"](clear_snapshot=False)
+        monkeypatch.setitem(
+            prompt_globals,
+            "_parse_skill_file",
+            lambda _skill_file: pytest.fail("snapshot fast path should be used"),
+        )
+
+        second = build_skills_system_prompt()
+        assert "okx" in second
+        assert "okx-agentic-wallet" not in second
+
+    def test_excludes_model_hidden_skills_from_external_dirs(self, monkeypatch, tmp_path):
+        """External skill dirs apply the same disable-model-invocation filter."""
+        hermes_home = tmp_path / "home"
+        (hermes_home / "skills").mkdir(parents=True)
+        external = tmp_path / "external"
+        self._wrapper_with_hidden_helper(external)
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external}\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        first = build_skills_system_prompt()
+        assert "okx" in first
+        assert "okx-agentic-wallet" not in first
+
+        build_skills_system_prompt.__globals__["clear_skills_system_prompt_cache"](
+            clear_snapshot=False
+        )
+        second = build_skills_system_prompt()
+        assert "okx" in second
+        assert "okx-agentic-wallet" not in second
+
+    def test_snapshot_from_before_the_flag_is_rebuilt(self, monkeypatch, tmp_path):
+        """A snapshot written without the flag must not keep serving hidden skills."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._wrapper_with_hidden_helper(tmp_path / "skills")
+        prompt_globals = build_skills_system_prompt.__globals__
+        current_version = prompt_globals["_SKILLS_SNAPSHOT_VERSION"]
+        current_flag = prompt_globals["skill_model_invocable"]
+
+        # Simulate the previous release: older snapshot version, flag ignored.
+        monkeypatch.setitem(prompt_globals, "_SKILLS_SNAPSHOT_VERSION", current_version - 1)
+        monkeypatch.setitem(prompt_globals, "skill_model_invocable", lambda _frontmatter: True)
+        assert "okx-agentic-wallet" in build_skills_system_prompt()
+
+        monkeypatch.setitem(prompt_globals, "_SKILLS_SNAPSHOT_VERSION", current_version)
+        monkeypatch.setitem(prompt_globals, "skill_model_invocable", current_flag)
+        prompt_globals["clear_skills_system_prompt_cache"](clear_snapshot=False)
+        assert "okx-agentic-wallet" not in build_skills_system_prompt()
+
     def test_snapshot_keeps_environment_skill_description_for_later_activation(
         self, monkeypatch, tmp_path
     ):

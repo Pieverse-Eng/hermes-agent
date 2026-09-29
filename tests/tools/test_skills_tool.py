@@ -317,6 +317,37 @@ class TestSkillsList:
 # ---------------------------------------------------------------------------
 
 
+class TestModelHiddenSkills:
+    HIDDEN = "disable-model-invocation: true\nuser-invocable: false\n"
+
+    def test_list_hides_flagged_helpers_but_they_stay_loadable(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            wrapper = _make_skill(tmp_path, "okx")
+            _make_skill(wrapper / "vendor", "okx-agentic-wallet", frontmatter_extra=self.HIDDEN)
+            listed = json.loads(skills_list())
+            through_wrapper = json.loads(
+                skill_view("okx", file_path="vendor/okx-agentic-wallet/SKILL.md")
+            )
+            by_name = json.loads(skill_view("okx-agentic-wallet"))
+
+        names = [s["name"] for s in listed["skills"]]
+        assert "okx" in names
+        assert "okx-agentic-wallet" not in names
+        assert through_wrapper["success"] is True
+        # Explicit loads (a user's slash command, a wrapper) still resolve it.
+        assert by_name["success"] is True
+
+    def test_wrapper_outranks_same_named_hidden_helper(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            # The helper is scanned first (sorted path), then the wrapper.
+            _make_skill(tmp_path, "rootdata", frontmatter_extra=self.HIDDEN, category="a-vendor")
+            _make_skill(tmp_path, "rootdata", category="research")
+            listed = json.loads(skills_list())
+
+        matches = [s for s in listed["skills"] if s["name"] == "rootdata"]
+        assert [s["category"] for s in matches] == ["research"]
+
+
 class TestSkillView:
     def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
