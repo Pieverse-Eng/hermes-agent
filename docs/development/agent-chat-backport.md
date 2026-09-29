@@ -1,149 +1,121 @@
 # Native Agent Chat backport
 
-This fork selectively carries official NousResearch Hermes changes onto
-`d7b3e4f32a3ee7db62fee928cf1da0a6dfeb5369`. It does not update the upstream
-baseline, introduce an alternate chat API, or include Bot Mode/Group Chat.
+## Scope and maintenance policy
 
-## Contract
+This is a selective backport of official NousResearch Hermes functionality onto
+`d7b3e4f32a3ee7db62fee928cf1da0a6dfeb5369`, with explicit old-version adaptations
+and local correctness fixes. It is **not** an unmodified cherry-pick or a new
+chat protocol. It does not upgrade the upstream baseline or bring in Group Chat,
+Bot Mode, desktop features or the upstream repository-wide module refactor.
 
-`GET /v1/capabilities` advertises `features.runs_idempotency` with
-`supported`, `durable`, and `retention_seconds` (86400). Clients must require
-`durable: true` before retrying an ambiguous submission. The additional
-backport discovery flags are `run_session_history`, `run_events_replay`, and
-`run_approval_request_id`.
+Prefer unchanged upstream modules and implementation fragments. Keep unavoidable
+adaptation at the existing API, AIAgent and SessionDB boundaries. Before adding a
+local fix, check the official follow-up chain; identify any remaining local fix
+below and keep its behavior regression. Do not add a second executor, transcript
+store or public compatibility protocol.
 
-`POST /v1/runs` with `input`, `session_id`, and `Idempotency-Key` resumes the
-native SessionDB transcript, preserving tool calls/results and following the
-current compression continuation. The agent's durable conversation-root lease
-serializes load/run/flush across processes, refreshes native history after admission, preserves explicit caller/Responses snapshots, refreshes during long turns, and
-fences stale transcript writes. Approvals retain their separate per-run scope.
+## Source ledger
 
-A retry with the same key, JSON body, and session-key header returns HTTP 202
-with the original `run_id`, `replayed: true`, and `Idempotency-Replayed: true`.
-A different body under the same scoped key returns HTTP 409 with
-`error.code=idempotency_key_conflict`. Keys are scoped to authenticated bearer
-identity and routed profile; credentials and request bodies are not stored.
-Reservations use SQLite `BEGIN IMMEDIATE` and survive restart. Keyed run status
-(including terminal output/error/usage/session_id) is recoverable through
-`GET /v1/runs/{run_id}`. A nonterminal reservation whose owning process died
-becomes `interrupted`, never a new execution. Terminal reservations expire
-24 hours after their last status update; clients must not retry indefinitely.
-The upstream store falls back to memory if disk storage cannot open, and the
-capability then reports `durable: false`.
+All source revisions refer to https://github.com/NousResearch/hermes-agent.
+Commit references identify source material, not claims that whole commits were
+cherry-picked. The initial backport preserves upstream contributor attribution.
 
-SSE events carry numeric `id:` and `seq`; reconnect using `Last-Event-ID` or
-`last_seq`. Each subscriber receives its own fanout queue. Replay retains the
-last 1000 events in memory, reports `replay.truncated` on a gap, and closes slow
-subscribers rather than silently skipping events. Replay is not durable across
-restart. The existing upstream 300-second orphan transport TTL remains;
-clients recover expired/disconnected streams through run status and SessionDB.
-A transport failure is not evidence that the run failed.
+| Capability | Official source | Backport boundary |
+| --- | --- | --- |
+| Durable run idempotency | `e7433910e96c097ddf34352ea28653e83d951fbb` | `api_server_run_idempotency.py` is copied unchanged. Admission, status and bearer/profile scope are wired into the old monolithic adapter. Room grants/steering/routes are excluded. |
+| Native session continuation | `e7433910e96c097ddf34352ea28653e83d951fbb`, `0efb525420668b91568aa0e73050c5b41b336044` | Reuse the old SessionDB history/resume helpers. Do not import declared-room/wake machinery just to continue a supplied session ID. |
+| Conversation-root leases | `6e929a96946a5c69644d08bd59c9dcfdc757e91b`, `3b0945601955e13b6159816141dc4acbc80c4132`, `5e2be43fd4`, `c21efeeb52`, `f1025b2c00`, `19b1204392`, `967391cd4b`, `6b25e67047` | Carry acquire/wait/refresh/release and stale-writer fencing into the old AIAgent/SessionDB layout. Do not import the later facade/finalizer refactor. Failed-write classification comes from `2a9f5b3476`. |
+| SSE fanout and replay | `52a2835136d44896427a20b97103cffefacb94aa`, `4937863e4d28106d62bdd4571cdabc6783aaf4c3`, `10963689dcbb8b9271315150891356adee5c698f`, `61286a889ec9ee1162b1a80bf1d13c6a914f2bfe` | `_RunStream` and stream behavior use the resulting official implementation at `e824425e8c15b05e0847e818f3860c58290394cc`, adapted to the existing HTTP adapter. |
+| Request-bound approvals | `f703e7061869fd6af9efb599ee3cfa435c49c551` | Carry queue request-ID matching and API forwarding; omit desktop/TUI reconnect and acknowledgement plumbing. |
 
-Approval events carry `request_id`; clients must send that exact ID with
-`choice: once` or `deny` to `POST /v1/runs/{run_id}/approval`. A stale ID cannot
-resolve the next queued approval. Omission retains the pre-existing FIFO
-contract for older clients; Agent Chat must always supply the ID. Pending
-approval waits are not reconstructed after restart, and an interrupted run
-must never automatically grant or repeat its old approval. Stop remains
-cooperative and does not promise rollback of effects already executed.
+Directly cherry-picking only these revisions is insufficient: `e7433910e9`
+contains 52 files of Group Chat work and extracts the Runs adapter; subsequent
+SSE and continuation patches target that extraction. Pulling their full
+ancestry would also introduce unrelated refactors. Selective backporting avoids
+that dependency expansion while preserving the required native behavior.
 
-## Upstream provenance and adaptations
+## Explicit local adaptations and fixes
 
-All revisions below are from https://github.com/NousResearch/hermes-agent:
+These are maintenance obligations, not additional official features. The tests
+below are the acceptance criteria for replacing them during an upstream upgrade.
 
-- `e7433910e96c097ddf34352ea28653e83d951fbb`: native session history loading,
-  durable idempotency store/admission/status and authenticated profile scope.
-  The store is retained as the original standalone module; Group Chat routes,
-  grants, steering, and unrelated extraction are excluded.
-- `0efb525420668b91568aa0e73050c5b41b336044`: adopt the live compression tip for
-  client-addressed native runs. Existing fork SessionDB helpers are reused.
-  Native history read failures return 503 before admission, instead of silently
-  running an empty context.
-- `6e929a96946a5c69644d08bd59c9dcfdc757e91b`, `3b0945601955e13b6159816141dc4acbc80c4132`,
-  `5e2be43fd4`, `c21efeeb52`, `f1025b2c00`, `19b1204392`, `967391cd4b`,
-  `6b25e67047`: conversation-root leases, interruptible waiting, refresh,
-  compression-root handling, transcript write fencing, and refresher teardown.
-  Later reload-skipping optimization is deliberately excluded: native API
-  submissions must reload the admitted durable transcript. Existing base
-  error text is retained; classification at the failed write is carried from
-  `2a9f5b3476` for the lease regression contract.
-- `52a2835136d44896427a20b97103cffefacb94aa`,
-  `4937863e4d28106d62bdd4571cdabc6783aaf4c3`,
-  `10963689dcbb8b9271315150891356adee5c698f`,
-  `61286a889ec9ee1162b1a80bf1d13c6a914f2bfe`: SSE fanout, replay, bounded
-  subscriber buffering, write timeout, and explicit overflow disconnection.
-  Stream code is taken from the resulting upstream implementation at
-  `e824425e8c15b05e0847e818f3860c58290394cc` and adapted to the existing adapter.
-- `f703e7061869fd6af9efb599ee3cfa435c49c551`: stable approval request IDs and
-  matching under the approval queue lock. Desktop-only acknowledgements and
-  reconnect plumbing are excluded; the API forwards the correlated ID.
+| Local delta | Why it exists on this baseline | Replacement/removal condition |
+| --- | --- | --- |
+| API glue in `api_server.py` | Old baseline keeps Runs handlers in one class. Wires upstream store, streams, approval IDs and native history into those handlers. | Use the official Runs module during the full upgrade; remove the duplicate glue after the HTTP contract suite passes. |
+| History read failure returns 503; explicit empty history remains authoritative | Prevent a failed history read from silently starting an empty-context turn, and preserve existing Responses/caller snapshots. This is stricter than the cited upstream fallback. | Verify the target official behavior; if it differs, explicitly resolve the product behavior before deleting the guard. Do not silently copy the guard into the new runtime. |
+| Internal `reload_session_history` argument | Native continuation must reload after lease admission; explicit history/Responses callers must retain their supplied snapshot. Avoid importing the full new turn facade for this distinction. | Adopt the target official history/admission mechanism after continuation, contention and explicit-history tests pass. |
+| Nonterminal cross-worker status refresh and interruption mapping | Cached status must not hide completion/owner death; lease interruption must not report success. | Replace with official status/recovery paths after restart and interruption regressions pass. |
+| First-turn lease and final-persistence failure handling (`06713e6c54`) | Serialize a session before its first row exists and avoid reporting a successful reply whose final transcript was rejected by the lease fence. | Verify equivalent behavior in the target official lease/finalizer path, then discard these old-layout additions. |
+| Parent-bound branch/delegate predicate (`cd17f0b27b`) | Compression descendants inherit fork markers; those markers must not hide the live compressed continuation or merge independent branches. | Use the target official lineage resolver once branch/delegate isolation and compressed continuation regressions pass. |
 
-Upstream authors remain credited in the backport commit. These patches are
-intended to be superseded by a separately reviewed upstream upgrade containing
-these behaviors. At that point remove duplicate adapters/discovery flags only
-after preserving the published capability and recovery contracts.
+A few unused helpers remain inside the unchanged official durable store. Keeping
+that module intact makes comparison and eventual removal easier than pruning it
+into a private variant. Do not expose those helpers as new APIs.
 
-## Verification
+## Public runtime contract
 
-Tests use real temporary SQLite databases and deterministic fake agents; no
-provider/model call, production deployment, or real tool execution is needed.
-Native HTTP tests cover tool metadata, compression continuation, retry/conflict,
-restart interruption, event replay, and stale approval IDs. Upstream lease tests
-exercise separate database handles, lock contention, compression roots,
-refresh, interrupted waiting, and stale-writer fencing.
+Use official feature names from `/v1/capabilities`: `run_submission`,
+`run_status`, `run_events_sse`, `session_resources`, `runs_idempotency`,
+`run_stop`, `run_approval_response`, `approval_events` and `tool_progress_events`.
+There are no backport-only capability flags. In particular, clients must not
+require `run_session_history`, `run_events_replay` or `run_approval_request_id`.
+The old runtime without durable idempotency remains unsupported.
 
-Run with the repository's hermetic wrapper:
+These flags advertise endpoints and availability, not proof of every continuation,
+replay or approval semantic. Before promoting any image (backport or later
+upstream upgrade), validate the behavior contract against its exact pinned source
+and deployed authentication/Router path. Never infer that any arbitrary build
+with these flags is fully tested.
+
+- Native Runs accept the current `input`, `session_id` and `Idempotency-Key`.
+  SessionDB remains authoritative for context, including tool calls/results and
+  compression continuations; Platform replay records are not injected as history.
+- Keys are scoped to authenticated bearer identity and profile. Identical retries
+  return the original run; changed payloads conflict. SQLite reservations survive
+  restart. An unfinished reservation whose owning process died is interrupted,
+  never automatically executed again. Terminal retention is 24 hours after the
+  last update. A memory-only store advertises `durable: false`.
+- SSE uses numeric `id`/`seq` and `Last-Event-ID` or `last_seq`. Replay keeps the
+  latest 1,000 events in memory, reports truncation and disconnects slow readers.
+  Replay is not restart-durable; the existing 300-second orphan transport TTL
+  remains. Recover using native run status and history, without resubmission.
+- Approvals carry `request_id`; Platform always sends the exact pending ID with
+  `once` or `deny`. The legacy FIFO omission behavior remains for older clients.
+  Restart does not reconstruct pending approvals or authorize their replay.
+- Stop is cooperative; it does not roll back effects already executed.
+
+## Verification and future upstream upgrade
+
+Tests use temporary SQLite and stubbed model execution; no provider call or live
+trade is required. Run via the repository's hermetic wrapper:
 
 ```sh
 scripts/run_tests.sh tests/state tests/run_agent tests/gateway/test_api_server*.py -j 8 -q
 ```
 
-Broad local verification: 184 files, 1652 passed, 8 failed before installing
-optional pinned `anthropic==0.87.0`. Rerunning all five failing files after that
-installation: 299 passed, one failure. The remaining
-`test_primary_runtime_restore.py::TestTryRecoverPrimaryTransport::test_allowed_for_nous_anthropic_messages`
-also fails on an untouched `origin/main` worktree (23 pass / 1 fail), because
-its empty model fixture resolves a 36864-token context below the 64000 minimum.
-This baseline provider-fixture failure is outside the backport.
+Key behavior suites: `test_api_server_native_runs.py`,
+`test_cross_process_turn_lease.py`, `test_session_turn_lease.py` and
+`test_compression_lineage_guard.py`. Platform additionally runs its native HTTP
+integration tier against `HERMES_TEST_ROOT` and uses the official capability
+response shape in adapter tests. Keep those tests through the later upgrade;
+adapt test fixtures to official internals without weakening their assertions.
 
-## Review hardening
+For the eventual full upgrade:
 
-- Durable statuses loaded from another worker are refreshed from SQLite until
-  terminal; an earlier GET cannot hide subsequent completion or owner death.
-- The native adapter maps `interrupted: true` agent results (including lease
-  loss) to `run.interrupted`, persists the reason/status, and never emits a
-  successful completion for that run. Explicit stop retains its cancelled
-  status. Idempotent retries return the interrupted original run.
-- Agent turn admission only reloads caller-supplied history when its caller
-  explicitly sets `reload_session_history=True`. Native session continuation
-  opts in, after resolving its initial history source; explicit history and
-  `previous_response_id` retain their supplied snapshots. Calls without any
-  supplied history also load durable state. The lease and write fence apply
-  regardless of which history source is authoritative.
-- Integrated regressions combine the HTTP adapter, real AIAgent admission and
-  real SQLite handles, stubbing only the model conversation body. Owner-death
-  polling additionally uses a real short-lived subprocess.
+1. Select and pin an official revision containing the source capabilities and
+   relevant follow-up fixes. Review existing Pieverse integrations separately.
+2. Replace this backport's modules/glue with official implementations. Do not
+   overwrite unrelated fork customizations or duplicate the old lease/store code.
+3. Run native continuation/isolation, tool history/compression, duplicate/conflict,
+   restart/reconnect, stop and stale-approval tests. Check every local-delta row
+   above; any remaining semantic difference needs an explicit decision.
+4. Run Platform native integration and deployed canary checks for both runtimes.
+   Keep Platform on the official protocol; no new fork-only discovery flags.
+5. Once equivalent behavior is verified, remove superseded adaptation code and
+   archive this ledger as upgrade provenance. Do not remove regressions merely
+   because their original source files moved.
 
-Review-round focused verification: 65 tests passed across native HTTP recovery,
-original API runs/approval/stop, agent turn admission, and real SQLite lease
-suites. Explicit empty history is also preserved; it is not reinterpreted as a
-request to reload native context.
-
-The review-round broader run covered 184 files: 1667 passed, 1 failed. Its only remaining failure is
-the same independently reproduced baseline primary-runtime fixture described
-above; no native-chat, API, persistence, or lease regression failed.
-
-## Database-focused follow-up review
-
-Compression children inherit their parent model configuration. Branch/delegate
-markers therefore identify an independent fork only when they name that row's
-immediate parent; they must not hide later compression continuations. The three
-SessionDB continuation queries now share this parent-bound predicate. Real SQLite
-and native Runs HTTP tests verify that original branches stay independent while
-compressed branch/delegate sessions resume the compacted history. The expanded
-focused regression run passed 143 tests across 10 files.
-
-The upstream durable-run store retains a few unused acknowledgement/retention
-helpers. They are not additional services or exposed custom chat endpoints; they
-remain with the upstream implementation to keep the backport auditable rather
-than introducing a second privately redesigned store.
+Do not run a pre-backport binary concurrently with a lease-aware Hermes binary
+against the same writable SQLite state: the pre-backport binary does not
+participate in the new leases. Image
+building, migration and production promotion are separate release operations.
