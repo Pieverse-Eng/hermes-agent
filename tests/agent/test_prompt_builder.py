@@ -417,6 +417,28 @@ class TestBuildSkillsSystemPrompt:
         assert "okx" in second
         assert "okx-agentic-wallet" not in second
 
+    def test_excludes_model_hidden_skills_from_external_dirs(self, monkeypatch, tmp_path):
+        """External skill dirs apply the same disable-model-invocation filter."""
+        hermes_home = tmp_path / "home"
+        (hermes_home / "skills").mkdir(parents=True)
+        external = tmp_path / "external"
+        self._wrapper_with_hidden_helper(external)
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external}\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        first = build_skills_system_prompt()
+        assert "okx" in first
+        assert "okx-agentic-wallet" not in first
+
+        build_skills_system_prompt.__globals__["clear_skills_system_prompt_cache"](
+            clear_snapshot=False
+        )
+        second = build_skills_system_prompt()
+        assert "okx" in second
+        assert "okx-agentic-wallet" not in second
+
     def test_snapshot_from_before_the_flag_is_rebuilt(self, monkeypatch, tmp_path):
         """A snapshot written without the flag must not keep serving hidden skills."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
