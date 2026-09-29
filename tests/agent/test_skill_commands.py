@@ -63,6 +63,17 @@ def _allow_certik_skill_view(monkeypatch):
 
 
 class TestScanSkillCommands:
+    def test_user_invocable_false_gets_no_slash_command(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "helper", frontmatter_extra="user-invocable: false\n")
+            _make_skill(
+                tmp_path, "model-hidden", frontmatter_extra="disable-model-invocation: true\n"
+            )
+            result = scan_skill_commands()
+
+        assert "/helper" not in result
+        # Hidden from the model only: the user can still invoke it.
+        assert "/model-hidden" in result
 
 
 
