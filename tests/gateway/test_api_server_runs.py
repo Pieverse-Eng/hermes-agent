@@ -92,7 +92,7 @@ def _make_slow_agent(**kwargs):
 
     mock_agent.interrupt = MagicMock(side_effect=_do_interrupt)
 
-    def _slow_run(user_message=None, conversation_history=None, task_id=None):
+    def _slow_run(user_message=None, conversation_history=None, task_id=None, reload_session_history=False):
         ready.set()
         # Block until interrupt() is called
         interrupted.wait(timeout=10)
@@ -185,8 +185,10 @@ class TestStartRun:
                 status = await status_response.json()
                 assert status["status"] == "failed"
                 assert run_id not in adapter._active_run_tasks
-                assert adapter._run_streams[run_id].get_nowait()["event"] == "run.failed"
-                assert adapter._run_streams[run_id].get_nowait() is None
+                stream = adapter._run_streams[run_id]
+                _, replay = stream.attach()
+                assert replay[0][1]["event"] == "run.failed"
+                assert replay[1][1] is None
         finally:
             await client.close()
 
@@ -204,7 +206,7 @@ class TestStartRun:
             with patch.object(adapter, "_create_agent") as mock_create:
                 mock_agent = MagicMock()
 
-                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                def _capture_run(user_message=None, conversation_history=None, task_id=None, reload_session_history=False):
                     from tools.async_delegation import _current_origin_session_id
 
                     captured["origin_session_id"] = _current_origin_session_id()
@@ -319,55 +321,70 @@ class TestRunSessionHistory:
         {"role": "assistant", "content": "Hyperliquid is the only quote."},
     ]
 
-    async def _history_seen(self, adapter, body):
-        db = MagicMock()
-        db.get_messages_as_conversation.return_value = list(self.STORED)
+    async def _history_seen(self, adapter, body, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("ax:web:s1", "api_server")
+        for message in self.STORED:
+            db.append_message(
+                "ax:web:s1", message["role"], message["content"],
+                tool_calls=message.get("tool_calls"),
+                tool_call_id=message.get("tool_call_id"),
+            )
         adapter._session_db = db
         seen = {}
 
-        def _capture(user_message=None, conversation_history=None, task_id=None):
-            seen["history"] = conversation_history
+        def _capture(user_message=None, conversation_history=None, task_id=None,
+                     reload_session_history=False):
+            seen["history"] = [
+                {key: value for key, value in message.items() if key != "timestamp"}
+                for message in conversation_history
+            ]
             return {"final_response": "done"}
 
-        app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_create_agent") as mock_create:
-                mock_agent = MagicMock()
-                mock_agent.run_conversation.side_effect = _capture
-                mock_agent.session_prompt_tokens = 0
-                mock_agent.session_completion_tokens = 0
-                mock_agent.session_total_tokens = 0
-                mock_create.return_value = mock_agent
+        try:
+            app = _create_runs_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    mock_agent = MagicMock()
+                    mock_agent.run_conversation.side_effect = _capture
+                    mock_agent.session_prompt_tokens = 0
+                    mock_agent.session_completion_tokens = 0
+                    mock_agent.session_total_tokens = 0
+                    mock_create.return_value = mock_agent
 
-                resp = await cli.post("/v1/runs", json=body)
-                assert resp.status == 202
-                run_id = (await resp.json())["run_id"]
-                for _ in range(40):
+                    resp = await cli.post("/v1/runs", json=body)
+                    assert resp.status == 202
+                    run_id = (await resp.json())["run_id"]
+                    task = adapter._active_run_tasks.get(run_id)
+                    if task is not None:
+                        await asyncio.wait_for(task, timeout=5)
                     status = await (await cli.get(f"/v1/runs/{run_id}")).json()
-                    if status["status"] == "completed":
-                        break
-                    await asyncio.sleep(0.05)
-        return seen["history"], db
+                    assert status["status"] == "completed"
+            return seen["history"]
+        finally:
+            db.close()
 
     @pytest.mark.asyncio
-    async def test_session_id_loads_stored_history_with_tool_results(self, adapter):
-        history, db = await self._history_seen(adapter, {"input": "spot", "session_id": "ax:web:s1"})
-        db.get_messages_as_conversation.assert_called_once_with("ax:web:s1")
+    async def test_session_id_loads_stored_history_with_tool_results(self, adapter, tmp_path):
+        history = await self._history_seen(
+            adapter, {"input": "spot", "session_id": "ax:web:s1"}, tmp_path,
+        )
         assert history == self.STORED
 
     @pytest.mark.asyncio
-    async def test_caller_history_wins_over_stored_history(self, adapter):
+    async def test_caller_history_wins_over_stored_history(self, adapter, tmp_path):
         caller = [{"role": "user", "content": "from caller"}]
-        history, db = await self._history_seen(
-            adapter, {"input": "spot", "session_id": "ax:web:s1", "conversation_history": caller}
+        history = await self._history_seen(
+            adapter, {"input": "spot", "session_id": "ax:web:s1", "conversation_history": caller},
+            tmp_path,
         )
-        db.get_messages_as_conversation.assert_not_called()
         assert history == caller
 
     @pytest.mark.asyncio
-    async def test_run_without_session_id_stays_stateless(self, adapter):
-        history, db = await self._history_seen(adapter, {"input": "hello"})
-        db.get_messages_as_conversation.assert_not_called()
+    async def test_run_without_session_id_stays_stateless(self, adapter, tmp_path):
+        history = await self._history_seen(adapter, {"input": "hello"}, tmp_path)
         assert history == []
 
 

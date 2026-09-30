@@ -69,6 +69,33 @@ def test_find_live_compression_child_ignores_non_continuation_children(
     assert child["id"] == "canonical"
 
 
+@pytest.mark.parametrize("fork_marker", ["_branched_from", "_delegate_from"])
+def test_compressed_fork_resumes_its_continuation_without_hijacking_origin(
+    db: SessionDB, fork_marker: str,
+) -> None:
+    _compression_parent(db, "origin")
+    config = {fork_marker: "origin"}
+    db.create_session("fork", source="webui", parent_session_id="origin", model_config=config)
+    db.append_message("fork", "user", "before compression")
+    assert db.try_acquire_compression_lock("fork", "compressor")
+    db.publish_compression_child(
+        parent_session_id="fork", child_session_id="continuation", source="webui",
+        messages=[{"role": "user", "content": "current compressed context"}],
+        model_config=config, compression_lock_holder="compressor",
+    )
+    db.release_compression_lock("fork", "compressor")
+    # New real forks and tool sessions still cannot hijack the continuation.
+    db.create_session("nested-fork", source="webui", parent_session_id="fork", model_config={fork_marker: "fork"})
+    db.create_session("tool-child", source="tool", parent_session_id="fork")
+
+    assert db.get_compression_tip("origin") == "origin"
+    assert db.resolve_resume_session_id("origin") == "origin"
+    assert db.get_compression_tip("fork") == "continuation"
+    assert db.resolve_resume_session_id("fork") == "continuation"
+    assert db.find_live_compression_child("fork")["id"] == "continuation"
+    assert db._session_turn_lease_key("continuation") == "fork"
+
+
 
 
 
