@@ -7,6 +7,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from agent import relay_runtime
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -710,3 +712,71 @@ def test_non_lease_persistence_failure_preserves_existing_error(tmp_path, monkey
         assert result == {"completed": False, "failed": True, "error": "storage unavailable"}
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("in_place", [True, False])
+@pytest.mark.parametrize("takeover", [True, False])
+def test_compression_commit_respects_turn_ownership(
+    tmp_path, monkeypatch, in_place, takeover
+):
+    """A resumed compressor cannot replace a successor's live context."""
+    from agent.conversation_compression import compress_context
+    from hermes_state import SessionTurnLeaseLostError
+    from tests.agent.test_compression_worker_isolation_76354 import _build_agent_with_db
+
+    db = SessionDB(tmp_path / "state.db")
+    successor = SessionDB(tmp_path / "state.db")
+    db.create_session("chat", "api_server")
+    original = [{"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"}]
+    db.append_messages_batch("chat", original)
+    agent = _build_agent_with_db(db, "chat")
+    agent.platform = "api_server"
+    agent.compression_in_place = in_place
+    agent._cached_system_prompt = "sys"
+    compacted = [{"role": "user", "content": "[CONTEXT COMPACTION] old context"},
+                 {"role": "assistant", "content": "old tail"}]
+
+    def summary_after_pause(messages, **kwargs):
+        if takeover:
+            # Expiry simulates a process pause without relying on wall-clock sleeps.
+            successor._execute_write(lambda conn: conn.execute(
+                "UPDATE session_turn_leases SET expires_at=0"))
+            assert successor.try_acquire_session_turn_lease("chat", "next-owner")
+            if in_place:
+                successor._execute_write(lambda conn: conn.execute(
+                    "UPDATE compression_locks SET expires_at=0"))
+                successor.append_message("chat", "user", "new owner message",
+                                         turn_lease_holder="next-owner")
+            # Rotation keeps the independent compression lease valid: owning
+            # that lease alone must not permit publication after a turn takeover.
+        return compacted
+
+    agent.context_compressor.compress.side_effect = summary_after_pause
+
+    def loop(agent, message, system, history, *args, **kwargs):
+        if message != "followup":
+            compress_context(agent, history, "sys", approx_tokens=100000, force=True)
+        return {"completed": True, "final_response": "done"}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", loop)
+    try:
+        if takeover:
+            with pytest.raises(SessionTurnLeaseLostError):
+                agent.run_conversation("continue", reload_session_history=True)
+            assert db.get_session("chat")["ended_at"] is None
+            assert db.find_live_compression_child("chat") is None
+            expected = ["old question", "old answer"]
+            if in_place:
+                expected.append("new owner message")
+            assert [m["content"] for m in db.get_messages("chat")] == expected
+            successor.release_session_turn_lease("chat", "next-owner")
+            # An internal stop must not poison the next use of a cached agent.
+            assert agent.run_conversation("followup", reload_session_history=True)["completed"]
+        else:
+            assert agent.run_conversation("continue", reload_session_history=True)["completed"]
+            live_id = db.resolve_resume_session_id("chat")
+            assert [m["content"] for m in db.get_messages(live_id)] == [m["content"] for m in compacted]
+    finally:
+        db.close()
+        successor.close()

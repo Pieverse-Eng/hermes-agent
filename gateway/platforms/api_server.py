@@ -6873,9 +6873,11 @@ class APIServerAdapter(BasePlatformAdapter):
         alive = pid > 0 and _pid_exists(pid) and (
             not started or int(get_process_start_time(pid) or 0) == started)
         if status.get("status") not in {"completed", "failed", "cancelled", "interrupted"} and not alive:
-            status.update(status="interrupted", error="The gateway restarted before this run settled.",
-                          last_event="run.interrupted", updated_at=time.time())
-            self._run_idempotency_store.update_status(run_id, status)
+            status = self._run_idempotency_store.interrupt_if_unsettled(
+                scope, run_id, "The gateway restarted before this run settled."
+            )
+            if status is None:
+                return None
         self._run_statuses[run_id] = status
         self._run_owners[run_id] = scope
         self._run_idempotency_ids.add(run_id)

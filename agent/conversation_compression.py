@@ -3200,6 +3200,12 @@ def compress_context(
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
+                        turn_lease_holder=getattr(
+                            agent, "_active_session_turn_lease_holder", None
+                        ),
+                        turn_lease_ttl_seconds=getattr(
+                            agent, "_active_session_turn_lease_ttl_seconds", 300.0
+                        ) or 300.0,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
@@ -3268,6 +3274,12 @@ def compress_context(
                     )
                     agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
+                        turn_lease_holder=getattr(
+                            agent, "_active_session_turn_lease_holder", None
+                        ),
+                        turn_lease_ttl_seconds=getattr(
+                            agent, "_active_session_turn_lease_ttl_seconds", 300.0
+                        ) or 300.0,
                         child_session_id=new_session_id,
                         source=agent.platform
                         or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
@@ -3335,6 +3347,17 @@ def compress_context(
                     }
                 _session_commit_succeeded = True
             except Exception as e:
+                from hermes_state import SessionTurnLeaseLostError
+
+                if isinstance(e, SessionTurnLeaseLostError):
+                    # A compression lease does not confer ownership of the
+                    # conversation turn. Never continue with a stale summary
+                    # or report success after the durable turn fence rejects it.
+                    agent._session_turn_lease_lost = True
+                    message = "Session ownership changed during compression."
+                    agent._session_turn_lease_interrupt_message = message
+                    agent.interrupt(message)
+                    raise
                 if (
                     not in_place
                     and locals().get("old_session_id")

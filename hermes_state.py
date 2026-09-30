@@ -3582,6 +3582,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
+        turn_lease_holder: Optional[str] = None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -3590,6 +3592,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         a complete child, never an ended parent with a missing/empty child.
         """
         def _do(conn):
+            self._check_session_turn_write_guard(
+                conn, parent_session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
                 (parent_session_id,),
@@ -6571,6 +6576,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise SessionCompressionInProgressError(
                 f"Session {session_id!r} is being compressed by another writer"
             )
+        self._check_session_turn_write_guard(
+            conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+        )
+        session = conn.execute(
+            "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if (
+            session is not None
+            and session["ended_at"] is not None
+            and session["end_reason"] == "compression"
+        ):
+            raise CompressionSessionClosedError(session_id)
+
+    def _check_session_turn_write_guard(
+        self, conn, session_id: str, turn_lease_holder: Optional[str],
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
+        """Fence appends and compression commits inside their write transaction."""
         if turn_lease_holder:
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
             lease = conn.execute(
@@ -6598,16 +6622,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         turn_lease_holder,
                     ),
                 )
-        session = conn.execute(
-            "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        if (
-            session is not None
-            and session["ended_at"] is not None
-            and session["end_reason"] == "compression"
-        ):
-            raise CompressionSessionClosedError(session_id)
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
@@ -7282,6 +7296,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
+        *,
+        turn_lease_holder: Optional[str] = None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -7310,6 +7327,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
+            self._check_session_turn_write_guard(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit

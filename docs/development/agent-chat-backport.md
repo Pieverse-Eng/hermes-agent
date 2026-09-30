@@ -26,7 +26,7 @@ cherry-picked. The initial backport preserves upstream contributor attribution.
 
 | Capability | Official source | Backport boundary |
 | --- | --- | --- |
-| Durable run idempotency | `e7433910e96c097ddf34352ea28653e83d951fbb` | `api_server_run_idempotency.py` is copied unchanged. Admission, status and bearer/profile scope are wired into the old monolithic adapter. Room grants/steering/routes are excluded. |
+| Durable run idempotency | `e7433910e96c097ddf34352ea28653e83d951fbb` | `api_server_run_idempotency.py` is copied from this revision, with only the additive atomic interruption-recovery method documented below. Admission, status and bearer/profile scope are wired into the old monolithic adapter. Room grants/steering/routes are excluded. |
 | Native session continuation | `e7433910e96c097ddf34352ea28653e83d951fbb`, `0efb525420668b91568aa0e73050c5b41b336044` | Reuse the old SessionDB history/resume helpers. Do not import declared-room/wake machinery just to continue a supplied session ID. |
 | Conversation-root leases | `6e929a96946a5c69644d08bd59c9dcfdc757e91b`, `3b0945601955e13b6159816141dc4acbc80c4132`, `5e2be43fd4`, `c21efeeb52`, `f1025b2c00`, `19b1204392`, `967391cd4b`, `6b25e67047` | Carry acquire/wait/refresh/release and stale-writer fencing into the old AIAgent/SessionDB layout. Do not import the later facade/finalizer refactor. Failed-write classification comes from `2a9f5b3476`. |
 | SSE fanout and replay | `52a2835136d44896427a20b97103cffefacb94aa`, `4937863e4d28106d62bdd4571cdabc6783aaf4c3`, `10963689dcbb8b9271315150891356adee5c698f`, `61286a889ec9ee1162b1a80bf1d13c6a914f2bfe` | `_RunStream` and stream behavior use the resulting official implementation at `e824425e8c15b05e0847e818f3860c58290394cc`, adapted to the existing HTTP adapter. |
@@ -69,12 +69,20 @@ below are the acceptance criteria for replacing them during an upstream upgrade.
 | History read failure returns 503; explicit empty history remains authoritative | Prevent a failed history read from silently starting an empty-context turn, and preserve existing Responses/caller snapshots. This is stricter than the cited upstream fallback. | Verify the target official behavior; if it differs, explicitly resolve the product behavior before deleting the guard. Do not silently copy the guard into the new runtime. |
 | Internal `reload_session_history` argument | Native continuation must reload after lease admission; explicit history/Responses callers must retain their supplied snapshot. Avoid importing the full new turn facade for this distinction. | Adopt the target official history/admission mechanism after continuation, contention and explicit-history tests pass. |
 | Nonterminal cross-worker status refresh and interruption mapping | Cached status must not hide completion/owner death; lease interruption must not report success. | Replace with official status/recovery paths after restart and interruption regressions pass. |
+| Atomic owner-death recovery | Re-read and conditionally interrupt under one SQLite write transaction; an owner that saved its terminal result before exiting must retain its output. The official store is otherwise unchanged. | Replace once the target official status recovery preserves a concurrent terminal commit; keep the two-handle regression. |
+| Compression turn fencing | Reuse the transcript append fence inside in-place and rotation commit transactions; a compression lock alone does not prove turn ownership. Abort the stale turn on rejection and clear only its internal stop marker before reusing the agent. | Remove once the official compression write paths enforce the same conversation-turn ownership; verify both compression modes, stale takeover, normal completion and cached-agent follow-up. |
 | First-turn lease and final-persistence failure handling (`06713e6c54`) | Serialize a session before its first row exists and avoid reporting a successful reply whose final transcript was rejected by the lease fence. | Verify equivalent behavior in the target official lease/finalizer path, then discard these old-layout additions. |
 | Parent-bound branch/delegate predicate (`cd17f0b27b`) | Compression descendants inherit fork markers; those markers must not hide the live compressed continuation or merge independent branches. | Use the target official lineage resolver once branch/delegate isolation and compressed continuation regressions pass. |
 
-A few unused helpers remain inside the unchanged official durable store. Keeping
-that module intact makes comparison and eventual removal easier than pruning it
-into a private variant. Do not expose those helpers as new APIs.
+A few unused helpers remain inside the official durable store. Keep the original
+methods intact to make comparison and eventual removal easier; the only store
+addition is `interrupt_if_unsettled`. Do not expose unused helpers as new APIs.
+
+The two concurrency fixes were checked against official `e824425e` and
+`f42f579cf8bac4918ac9599bece71618afadd846` (2026-09-30). Those revisions still
+recover dead owners with an unconditional status update and do not pass a turn
+holder into compression commits. These fixes are explicitly local adaptations,
+not claims of additional official code being copied.
 
 ## Public runtime contract
 

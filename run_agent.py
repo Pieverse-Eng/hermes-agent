@@ -7822,7 +7822,7 @@ class AIAgent:
         durable_turn_lease_thread = None
         durable_turn_lease_activity_lock = threading.Lock()
         durable_turn_lease_turn_active = False
-        durable_turn_lease_interrupt_message = None
+        self._session_turn_lease_interrupt_message = None
         token = None
         acct_token = None
         task_started = False
@@ -7838,8 +7838,8 @@ class AIAgent:
                     durable_turn_lease_stop.set()
 
         def _clear_durable_turn_lease_interrupt() -> None:
-            """Clear only the interrupt admitted by this turn's refresher."""
-            message = durable_turn_lease_interrupt_message
+            """Clear this turn's lease interrupt, preserving a later user stop."""
+            message = self._session_turn_lease_interrupt_message
             if not message:
                 return
 
@@ -8033,14 +8033,13 @@ class AIAgent:
 
                 def _refresh_durable_turn_lease() -> None:
                     def _interrupt_turn(message: str) -> None:
-                        nonlocal durable_turn_lease_interrupt_message
                         with durable_turn_lease_activity_lock:
                             if (
                                 durable_turn_lease_stop.is_set()
                                 or not durable_turn_lease_turn_active
                             ):
                                 return
-                            durable_turn_lease_interrupt_message = message
+                            self._session_turn_lease_interrupt_message = message
                             try:
                                 self.interrupt(message, hard_cancel=True)
                             except Exception:

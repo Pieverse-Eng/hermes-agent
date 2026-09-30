@@ -371,6 +371,40 @@ class RunIdempotencyStore:
             )
             self._conn.commit()
 
+    def interrupt_if_unsettled(
+        self, scope: str, run_id: str, error: str,
+    ) -> dict[str, Any] | None:
+        """Recover a dead owner without overwriting a concurrently settled run.
+
+        The liveness check happens outside SQLite. Re-read under the write lock
+        so an owner that saved its final result before exiting wins that race.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT status_json FROM run_idempotency WHERE scope=? AND run_id=?",
+                    (scope, run_id),
+                ).fetchone()
+                status = json.loads(row[0]) if row is not None else None
+                if status is not None and status.get("status") not in {
+                    "completed", "failed", "cancelled", "interrupted",
+                }:
+                    now = time.time()
+                    status.update(status="interrupted", error=error,
+                                  last_event="run.interrupted", updated_at=now)
+                    self._conn.execute(
+                        "UPDATE run_idempotency SET status_json=?, updated_at=? "
+                        "WHERE scope=? AND run_id=?",
+                        (json.dumps(status, sort_keys=True, separators=(",", ":")),
+                         now, scope, run_id),
+                    )
+                self._conn.commit()
+                return status
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

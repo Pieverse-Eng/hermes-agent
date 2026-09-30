@@ -424,3 +424,28 @@ async def test_final_fenced_flush_cannot_complete_native_run(tmp_path, monkeypat
         successor.release_session_turn_lease("chat", "successor")
         db.close()
         successor.close()
+
+
+def test_owner_finishing_while_status_is_checked_keeps_completed_output(tmp_path, monkeypatch):
+    from tests.gateway.test_api_server_runs import _make_adapter
+    from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+    adapter = _make_adapter()
+    adapter._run_idempotency_store.close()
+    adapter._run_idempotency_store = RunIdempotencyStore(str(tmp_path / 'runs.db'))
+    writer = RunIdempotencyStore(str(tmp_path / 'runs.db'))
+    scope = adapter._run_idempotency_scope(None)
+    writer.reserve(scope, 'key', 'fingerprint', 'run_old', {'run_id': 'run_old', 'status': 'running'}, owner_pid=123456, owner_started=0)
+    def owner_exits_after_snapshot(pid):
+        # Owner commits its successful terminal result and then exits between
+        # status_for_run's read and the observer's process-aliveness check.
+        writer.update_status('run_old', {'run_id': 'run_old', 'status': 'completed', 'output': 'saved result'})
+        return False
+    monkeypatch.setattr('gateway.status._pid_exists', owner_exits_after_snapshot)
+    try:
+        status = adapter._durable_run_status(None, 'run_old')
+        durable = writer.status_for_run(scope, 'run_old')['status']
+        assert status['status'] == 'completed'
+        assert durable['output'] == 'saved result'
+    finally:
+        adapter._run_idempotency_store.close()
+        writer.close()
