@@ -31,6 +31,7 @@ from agent.skill_utils import (
     iter_skill_index_files,
     org_id_of_path,
     parse_frontmatter,
+    skill_model_invocable,
     read_active_org_id,
     skill_matches_environment,
     skill_matches_platform,
@@ -1367,8 +1368,9 @@ _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2 added org provenance fields; v3 adds the platform/environment metadata
-# needed by the Pieverse security filter.
-_SKILLS_SNAPSHOT_VERSION = 3
+# needed by the Pieverse security filter; v4 adds model_invocable so skills
+# marked disable-model-invocation leave indexes cached before v4.
+_SKILLS_SNAPSHOT_VERSION = 4
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1593,6 +1595,7 @@ def _build_snapshot_entry(
         "platforms": _frontmatter_string_list(frontmatter.get("platforms")),
         "environments": _frontmatter_string_list(frontmatter.get("environments")),
         "conditions": extract_skill_conditions(frontmatter),
+        "model_invocable": skill_model_invocable(frontmatter),
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1769,6 +1772,8 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            if entry.get("model_invocable") is False:
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -1795,6 +1800,8 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            if not entry["model_invocable"]:
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
@@ -1875,6 +1882,8 @@ def build_skills_system_prompt(
                 if not is_compatible:
                     continue
                 entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
+                if not entry["model_invocable"]:
+                    continue
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:

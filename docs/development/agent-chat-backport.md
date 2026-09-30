@@ -8,6 +8,10 @@ and local correctness fixes. It is **not** an unmodified cherry-pick or a new
 chat protocol. It does not upgrade the upstream baseline or bring in Group Chat,
 Bot Mode, desktop features or the upstream repository-wide module refactor.
 
+The branch also integrates Pieverse fork main through `d6695cca9eda70dc5a11998dc59fad034a11033c`
+(PRs #46 and #47). These fork fixes are retained; this is not a broad NousResearch
+upstream upgrade.
+
 Prefer unchanged upstream modules and implementation fragments. Keep unavoidable
 adaptation at the existing API, AIAgent and SessionDB boundaries. Before adding a
 local fix, check the official follow-up chain; identify any remaining local fix
@@ -33,6 +37,26 @@ contains 52 files of Group Chat work and extracts the Runs adapter; subsequent
 SSE and continuation patches target that extraction. Pulling their full
 ancestry would also introduce unrelated refactors. Selective backporting avoids
 that dependency expansion while preserving the required native behavior.
+
+## Integration with fork PR #47
+
+PR #47 (`fd8abbdb94384f4251cda2455dab32d035707354`) fixes the legacy Web Chat/AX
+caller that sends only `{input, session_id}`. Its named-session continuation is
+preserved through the backport's single native-history path. Do not retain its
+earlier history preload alongside that path: preloading makes a native turn look
+like caller-supplied history, bypasses compression-tip resolution and prevents
+the reload after session lease admission. An explicit empty caller history must
+also remain empty.
+
+The #47 tool-history, caller-history and stateless-request regressions remain in
+`test_api_server_runs.py`, using real temporary SQLite history. Existing native
+Runs regressions additionally cover compressed branch/delegate continuations,
+explicit empty history and a previous owner's write between initial history
+loading and admission. These caught five failures in the unadjusted automatic
+merge; they must pass together before release.
+
+PR #47 does not add durable idempotency, session leases, bounded SSE replay or
+request-bound approvals. Platform Agent Chat still requires the combined build.
 
 ## Explicit local adaptations and fixes
 

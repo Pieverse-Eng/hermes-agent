@@ -84,6 +84,7 @@ from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
+    skill_model_invocable,
 )
 
 logger = logging.getLogger(__name__)
@@ -857,8 +858,13 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                model_invocable = skill_model_invocable(frontmatter)
                 if name in seen_names:
-                    continue
+                    # A wrapper skill outranks a same-named model-hidden helper.
+                    existing = next((s for s in skills if s["name"] == name), None)
+                    if not (model_invocable and existing and not existing["model_invocable"]):
+                        continue
+                    skills.remove(existing)
                 if name in disabled:
                     continue
 
@@ -877,6 +883,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 seen_names.add(name)
                 skills.append({
+                    "model_invocable": model_invocable,
                     "name": name,
                     "description": description,
                     "category": category,
@@ -932,8 +939,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Find all skills
-        all_skills = _find_all_skills()
+        # Find all skills the model may choose on its own; skills marked
+        # disable-model-invocation are reached through their wrapper.
+        all_skills = [s for s in _find_all_skills() if s.get("model_invocable", True)]
 
         if not all_skills:
             return json.dumps(
@@ -1354,7 +1362,9 @@ def skill_view(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            available = [
+                s["name"] for s in _sort_skills(_find_all_skills()) if s.get("model_invocable", True)
+            ][:20]
             return json.dumps(
                 {
                     "success": False,

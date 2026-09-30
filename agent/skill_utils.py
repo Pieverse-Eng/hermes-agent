@@ -695,6 +695,30 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
     }
 
 
+def _frontmatter_flag(frontmatter: Dict[str, Any], key: str, default: bool) -> bool:
+    value = frontmatter.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return default
+
+
+def skill_model_invocable(frontmatter: Dict[str, Any]) -> bool:
+    """False for Agent Skills marked ``disable-model-invocation: true``.
+
+    Such skills are helpers behind a wrapper skill: they stay out of the
+    model's skill index and ``skills_list`` but remain loadable by path
+    through their wrapper and, unless also not user-invocable, by the user.
+    """
+    return not _frontmatter_flag(frontmatter, "disable-model-invocation", False)
+
+
+def skill_user_invocable(frontmatter: Dict[str, Any]) -> bool:
+    """False for Agent Skills marked ``user-invocable: false`` (no slash command)."""
+    return _frontmatter_flag(frontmatter, "user-invocable", True)
+
+
 # ── Skill config extraction ───────────────────────────────────────────────
 
 

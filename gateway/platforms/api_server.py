@@ -7105,6 +7105,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        # Continue the named session (fork #47) through one history-loading path.
+        # Classify the caller's input before reading SessionDB so native turns
+        # also reload after lease admission; caller snapshots remain authoritative.
         native_session_continuation = bool(
             session_id and not conversation_history and not previous_response_id
             and "conversation_history" not in body

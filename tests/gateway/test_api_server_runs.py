@@ -306,6 +306,88 @@ class TestStartRun:
         assert kwargs["model_options"] == model_options
 
 
+class TestRunSessionHistory:
+    """A run that names a session and brings no history continues that session."""
+
+    STORED = [
+        {"role": "user", "content": "compare HYPE spot"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "compare_trade_routes", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": '{"rankedRoutes": []}'},
+        {"role": "assistant", "content": "Hyperliquid is the only quote."},
+    ]
+
+    async def _history_seen(self, adapter, body, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("ax:web:s1", "api_server")
+        for message in self.STORED:
+            db.append_message(
+                "ax:web:s1", message["role"], message["content"],
+                tool_calls=message.get("tool_calls"),
+                tool_call_id=message.get("tool_call_id"),
+            )
+        adapter._session_db = db
+        seen = {}
+
+        def _capture(user_message=None, conversation_history=None, task_id=None,
+                     reload_session_history=False):
+            seen["history"] = [
+                {key: value for key, value in message.items() if key != "timestamp"}
+                for message in conversation_history
+            ]
+            return {"final_response": "done"}
+
+        try:
+            app = _create_runs_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    mock_agent = MagicMock()
+                    mock_agent.run_conversation.side_effect = _capture
+                    mock_agent.session_prompt_tokens = 0
+                    mock_agent.session_completion_tokens = 0
+                    mock_agent.session_total_tokens = 0
+                    mock_create.return_value = mock_agent
+
+                    resp = await cli.post("/v1/runs", json=body)
+                    assert resp.status == 202
+                    run_id = (await resp.json())["run_id"]
+                    task = adapter._active_run_tasks.get(run_id)
+                    if task is not None:
+                        await asyncio.wait_for(task, timeout=5)
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    assert status["status"] == "completed"
+            return seen["history"]
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_session_id_loads_stored_history_with_tool_results(self, adapter, tmp_path):
+        history = await self._history_seen(
+            adapter, {"input": "spot", "session_id": "ax:web:s1"}, tmp_path,
+        )
+        assert history == self.STORED
+
+    @pytest.mark.asyncio
+    async def test_caller_history_wins_over_stored_history(self, adapter, tmp_path):
+        caller = [{"role": "user", "content": "from caller"}]
+        history = await self._history_seen(
+            adapter, {"input": "spot", "session_id": "ax:web:s1", "conversation_history": caller},
+            tmp_path,
+        )
+        assert history == caller
+
+    @pytest.mark.asyncio
+    async def test_run_without_session_id_stays_stateless(self, adapter, tmp_path):
+        history = await self._history_seen(adapter, {"input": "hello"}, tmp_path)
+        assert history == []
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
 # ---------------------------------------------------------------------------
