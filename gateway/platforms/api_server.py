@@ -7010,6 +7010,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+        # A caller that supplies no history of its own continues the session it
+        # names: history loads from SessionDB, as upstream api_server_runs does.
+        # The platform web chat sends only the new message and its session_id.
+        if not conversation_history and session_id and not previous_response_id:
+            conversation_history = await self._conversation_history_for_session(str(session_id))
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(

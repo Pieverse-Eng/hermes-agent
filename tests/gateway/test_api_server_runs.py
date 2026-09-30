@@ -304,6 +304,73 @@ class TestStartRun:
         assert kwargs["model_options"] == model_options
 
 
+class TestRunSessionHistory:
+    """A run that names a session and brings no history continues that session."""
+
+    STORED = [
+        {"role": "user", "content": "compare HYPE spot"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "compare_trade_routes", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": '{"rankedRoutes": []}'},
+        {"role": "assistant", "content": "Hyperliquid is the only quote."},
+    ]
+
+    async def _history_seen(self, adapter, body):
+        db = MagicMock()
+        db.get_messages_as_conversation.return_value = list(self.STORED)
+        adapter._session_db = db
+        seen = {}
+
+        def _capture(user_message=None, conversation_history=None, task_id=None):
+            seen["history"] = conversation_history
+            return {"final_response": "done"}
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = _capture
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json=body)
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(40):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+        return seen["history"], db
+
+    @pytest.mark.asyncio
+    async def test_session_id_loads_stored_history_with_tool_results(self, adapter):
+        history, db = await self._history_seen(adapter, {"input": "spot", "session_id": "ax:web:s1"})
+        db.get_messages_as_conversation.assert_called_once_with("ax:web:s1")
+        assert history == self.STORED
+
+    @pytest.mark.asyncio
+    async def test_caller_history_wins_over_stored_history(self, adapter):
+        caller = [{"role": "user", "content": "from caller"}]
+        history, db = await self._history_seen(
+            adapter, {"input": "spot", "session_id": "ax:web:s1", "conversation_history": caller}
+        )
+        db.get_messages_as_conversation.assert_not_called()
+        assert history == caller
+
+    @pytest.mark.asyncio
+    async def test_run_without_session_id_stays_stateless(self, adapter):
+        history, db = await self._history_seen(adapter, {"input": "hello"})
+        db.get_messages_as_conversation.assert_not_called()
+        assert history == []
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
 # ---------------------------------------------------------------------------
