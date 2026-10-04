@@ -457,6 +457,10 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
 
+Successful persisted API conversations, including `/v1/runs`, use the existing automatic session-title generator after the first exchange. Generation runs in the background with the conversation's runtime settings and honors `auxiliary.title_generation.enabled`. Read the generated title through `GET /api/sessions/{id}`; it may arrive after the reply completes. Existing or concurrently edited titles take precedence. A title-generation failure leaves the chat result and conversation history intact.
+
+This REST title wiring supports each tenant's single-profile API. Automatic naming is skipped for all context-scoped multiplexed requests, including `/p/{profile}`, `/p/default` and the unprefixed default listener, because the unchanged native generator's background thread does not propagate request-local profile configuration and credential scope. Those requests retain their existing titles until native profile propagation is supported.
+
 ```bash
 # fork a session and run one turn
 curl -X POST http://localhost:8642/api/sessions/$ID/fork \
