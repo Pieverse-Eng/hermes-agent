@@ -6591,6 +6591,50 @@ class APIServerAdapter(BasePlatformAdapter):
             cron_session="",
         )
 
+    @staticmethod
+    def _maybe_auto_title(agent, user_message, result) -> None:
+        """Wire REST turns to the same background titler as CLI/gateway turns."""
+        if (
+            not isinstance(result, dict)
+            or result.get("failed") or result.get("interrupted") or result.get("partial")
+            or result.get("completed") is False
+        ):
+            return
+        try:
+            from hermes_constants import get_hermes_home_override
+            from agent.title_generator import maybe_auto_title
+
+            # The pinned official titler starts a bare thread and does not
+            # propagate request-local profile/secret scope. Never let a
+            # multiplexed request fall back to the process's default profile.
+            if get_hermes_home_override() is not None:
+                return
+            model = getattr(agent, "model", None)
+            provider = getattr(agent, "provider", None)
+            maybe_auto_title(
+                getattr(agent, "_session_db", None),
+                getattr(agent, "session_id", None),
+                _normalize_chat_content(user_message),
+                result.get("final_response", ""),
+                result.get("messages", []),
+                main_runtime={
+                    "model": model,
+                    "provider": provider,
+                    "base_url": getattr(agent, "base_url", None),
+                    "api_key": getattr(agent, "api_key", None),
+                    "api_mode": getattr(agent, "api_mode", None),
+                },
+                runtime_validator=lambda: (
+                    getattr(agent, "model", None) == model
+                    and getattr(agent, "provider", None) == provider
+                ),
+                failure_callback=lambda task, exc: logger.debug(
+                    "API auto-title failure suppressed (not user-visible): %s: %s", task, exc,
+                ),
+            )
+        except Exception:
+            logger.debug("API auto-title unavailable", exc_info=True)
+
     async def _run_agent(
         self,
         user_message: str,
@@ -6771,6 +6815,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         if isinstance(result, dict):
                             result["runtime"] = runtime
                         usage["runtime"] = runtime
+                    self._maybe_auto_title(agent, user_message, result)
                     return result, usage
                 except _ProviderAuthResolutionError as exc:
                     # Only _ProviderAuthResolutionError — raised exclusively
@@ -7389,6 +7434,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         usage=usage,
                         last_event="run.completed",
                     )
+                    with self._profile_scope(request_profile):
+                        self._maybe_auto_title(agent, user_message, result)
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
