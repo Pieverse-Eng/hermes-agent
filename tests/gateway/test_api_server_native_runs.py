@@ -449,3 +449,24 @@ def test_owner_finishing_while_status_is_checked_keeps_completed_output(tmp_path
     finally:
         adapter._run_idempotency_store.close()
         writer.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"input": "hello"}, "Platform rules"),
+        ({"input": "hello", "instructions": "Be a pirate"}, "Be a pirate"),
+        ({"input": "hello", "instructions": ""}, ""),
+    ],
+)
+async def test_runs_default_to_configured_system_prompt(body, expected):
+    from types import SimpleNamespace
+    adapter = _make_adapter()
+    runner = SimpleNamespace(_ephemeral_system_prompt="Platform rules")
+    with patch("gateway.run._gateway_runner_ref", lambda: runner), \
+            patch.object(adapter, "_create_agent", return_value=RecordingAgent()) as create_agent:
+        async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+            response = await cli.post("/v1/runs", json=body)
+            assert response.status == 202
+            await settle(adapter, (await response.json())["run_id"])
+    assert create_agent.call_args.kwargs["ephemeral_system_prompt"] == expected

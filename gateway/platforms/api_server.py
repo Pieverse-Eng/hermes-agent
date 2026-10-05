@@ -1544,6 +1544,20 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    @staticmethod
+    def _configured_system_prompt() -> Optional[str]:
+        """Global ``agent.system_prompt``, as the gateway's messaging channels use it.
+
+        Pieverse: hosted tenants deliver platform rules through this key, and
+        /v1/runs callers that send no ``instructions`` must still receive them.
+        """
+        from gateway.run import GatewayRunner, _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        if runner is not None:
+            return getattr(runner, "_ephemeral_system_prompt", None) or None
+        return GatewayRunner._load_ephemeral_system_prompt() or None
+
     def _draining_response(self) -> Optional["web.Response"]:
         """Return a retryable response while the gateway drains existing work."""
         if not self._gateway_is_draining():
@@ -7178,7 +7192,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # concurrent runs can intentionally share them, and resolving an
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
-        ephemeral_system_prompt = instructions
+        ephemeral_system_prompt = (
+            instructions if instructions is not None else self._configured_system_prompt()
+        )
         loop = asyncio.get_running_loop()
         q = _RunStream()
         created_at = time.time()

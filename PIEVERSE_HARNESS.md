@@ -12,6 +12,8 @@ The Pieverse harness is intentionally limited to hosted-platform integration:
 - compatibility between bundled messaging plugins and Pieverse
   channel-gateway, including LINE, Telegram proxying, and the managed
   WhatsApp plugin;
+- `/v1/runs` requests without `instructions` use the configured global
+  `agent.system_prompt`, as messaging channels do;
 - the hosted `/pieverse-byok` command and its plugin-command dispatch support;
 - CertiK-backed security checks for user-installed and external skills while
   trusting image-managed platform skills.
