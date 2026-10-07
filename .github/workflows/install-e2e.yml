@@ -17,7 +17,8 @@ name: Install & Update E2E
 #     surfaces on a schedule rather than in someone's review cycle;
 #   * when a release tag is created -- the moment the set of versions users can
 #     update FROM changes, and the moment a broken updater would strand them;
-#   * manually, where you can pick the route and how many releases to sample.
+#   * manually (including forks with release tags), where you can pick the
+#     route and how many releases to sample.
 #
 # Deliberately NOT on pull_request: a leg takes ~11 minutes of real toolchain
 # installation, and the matrix multiplies that. Updating is release-shaped work,
@@ -58,6 +59,8 @@ jobs:
   # by both route matrices, so the two routes cover the same set.
   pick-releases:
     name: Pick release tags
+    # Forks may not publish release tags; automatic runs belong to upstream.
+    if: github.repository == 'NousResearch/hermes-agent' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
