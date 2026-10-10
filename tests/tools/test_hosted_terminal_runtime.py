@@ -21,8 +21,10 @@ def test_sourced_script_blocks_gateway_restart(prefix, tmp_path):
     "printf '%s' 'Hermes gateway restart'",
     "echo 'launchctl submit -l ai.hermes.gateway -- /bin/true'",
 ])
-def test_output_text_is_not_an_executed_lifecycle_command(command):
-    assert not blocked(command)
+def test_upstream_conservative_lifecycle_matching_is_preserved(command):
+    # Keep upstream's conservative verdict for restart-shaped text. This
+    # repair exempts Node launchers, not arbitrary shell payloads.
+    assert blocked(command)
 
 
 @pytest.mark.parametrize("prefix", ["exec", "env TEST=1", "exec env -u TEST TEST=1"])
@@ -32,6 +34,18 @@ def test_wrappers_cannot_hide_nested_shell_restart(tmp_path, prefix):
     outer = tmp_path / "outer.sh"
     outer.write_text(f"#!/bin/sh\n{prefix} {shlex.quote(str(inner))}\n")
     assert blocked(f"sh {shlex.quote(str(outer))}")
+
+
+@pytest.mark.parametrize("template", [
+    "env -S 'sh {path}'",
+    "exec env -S 'sh {path}'",
+    "env -S'sh {path}'",
+    "exec env --split-string='sh {path}'",
+])
+def test_env_split_string_cannot_hide_a_referenced_restart(tmp_path, template):
+    script = tmp_path / "helper.sh"
+    script.write_text("systemctl restart hermes-gateway\n")
+    assert blocked(template.format(path=script))
 
 
 @pytest.mark.parametrize("command", [
@@ -80,8 +94,8 @@ def test_non_shell_visit_does_not_skip_later_shell_interpretation(tmp_path):
     "printf '%s\\n' 'example:\nhermes gateway restart\nend'",
     "cat <<'EOF'\nhermes gateway restart\nEOF",
 ])
-def test_multiline_output_is_literal(command):
-    assert not blocked(command)
+def test_upstream_multiline_lifecycle_matching_is_preserved(command):
+    assert blocked(command)
 
 
 def test_malformed_env_split_is_a_verdict_not_an_exception():
