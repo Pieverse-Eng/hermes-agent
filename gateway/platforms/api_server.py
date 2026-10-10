@@ -293,6 +293,7 @@ _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
     "base_url",
     "provider",
+    "requested_provider",
     "api_mode",
     "command",
     "args",
@@ -354,7 +355,7 @@ def _request_service_tier(model_options: Any) -> Any:
 
 
 def _apply_runtime_agent_overrides(
-    runtime_kwargs: Dict[str, Any], overrides: Optional[Dict[str, Any]]
+    runtime_kwargs: Dict[str, Any], overrides: Optional[Dict[str, Any]], *, resolved: bool = False
 ) -> Dict[str, Any]:
     """Merge resolved provider/runtime fields into ``runtime_kwargs`` in place."""
     if not isinstance(overrides, dict):
@@ -363,7 +364,7 @@ def _apply_runtime_agent_overrides(
         if key not in overrides:
             continue
         value = overrides.get(key)
-        if value is None:
+        if value is None and not resolved:
             continue
         runtime_kwargs[key] = list(value) if key == "args" and isinstance(value, (list, tuple)) else value
     return runtime_kwargs
@@ -404,6 +405,7 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
@@ -2738,6 +2740,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # lock is an execution contract: it bypasses the session /model
         # override and fails closed (never reuses global credentials) if
         # its provider cannot be resolved.
+        from hermes_cli.runtime_provider import runtime_provider_identity
+
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
         session_override = None
@@ -2750,16 +2754,23 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.model_switch import resolve_effective_model
         if session_override:
             override_model = resolve_effective_model(session_override, None, model)
-            session_provider = _clean_request_string(session_override.get("provider"))
-            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
-            provider_runtime = _resolve_provider_runtime(
+            session_provider = runtime_provider_identity(session_override, model=override_model)
+            current_provider = runtime_provider_identity(runtime_kwargs, model=model)
+            if session_provider == "custom" and session_override.get("base_url") and not session_override.get("api_key"):
+                raise _ProviderAuthResolutionError("Cannot recover the session's custom provider identity")
+            provider_runtime = None if session_provider == "custom" and session_override.get("api_key") else _resolve_provider_runtime(
                 session_provider or current_provider,
                 target_model=override_model,
-                required=False,
+                required=bool(session_provider),
             )
-            if provider_runtime:
-                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            # Apply session fields before the refreshed auth bundle. A live
+            # refresh must not be overwritten by a stale session credential.
             _apply_runtime_agent_overrides(runtime_kwargs, session_override)
+            if provider_runtime:
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime, resolved=True)
+            elif session_provider:
+                runtime_kwargs["requested_provider"] = session_provider
+                runtime_kwargs["credential_pool"] = session_override.get("credential_pool")
             model = override_model
             if route or request_model or request_provider:
                 logger.debug(
@@ -2771,14 +2782,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # alias).  Pins this session's turns ahead of per-request body
             # values — a session's chosen model is a standing selection,
             # matching the native gateway's session-model semantics.
-            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            current_provider = runtime_provider_identity(runtime_kwargs, model=model)
             provider_runtime = _resolve_provider_runtime(
                 current_provider,
                 target_model=session_row_model,
                 required=False,
             )
             if provider_runtime:
-                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime, resolved=True)
             model = resolve_effective_model(None, session_row_model, model)
             if request_model or request_provider:
                 logger.debug(
@@ -2794,7 +2805,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 effective_model = route_model or model
             else:
                 effective_model = request_model or model
-            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            current_provider = runtime_provider_identity(runtime_kwargs, model=model)
             effective_provider = request_provider or route_provider or current_provider
             provider_runtime = None
             if effective_provider and (
@@ -2806,10 +2817,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     # A confirmed Browser lock fails closed: if the locked
                     # provider cannot be resolved, never fall through to
                     # the previous global provider's credentials.
-                    required=bool(request_provider) or confirmed_runtime_lock,
+                    required=bool(request_provider or route_provider) or confirmed_runtime_lock,
                 )
             if provider_runtime:
-                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime, resolved=True)
             elif effective_provider and effective_provider != current_provider:
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model

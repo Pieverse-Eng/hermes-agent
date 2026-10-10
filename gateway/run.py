@@ -7196,9 +7196,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _override_state.conversation.model_override if _override_state else None
         )
         if override:
+            from hermes_cli.runtime_provider import runtime_provider_identity, has_named_custom_provider
+
             override_model = override.get("model", model)
+            provider_identity = runtime_provider_identity(override, model=override_model)
             override_runtime = {
                 "provider": override.get("provider"),
+                "requested_provider": provider_identity,
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
@@ -7206,9 +7210,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "credential_pool": override.get("credential_pool"),
             }
             if override_runtime.get("api_key"):
+                if provider_identity and (provider_identity.startswith("custom:") or has_named_custom_provider(provider_identity)):
+                    override_runtime["provider"] = "custom"
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
-                        override.get("provider")
+                        provider_identity
                     )
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
@@ -7216,8 +7222,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     override_runtime.get("provider"),
                 )
                 return override_model, override_runtime
-            # Override exists but has no api_key — fall through to env-based
-            # resolution and apply model/provider from the override on top.
+            if provider_identity:
+                if provider_identity == "custom" and override.get("base_url"):
+                    raise RuntimeError("Cannot recover the session's custom provider identity")
+                # An explicit session provider owns its entire credential
+                # bundle. Never fill a failed selection with global auth.
+                runtime = _resolve_runtime_agent_kwargs_for_provider(provider_identity)
+                runtime.pop("model", None)
+                return override_model, runtime
+            # Model-only overrides continue to inherit the global provider.
             logger.debug(
                 "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
                 resolved_session_key or "", model, override_model,
@@ -23266,26 +23279,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Failed to read persisted session model override", exc_info=True
             )
             return
-        if not persisted:
+        if not isinstance(persisted, dict) or not persisted:
             return
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
         }
-        provider = persisted.get("provider")
+        from hermes_cli.runtime_provider import runtime_provider_identity
+
+        provider = runtime_provider_identity(persisted, model=persisted.get("model"))
         if provider:
             # Re-resolve credentials for the persisted provider. On failure
             # (e.g. credentials were removed since the switch) keep the
-            # credential-less override — _resolve_session_agent_runtime falls
-            # back to env-based resolution and applies model/provider on top.
+            # identity so the next turn fails closed against that provider.
             try:
+                if provider == "custom" and persisted.get("base_url"):
+                    raise RuntimeError("Cannot recover the session's custom provider identity")
                 runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                override["provider"] = runtime.get("provider") or provider
+                override["requested_provider"] = runtime.get("requested_provider") or provider
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")
                 override["credential_pool"] = runtime.get("credential_pool")
-                if not override.get("base_url"):
-                    override["base_url"] = runtime.get("base_url")
+                override["base_url"] = runtime.get("base_url")
             except Exception:
                 logger.debug(
                     "Credential re-resolution failed for persisted override "
@@ -23314,7 +23331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+        for key in ("provider", "requested_provider", "api_key", "base_url", "api_mode", "credential_pool"):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
