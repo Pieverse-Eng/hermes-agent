@@ -59,7 +59,7 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # `start` is intentionally excluded: starting a gateway from inside a
     # gateway is benign (a no-op or "already running" error), and a
     # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    r"(?:hermes\s+gateway\s+(?:restart|stop)\b)"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -77,8 +77,10 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
     # token orders because real reproductions show both.
-    r"|(?:p?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    # Leading \b ensures we match "pkill" or "kill" as whole words, not as
+    # suffixes of other words (e.g. "skill" -> "kill").
+    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
+    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
 )
 
 
@@ -115,10 +117,60 @@ _CONTROL_CHARS = frozenset(";&|()")
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+def _split_logical_lines(text: str) -> list[str]:
+    """Split text on newlines that are not inside quotes.
+
+    A newline inside a quoted string (single or double quotes) is data,
+    not a command separator. Handles escaped quotes within strings.
+    """
+    lines = []
+    current = []
+    in_single = False
+    in_double = False
+    escape = False
+
+    for ch in text:
+        if escape:
+            current.append(ch)
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            current.append(ch)
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+            continue
+        if ch == "\n" and not in_single and not in_double:
+            lines.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+
+    if current:
+        lines.append("".join(current))
+    return lines
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
-    """Yield shell-tokenized command segments, honoring quotes and comments."""
+    """Yield shell-tokenized command segments, honoring quotes and comments.
+
+    A newline inside a quoted token is data, not a command separator.
+    First split on logical lines (newlines outside quotes), then tokenize
+    each logical line with shlex. If a logical line cannot be tokenized
+    (unbalanced quotes), fall back to per-physical-line tokenization for
+    that logical line.
+    """
     normalized = command.replace("\\\n", "")
-    for line in normalized.splitlines() or [normalized]:
+    logical_lines = _split_logical_lines(normalized)
+
+    for line in logical_lines:
+        # Try to tokenize the logical line as a whole.
         try:
             lexer = shlex.shlex(
                 line,
@@ -129,6 +181,31 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
             lexer.commenters = "#"
             tokens = list(lexer)
         except ValueError:
+            # Fall back to per-physical-line tokenization for this logical line.
+            # This handles cases where quotes are unbalanced across lines.
+            for physical_line in line.splitlines():
+                try:
+                    lexer = shlex.shlex(
+                        physical_line,
+                        posix=True,
+                        punctuation_chars=";&|()",
+                    )
+                    lexer.whitespace_split = True
+                    lexer.commenters = "#"
+                    tokens = list(lexer)
+                except ValueError:
+                    continue
+
+                segment: list[str] = []
+                for token in tokens:
+                    if token and set(token) <= _CONTROL_CHARS:
+                        if segment:
+                            yield segment
+                            segment = []
+                        continue
+                    segment.append(token)
+                if segment:
+                    yield segment
             continue
 
         segment: list[str] = []
@@ -143,10 +220,104 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
             yield segment
 
 
+def _executable_name(token: str) -> str:
+    """Return the command name for a tokenized executable token.
+
+    ``Path(token).name`` is right for real paths (``/usr/bin/bash`` →
+    ``bash``), but pathlib has no name component for the pure-path tokens
+    ``.``, ``..`` and ``/``, so it returns "" for them. The POSIX
+    dot-source builtin is spelled ``.``, so keying the sourced-script
+    branch on ``Path(token).name`` alone made it unreachable: ``source
+    ./helper.sh`` was scanned but its exact synonym ``. ./helper.sh`` was
+    not, letting a referenced script carrying a lifecycle command through
+    both the cron guard and the in-gateway terminal guard. Fall back to the
+    raw token so ``.`` survives.
+    """
+    return Path(token).name or token
+
+
+# Prefixes that hand execution straight to their argument tail: the command
+# that actually runs sits further right. A guard that reads only the first
+# token sees `sudo`/`env`/`nohup` and never inspects what they run, so
+# `sudo bash ~/restart.sh` walked past the same walk that stops
+# `bash ~/restart.sh`, and `sudo launchctl submit ...` past the
+# label-independent submit block (#62891). `_PIPE_TO_INTERPRETER` above
+# already reads `sudo ` this way for the pipe case; this generalises that
+# reading to the command position.
+_TRANSPARENT_COMMAND_PREFIXES = frozenset({
+    "sudo", "doas", "env", "nohup", "setsid", "nice", "ionice", "stdbuf",
+    "timeout", "exec", "command", "builtin", "eatmydata",
+})
+
+# Options of those wrappers that consume the NEXT token as their value, so a
+# value is never mistaken for the wrapped command (`sudo -u deploy bash x.sh`).
+_TRANSPARENT_PREFIX_VALUE_OPTIONS = {
+    "sudo": {"-u", "-g", "-U", "-C", "-p", "-r", "-t", "-T",
+             "--user", "--group", "--prompt"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "--unset", "-S", "--split-string", "-C", "--chdir"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+}
+
+# Wrappers whose first non-option operand is a VALUE, not the command
+# (`timeout 60 bash x.sh`).
+_TRANSPARENT_PREFIX_OPERANDS = {"timeout": 1}
+
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Bound the walk: a pathological token run must not spin here.
+_MAX_PREFIX_PEELS = 8
+
+
+def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
+    """Return the index of the command a wrapper chain actually executes.
+
+    Returns *index* unchanged when the token there is not a wrapper, and may
+    return ``len(segment)`` when a wrapper has no operand — callers must
+    bounds-check before indexing.
+    """
+    for _ in range(_MAX_PREFIX_PEELS):
+        if index >= len(segment):
+            return index
+        name = _executable_name(segment[index])
+        if name not in _TRANSPARENT_COMMAND_PREFIXES:
+            return index
+        wrapper_index = index
+        value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
+        index += 1
+        while index < len(segment):
+            token = segment[index]
+            if token == "--":
+                # POSIX end-of-options: the command starts at the next token.
+                index += 1
+                break
+            if name == "env" and (
+                token == "--split-string" or token.startswith("--split-string=")
+                or token.startswith("-S")
+            ):
+                # The command is inside this option's string. Preserve the
+                # wrapper for the upstream payload walk instead of losing it.
+                return wrapper_index
+            if token in value_options:
+                index += 2
+                continue
+            if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
+                index += 1
+                continue
+            break
+        for _ in range(_TRANSPARENT_PREFIX_OPERANDS.get(name, 0)):
+            if index < len(segment) and not segment[index].startswith("-"):
+                index += 1
+    return index
+
+
 def _command_token_index(segment: list[str]) -> Optional[int]:
     """Return the executable token index after simple env assignments."""
     for index, token in enumerate(segment):
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+        if _ENV_ASSIGNMENT.match(token):
             continue
         return index
     return None
@@ -166,7 +337,10 @@ def contains_launchctl_submit_command(command: str) -> bool:
         index = _command_token_index(segment)
         if index is None:
             continue
-        if Path(segment[index]).name == "launchctl":
+        index = _peel_transparent_prefixes(segment, index)
+        if index >= len(segment):
+            continue
+        if _executable_name(segment[index]) == "launchctl":
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
@@ -211,69 +385,112 @@ def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optiona
     return path
 
 
+def _references_at(
+    segment: list[str], index: int, cwd: Optional[str]
+) -> Iterator[tuple[Path, bool]]:
+    """Yield the scripts the token at *index* executes, if any."""
+    if index >= len(segment):
+        return
+    executable = segment[index]
+    executable_name = _executable_name(executable)
+
+    if executable_name in {".", "source"}:
+        if len(segment) > index + 1:
+            resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
+            if resolved is not None:
+                yield resolved, True
+        return
+
+    if executable_name in _SHELL_EXECUTABLES:
+        arguments = segment[index + 1 :]
+        arg_index = 0
+        while arg_index < len(arguments):
+            argument = arguments[arg_index]
+            if argument == "--":
+                arg_index += 1
+                break
+            if argument in {"-c", "--command"}:
+                break
+            if argument in _SHELL_OPTIONS_WITH_VALUES:
+                arg_index += 2
+                continue
+            if argument.startswith("-"):
+                arg_index += 1
+                continue
+            break
+        if arg_index < len(arguments) and arguments[arg_index] not in {
+            "-c",
+            "--command",
+        }:
+            resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
+            if resolved is not None:
+                yield resolved, True
+        return
+
+    # A bare "/" token is pathlib's division operator in Python sources
+    # (e.g. `Path.home() / ".hermes"`), not an executable reference.
+    # Resolving it walks to the filesystem root and fails the
+    # regular-file check below, hard-blocking innocent .py scripts
+    # (#77131). Skip pure-separator tokens.
+    if executable.strip("/"):
+        if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
+            resolved = _resolve_terminal_script_path(executable, cwd)
+            if resolved is not None:
+                yield resolved, False
+
+
 def _iter_referenced_shell_scripts(
     command: str,
     *,
     cwd: Optional[str] = None,
-) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell."""
+) -> Iterator[tuple[Path, bool]]:
+    """Yield scripts executed directly or through a POSIX shell.
+
+    Each segment is read twice: once at the token the walk has always used,
+    and again at the command a wrapper chain hands off to. Additive on
+    purpose — peeling must never REMOVE a reference the un-peeled read would
+    have found. A local script named ``./timeout`` is a script, not the
+    coreutils wrapper, and reading only the peeled index would skip it.
+    """
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
             continue
-        executable = segment[index]
-        executable_name = Path(executable).name
+        yield from _references_at(segment, index, cwd)
+        peeled = _peel_transparent_prefixes(segment, index)
+        if peeled != index:
+            yield from _references_at(segment, peeled, cwd)
 
-        if executable_name in {".", "source"}:
-            if len(segment) > index + 1:
-                resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
-                if resolved is not None:
-                    yield resolved
-            continue
 
-        if executable_name in _SHELL_EXECUTABLES:
-            arguments = segment[index + 1 :]
-            arg_index = 0
-            while arg_index < len(arguments):
-                argument = arguments[arg_index]
-                if argument == "--":
-                    arg_index += 1
-                    break
-                if argument in {"-c", "--command"}:
-                    break
-                if argument in _SHELL_OPTIONS_WITH_VALUES:
-                    arg_index += 2
-                    continue
-                if argument.startswith("-"):
-                    arg_index += 1
-                    continue
-                break
-            if arg_index < len(arguments) and arguments[arg_index] not in {
-                "-c",
-                "--command",
-            }:
-                resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
-                if resolved is not None:
-                    yield resolved
-            continue
-
-        # A bare "/" token is pathlib's division operator in Python sources
-        # (e.g. `Path.home() / ".hermes"`), not an executable reference.
-        # Resolving it walks to the filesystem root and fails the
-        # regular-file check below, hard-blocking innocent .py scripts
-        # (#77131). Skip pure-separator tokens.
-        if executable.strip("/"):
-            if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                resolved = _resolve_terminal_script_path(executable, cwd)
-                if resolved is not None:
-                    yield resolved
+def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator[str]:
+    """Yield option values, following the official upstream payload helper."""
+    prefix = option + "="
+    for position in range(start + 1, len(segment)):
+        token = segment[position]
+        if token == "--":
+            break
+        if token == option and position + 1 < len(segment):
+            yield segment[position + 1]
+        elif token.startswith(prefix):
+            yield token[len(prefix):]
+        elif option == "-S" and token.startswith("-S") and len(token) > 2:
+            yield token[2:]
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
-        if index is None or Path(segment[index]).name not in _SHELL_EXECUTABLES:
+        if index is None:
+            continue
+        index = _peel_transparent_prefixes(segment, index)
+        if index >= len(segment):
+            continue
+        if _executable_name(segment[index]) == "env":
+            yield from _iter_option_values(segment, index, "-S")
+            yield from _iter_option_values(segment, index, "--split-string")
+            continue
+        if _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue
         arguments = segment[index + 1 :]
         for arg_index, argument in enumerate(arguments[:-1]):
@@ -293,7 +510,25 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
+def _is_node_script(data: bytes) -> bool:
+    """Identify known interpreters before applying the shell scanning cap."""
+    header = data.split(b"\n", 1)[0][:256]
+    if not header.startswith(b"#!"):
+        return False
+    try:
+        tokens = shlex.split(header[2:].decode("utf-8"))
+        index = _command_token_index(tokens)
+        if index is not None:
+            index = _peel_transparent_prefixes(tokens, index)
+        if index is not None and index >= len(tokens):
+            return False
+        interpreter = Path(tokens[index]).name if index is not None else ""
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return bool(re.fullmatch(r"(?:node|nodejs)", interpreter))
+
+
+def _read_referenced_script(path: Path, *, force_shell: bool = False) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -325,12 +560,14 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     # executed by the user is not a referenced *shell script*.
     if b"\x00" in data:
         return None, False
+    if not force_shell and _is_node_script(data):
+        return None, False
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
 
 
-def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bool]:
+def _sanitize_remote_script_text(text: Optional[str], *, force_shell: bool = False) -> tuple[Optional[str], bool]:
     """Apply the local-read contract to text from a ``read_remote_script`` callback.
 
     The recursion boundary must not trust its callbacks: any backend (SSH,
@@ -351,6 +588,8 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
         return None, False
     if "\x00" in text:
         return None, False
+    if not force_shell and _is_node_script(text[:256].encode("utf-8")):
+        return None, False
     if len(text.encode("utf-8", errors="replace")) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return text, False
@@ -361,7 +600,7 @@ def _contains_unsafe_gateway_action(
     *,
     cwd: Optional[str],
     depth: int,
-    visited: set[Path],
+    visited: set[tuple[Path, bool]],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
 ) -> bool:
     if contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(
@@ -381,7 +620,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path, force_shell in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -389,10 +628,11 @@ def _contains_unsafe_gateway_action(
             # from a binary's decoded contents tokenized as a path — a
             # guarded path must never crash the guard (#76762).
             resolved = script_path
-        if resolved in visited:
+        identity = (resolved, force_shell)
+        if identity in visited:
             continue
-        visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        visited.add(identity)
+        script_text, unsafe = _read_referenced_script(script_path, force_shell=force_shell)
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:
@@ -401,7 +641,7 @@ def _contains_unsafe_gateway_action(
             # local read — sanitize it identically before it enters the
             # recursion (binary skip + size fail-closed).
             script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path))
+                read_remote_script(str(script_path)), force_shell=force_shell
             )
             if unsafe:
                 return True
@@ -507,7 +747,7 @@ def _read_script_for_scanning(script_path: str) -> str:
     resolved = _resolve_script_path(script_path)
     if resolved is None:
         return ""
-    script_text, unsafe = _read_referenced_script(resolved)
+    script_text, unsafe = _read_referenced_script(resolved, force_shell=True)
     if unsafe:
         return "hermes gateway restart"
     return script_text or ""

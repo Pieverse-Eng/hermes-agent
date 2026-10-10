@@ -2623,6 +2623,17 @@ class TestModelRoutesAgentCreation:
 
         _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
         adapter = _make_routing_adapter({"alias": {"model": "route/model", "api_key": "sk-route"}})
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+            lambda provider, target_model=None: {
+                "provider": provider,
+                "requested_provider": provider,
+                "api_key": "sk-session",
+                "base_url": "https://session.example/v1",
+                "api_mode": "responses",
+                "credential_pool": "pool-session",
+            },
+        )
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
         monkeypatch.setattr(
             adapter,

@@ -766,6 +766,10 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    # Persist the routable identity, never just a resolved transport class.
+    requested = override.get("requested_provider")
+    if requested not in (None, ""):
+        cleaned["provider"] = str(requested)
     return cleaned or None
 
 

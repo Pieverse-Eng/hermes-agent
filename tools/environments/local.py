@@ -1140,6 +1140,16 @@ def _prepend_hermes_bin_dir(existing_path: str) -> str:
     return sep.join([bin_dir, *entries])
 
 
+def _tenant_cli_path_entries() -> list[str]:
+    """Resolve existing CLI paths in the current profile only."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    return [str(path) for path in (
+        home / ".platform-bin", home / ".local/bin", home / ".npm-global/bin"
+    ) if path.is_dir()]
+
+
 def _managed_runtime_path_entries() -> list[str]:
     """Return existing Hermes-managed runtime dirs for the terminal subshell PATH.
 
@@ -1163,7 +1173,7 @@ def _managed_runtime_path_entries() -> list[str]:
         from hermes_constants import get_hermes_home, iter_hermes_node_dirs
 
         candidates = [*iter_hermes_node_dirs(), get_hermes_home() / "bin"]
-        return [str(d) for d in candidates if d.is_dir()]
+        return [*_tenant_cli_path_entries(), *(str(d) for d in candidates if d.is_dir())]
     except Exception:
         return []
 
@@ -1221,7 +1231,55 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
         if entry not in seen:
             ordered_entries.append(entry)
 
+    tenant_entries = _tenant_cli_path_entries()
+    if tenant_entries and Path(tenant_entries[0]).name == ".platform-bin":
+        shim = tenant_entries[0]
+        first_install = next((i for i, entry in enumerate(ordered_entries) if entry in tenant_entries[1:]), len(ordered_entries))
+        if ordered_entries.index(shim) > first_install:
+            ordered_entries.remove(shim)
+            ordered_entries.insert(first_install, shim)
     return ":".join(ordered_entries)
+
+
+def _restore_managed_path_after_init(cmd_string: str) -> str:
+    """Repair PATH after login profiles and before the environment snapshot.
+
+    Use bash builtins so this also works when init files leave no usable CLI
+    PATH. Existing entries retain their order; only the platform shim moves
+    ahead of this profile's installation directories.
+    """
+    if _IS_WINDOWS:
+        return cmd_string
+    entries = _managed_runtime_path_entries()
+    if not entries:
+        return cmd_string
+    tenant = _tenant_cli_path_entries()
+    shim = tenant[0] if tenant and Path(tenant[0]).name == ".platform-bin" else ""
+    installs = tenant[1:] if shim else []
+    quoted_entries = " ".join(_quote_bash_path(entry) for entry in entries)
+    quoted_installs = "|".join(_quote_bash_path(entry) for entry in installs) or "''"
+    prelude = f"""__hermes_restore_path() {{
+  local entry result='' shim={_quote_bash_path(shim)}
+  local -a path_entries
+  IFS=':' read -r -a path_entries <<< "$PATH"
+  for entry in {quoted_entries}; do
+    case ":$PATH:" in *":$entry:"*) ;; *) path_entries+=("$entry");; esac
+  done
+  for entry in "${{path_entries[@]}}"; do
+    [ -n "$entry" ] || continue
+    if [ -n "$shim" ] && [ "$entry" = "$shim" ]; then shim=''; fi
+    case "$entry" in {quoted_installs})
+      if [ -n "$shim" ]; then result="${{result:+$result:}}$shim"; shim=''; fi;;
+    esac
+    case ":$result:" in *":$entry:"*) ;; *) result="${{result:+$result:}}$entry";; esac
+  done
+  if [ -n "$shim" ]; then result="${{result:+$result:}}$shim"; fi
+  export PATH="$result"
+}}
+__hermes_restore_path
+unset -f __hermes_restore_path
+"""
+    return prelude + cmd_string
 
 
 def _apply_windows_msys_bash_env_defaults(env: dict) -> None:
@@ -1494,6 +1552,7 @@ class LocalEnvironment(BaseEnvironment):
         # Non-login invocations are already sourcing the snapshot and
         # don't need this.
         if login:
+            cmd_string = _restore_managed_path_after_init(cmd_string)
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)

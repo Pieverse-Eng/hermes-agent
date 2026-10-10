@@ -2085,6 +2085,7 @@ class GatewaySlashCommandsMixin:
                         _self._session_model_overrides[_session_key] = {
                             "model": result.new_model,
                             "provider": result.target_provider,
+                            "requested_provider": result.target_provider,
                             "api_key": result.api_key,
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
@@ -2396,6 +2397,7 @@ class GatewaySlashCommandsMixin:
             self._session_model_overrides[session_key] = {
                 "model": result.new_model,
                 "provider": result.target_provider,
+                "requested_provider": result.target_provider,
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,

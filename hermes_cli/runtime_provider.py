@@ -1035,6 +1035,23 @@ def canonical_custom_identity(
     return None
 
 
+def runtime_provider_identity(runtime: Dict[str, Any], *, model: Optional[str] = None) -> Optional[str]:
+    """Return the logical auth identity, rather than the transport class.
+
+    Old session rows only stored ``custom`` and an endpoint. Recover those
+    through the existing endpoint/model lookup before refreshing credentials.
+    An unknown recorded endpoint must not borrow the current default's key.
+    """
+    requested = str(runtime.get("requested_provider") or "").strip()
+    provider = requested or str(runtime.get("provider") or "").strip()
+    if provider != "custom":
+        return provider or None
+    base_url = runtime.get("base_url")
+    if base_url:
+        return find_custom_provider_identity(base_url) or "custom"
+    return canonical_custom_identity(model=model) or "custom"
+
+
 def _normalize_base_url_for_match(value) -> str:
     return str(value or "").strip().rstrip("/").lower()
 
