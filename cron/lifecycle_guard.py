@@ -357,6 +357,12 @@ def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optiona
     return path
 
 
+def _executable_name(token: str) -> str:
+    """Preserve POSIX dot-source, which has no pathlib name component."""
+    # Backport NousResearch/hermes-agent 5921ba8c0646e04a778b0ab3f7e4e5756a2eabdd.
+    return Path(token).name or token
+
+
 def _iter_referenced_shell_scripts(
     command: str,
     *,
@@ -368,7 +374,7 @@ def _iter_referenced_shell_scripts(
         if index is None:
             continue
         executable = segment[index]
-        executable_name = Path(executable).name
+        executable_name = _executable_name(executable)
 
         if executable_name in {".", "source"}:
             if len(segment) > index + 1:

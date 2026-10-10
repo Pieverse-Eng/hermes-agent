@@ -10,6 +10,13 @@ from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_reference
 from tools.environments.local import LocalEnvironment
 
 
+@pytest.mark.parametrize("prefix", [".", "source"])
+def test_sourced_script_blocks_gateway_restart(prefix, tmp_path):
+    script = tmp_path / "sourced.sh"
+    script.write_text("systemctl restart hermes-gateway\n")
+    assert blocked(f"{prefix} {script}")
+
+
 @pytest.mark.parametrize("command", [
     "printf '%s' 'Hermes gateway restart'",
     "echo 'launchctl submit -l ai.hermes.gateway -- /bin/true'",
