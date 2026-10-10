@@ -34,7 +34,7 @@ def profile(tmp_path, monkeypatch):
             },
         },
     }
-    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     return tmp_path
 
 
@@ -91,6 +91,47 @@ def test_missing_explicit_provider_never_borrows_global_credentials(adapter):
         adapter._create_agent(
             requested_provider="missing-provider", requested_model="fixed-model"
         )
+
+
+@pytest.mark.parametrize("requested_provider", [None, "anthropic"])
+@pytest.mark.parametrize("endpoint, expected_endpoint", [
+    (None, "https://api.anthropic.com"),
+    ("https://route.test/v1", "https://route.test/v1"),
+])
+def test_route_key_resolves_provider_without_profile_auth(adapter, requested_provider, endpoint, expected_endpoint):
+    route = {"model": "claude-test-model", "provider": "anthropic", "api_key": "route-key"}
+    if endpoint:
+        route["base_url"] = endpoint
+    agent = adapter._create_agent(route=route, requested_provider=requested_provider)
+    assert agent.kwargs["model"] == "claude-test-model"
+    assert agent.kwargs["provider"] == "anthropic"
+    assert agent.kwargs["requested_provider"] == "anthropic"
+    assert agent.kwargs["api_key"] == "route-key"
+    assert agent.kwargs["base_url"] == expected_endpoint
+    assert agent.kwargs["api_mode"] == "anthropic_messages"
+    assert agent.kwargs["credential_pool"] is None
+
+
+def test_route_key_cannot_reuse_global_credential_pool(adapter, monkeypatch):
+    import gateway.run as gateway_run
+
+    original = gateway_run._resolve_runtime_agent_kwargs
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {
+        **original(), "credential_pool": object(),
+    })
+    agent = adapter._create_agent(route={"model": "auto/paid", "api_key": "route-key"})
+    assert agent.kwargs["api_key"] == "route-key"
+    assert agent.kwargs["base_url"] == "http://pieverse.test/v1"
+    assert agent.kwargs["credential_pool"] is None
+
+
+@pytest.mark.parametrize("route_key", [None, "  "])
+def test_route_without_auth_never_borrows_global_credentials(adapter, route_key):
+    with pytest.raises(_ProviderAuthResolutionError):
+        adapter._create_agent(route={
+            "model": "claude-test-model", "provider": "anthropic", "api_key": route_key,
+            "base_url": "https://route.test/v1",
+        })
 
 
 @pytest.mark.parametrize("stored_provider", ["pieverse", "custom"])
