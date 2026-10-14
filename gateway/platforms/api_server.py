@@ -7044,6 +7044,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    **({"tool_call_id": kwargs["tool_call_id"], "args": args}
+                       if kwargs.get("tool_call_id") else {}),
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -7053,6 +7055,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    **({"tool_call_id": kwargs["tool_call_id"], "args": args,
+                        "result": kwargs.get("result")}
+                       if kwargs.get("tool_call_id") else {}),
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -7269,6 +7274,138 @@ class APIServerAdapter(BasePlatformAdapter):
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
+        # Exact callbacks own tool lifecycle events. The engine also fires its
+        # legacy progress callback for each call; forwarding both duplicates
+        # activity and loses identity when same-name calls overlap.
+        tool_started_at: Dict[str, float] = {}
+        tool_event_lock = threading.Lock()
+        native_tool_progress = threading.local()
+
+        def _tool_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+            if event_type == "tool.completed":
+                # Native emitters report progress then exact completion on the
+                # same dispatch thread. Keep their failure/duration metadata
+                # without matching overlapping calls by tool name globally.
+                native_tool_progress.completed = (
+                    tool_name, kwargs.get("result"), kwargs.get("is_error"), kwargs.get("duration"),
+                )
+            elif event_type == "tool.started":
+                native_tool_progress.completed = None
+            else:
+                event_cb(event_type, tool_name, preview, args, **kwargs)
+
+        from agent.credential_persistence import _is_secret_payload_key, _normalize_key
+        from agent.redact import _JSON_KEY_NAMES, _SENSITIVE_BODY_KEYS
+
+        json_secret_key = re.compile(_JSON_KEY_NAMES, re.IGNORECASE)
+        json_field = re.compile(r'("(?:\\.|[^"\\])*")\s*:\s*')
+        json_decoder = json.JSONDecoder()
+        # Tool events carry public market identifiers and wallet public keys.
+        # Only these known API fields override the credential pool's broad
+        # *_key suffix rule; other keys still use its secret classification.
+        public_identity_fields = frozenset({"market_key", "public_key"})
+
+        def _credential_field(key):
+            normalized = _normalize_key(key)
+            if normalized in public_identity_fields:
+                return False
+            return (_is_secret_payload_key(key)
+                    or normalized in _SENSITIVE_BODY_KEYS
+                    or json_secret_key.fullmatch(normalized) is not None)
+
+        def _safe_tool_text(value):
+            # Stdout can prefix/suffix JSON fragments with ordinary text. Match
+            # field keys, then let the JSON decoder find the complete value
+            # boundary (including escaped quotes, arrays and objects).
+            parts = []
+            copied_through = search_from = 0
+            while match := json_field.search(value, search_from):
+                search_from = match.end()
+                try:
+                    key = json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    continue
+                try:
+                    item, value_end = json_decoder.raw_decode(value, search_from)
+                except json.JSONDecodeError:
+                    continue
+                # A normal field can contain objects, arrays or JSON-encoded
+                # strings with credentials several layers below it. Reuse the
+                # same recursive sanitizer rather than skipping its value.
+                safe = "***" if _credential_field(key) else _safe_tool_value(item)
+                if safe != item:
+                    parts.extend((value[copied_through:search_from], json.dumps(safe)))
+                    copied_through = value_end
+                search_from = value_end
+            parts.append(value[copied_through:])
+            return redact_sensitive_text("".join(parts), force=True, redact_url_credentials=True)
+
+        def _safe_tool_value(value):
+            if isinstance(value, str):
+                # Some tools embed a JSON object inside an argument/result
+                # string. Parse valid structured data before applying key
+                # redaction, without changing unaffected strings or their type.
+                try:
+                    structured = json.loads(value)
+                except json.JSONDecodeError:
+                    structured = None
+                # JSON strings can contain another encoded JSON string. Each
+                # decoded layer is shorter; recurse and restore every original
+                # string layer when masking changes its contents.
+                if isinstance(structured, (dict, list, str)):
+                    safe = _safe_tool_value(structured)
+                    return json.dumps(safe) if safe != structured else value
+                return _safe_tool_text(value)
+            if isinstance(value, (list, tuple)):
+                return [_safe_tool_value(item) for item in value]
+            if isinstance(value, dict):
+                safe = {}
+                for key, item in value.items():
+                    # Mask the whole credential value, including numbers,
+                    # arrays and objects. Never rewrite serialized JSON with a
+                    # text regex: quoted/newline values can corrupt its syntax.
+                    safe[key] = "***" if _credential_field(key) else _safe_tool_value(item)
+                return safe
+            return value
+
+        def _tool_start(tool_call_id, function_name, function_args):
+            if not tool_call_id or function_name.startswith("_"):
+                return
+            with tool_event_lock:
+                if tool_call_id in tool_started_at:
+                    return
+                tool_started_at[tool_call_id] = time.monotonic()
+            from agent.display import build_tool_preview
+
+            args = _safe_tool_value(function_args or {})
+            event_cb("tool.started", function_name, build_tool_preview(function_name, args),
+                     args=args,
+                     tool_call_id=tool_call_id)
+
+        def _tool_complete(tool_call_id, function_name, function_args, function_result):
+            metadata = getattr(native_tool_progress, "completed", None)
+            native_tool_progress.completed = None
+            if not tool_call_id or function_name.startswith("_"):
+                return
+            with tool_event_lock:
+                started_at = tool_started_at.pop(tool_call_id, None)
+            from agent.display import _detect_tool_failure
+
+            result_text = (function_result if isinstance(function_result, str)
+                           else json.dumps(function_result))
+            is_error, _ = _detect_tool_failure(function_name, result_text)
+            duration = time.monotonic() - started_at if started_at is not None else 0.0
+            if metadata is not None and metadata[0] == function_name and metadata[1] == function_result:
+                if isinstance(metadata[2], bool):
+                    is_error = metadata[2]
+                if isinstance(metadata[3], (int, float)) and metadata[3] >= 0:
+                    duration = metadata[3]
+            event_cb("tool.completed", function_name,
+                     args=_safe_tool_value(function_args or {}),
+                     tool_call_id=tool_call_id,
+                     result=_safe_tool_value(function_result),
+                     duration=duration, is_error=is_error)
+
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
@@ -7344,7 +7481,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
-                        tool_progress_callback=event_cb,
+                        tool_progress_callback=_tool_progress,
+                        tool_start_callback=_tool_start,
+                        tool_complete_callback=_tool_complete,
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
                         requested_provider=agent_overrides.get("requested_provider"),

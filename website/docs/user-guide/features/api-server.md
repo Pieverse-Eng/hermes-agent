@@ -375,6 +375,16 @@ Statuses are retained briefly after terminal states (`completed`, `failed`, or `
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
 
+`tool.started` and `tool.completed` share the native `tool_call_id`, even when
+multiple calls to the same tool overlap. Both carry the tool name and `args`;
+completion also carries `result`, elapsed `duration` and an `error` boolean.
+Arguments and results pass forced secret redaction before entering the stream.
+The public identity fields `market_key` / `marketKey` and `public_key` /
+`publicKey` remain visible; private keys and credential values are redacted.
+Use `Last-Event-ID` to resume the retained event stream without creating a new
+run. Run status and submission idempotency are durable; the bounded SSE event
+buffer is retained only in the current gateway process.
+
 When the agent delegates work to background subagents, the stream also carries
 `subagent.start` and `subagent.complete` lifecycle events, so clients can
 observe delegation outcomes — including timeouts and failures — instead of the
