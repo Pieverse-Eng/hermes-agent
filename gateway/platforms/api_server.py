@@ -7299,6 +7299,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         json_secret_key = re.compile(_JSON_KEY_NAMES, re.IGNORECASE)
         json_field = re.compile(r'("(?:\\.|[^"\\])*")\s*:\s*')
+        json_fragment = re.compile(r'(?<!\\)["\[{]')
         json_decoder = json.JSONDecoder()
         # Tool events carry public market identifiers and wallet public keys.
         # Only these known API fields override the credential pool's broad
@@ -7314,6 +7315,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     or json_secret_key.fullmatch(normalized) is not None)
 
         def _safe_tool_text(value):
+            # A log prefix may precede a standalone JSON string, array or
+            # object. Decode complete fragments before scanning loose fields,
+            # so encoded strings do not need an enclosing response object.
+            parts = []
+            copied_through = search_from = 0
+            while match := json_fragment.search(value, search_from):
+                search_from = match.end()
+                try:
+                    item, value_end = json_decoder.raw_decode(value, match.start())
+                except json.JSONDecodeError:
+                    continue
+                safe = _safe_tool_value(item)
+                if safe != item:
+                    parts.extend((value[copied_through:match.start()], json.dumps(safe)))
+                    copied_through = value_end
+                search_from = value_end
+            parts.append(value[copied_through:])
+            value = "".join(parts)
+
             # Stdout can prefix/suffix JSON fragments with ordinary text. Match
             # field keys, then let the JSON decoder find the complete value
             # boundary (including escaped quotes, arrays and objects).

@@ -349,8 +349,9 @@ async def test_run_public_market_wallet_identity_survives_secret_redaction(repre
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("encoding_depth", [2, 3, 5])
-async def test_run_recursively_redacts_multiple_json_string_layers(encoding_depth):
+@pytest.mark.parametrize("encoding_depth", [1, 2, 3, 5])
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_run_recursively_redacts_multiple_json_string_layers(encoding_depth, wrapped):
     response = {
         "client_secret": 'opaque-depth-secret-"quoted"\nnext-line',
         "price": "42.5", "message": 'Normal "quoted" message\nkeeps its newline',
@@ -358,7 +359,7 @@ async def test_run_recursively_redacts_multiple_json_string_layers(encoding_dept
     for _ in range(encoding_depth):
         response = json.dumps(response)
     prefix, suffix = "HTTP response body: ", "\nrequest completed"
-    stdout = prefix + json.dumps({"response": response}) + suffix
+    stdout = prefix + (json.dumps({"response": response}) if wrapped else response) + suffix
     events, replay, body = await _run_with_tools([
         ("call-encoded-depth", "terminal", {"command": "inspect response"},
          {"exit_code": 0, "output": stdout}),
@@ -370,7 +371,9 @@ async def test_run_recursively_redacts_multiple_json_string_layers(encoding_dept
         assert completed[0]["error"] is False
         output = completed[0]["result"]["output"]
         assert output.startswith(prefix) and output.endswith(suffix)
-        parsed = json.loads(output.removeprefix(prefix).removesuffix(suffix))["response"]
+        parsed = output.removeprefix(prefix).removesuffix(suffix)
+        if wrapped:
+            parsed = json.loads(parsed)["response"]
         for _ in range(encoding_depth):
             assert isinstance(parsed, str)
             parsed = json.loads(parsed)
