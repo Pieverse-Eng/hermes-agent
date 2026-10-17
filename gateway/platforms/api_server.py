@@ -3747,6 +3747,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "paper_proposal_only": True,
                 "live_proposal_only": True,
                 "host_tools_v1": True,
+                "publication_ack_v1": bool(self._expected_api_key()),
                 "host_tool_names": self._available_host_tools(),
                 "run_clarify_response": True,
                 "session_resources": True,
@@ -7145,6 +7146,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error(
                     "Invalid interaction_context", code="invalid_interaction_context"
                 ), status=400)
+        publication_ack = body.get("publication_ack", False)
+        if not isinstance(publication_ack, bool) or (publication_ack and not self._expected_api_key()):
+            return web.json_response(_openai_error("Publication acknowledgements require an authenticated Run",
+                                     code="publication_ack_unavailable"), status=400)
         host_tool_names = tuple((interaction_context or {}).get("host_tools", ()))
         if host_tool_names:
             try:
@@ -7526,7 +7531,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         raise RuntimeError("Current conversation delivery is unavailable") from None
 
                 from gateway.host_tools import HostToolBroker, host_tool_scope
-                host_broker = HostToolBroker(run_id, host_tool_names, _publish_interactive,
+                from gateway.publication_receipts import PUBLICATION_OPERATION, AcknowledgedPublisher
+                # Transport capability only. Keep it out of model schemas and the
+                # proposal-only manifest, including child-agent discovery.
+                broker_names = (*host_tool_names, PUBLICATION_OPERATION) if publication_ack else host_tool_names
+                host_broker = HostToolBroker(run_id, broker_names, _publish_interactive,
                     serial_tools=(interaction_context or {}).get("serial_host_tools", ()))
                 self._run_host_tools[run_id] = host_broker
 
@@ -7633,10 +7642,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             "message": message, "context": context,
                             **({"metadata": metadata} if metadata is not None else {}),
                         })
+                    deliver_current = AcknowledgedPublisher(host_broker, _deliver_current) if publication_ack else _deliver_current
                     approval_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile), current_message_scope(
-                        _deliver_current, interaction_context,
+                        deliver_current, interaction_context,
                         available_tools=getattr(agent, "valid_tool_names", None)
                     ), host_tool_scope(host_broker):
                         try:

@@ -83,7 +83,7 @@ def is_proposal_context(context: Optional[dict]) -> bool:
                              context.get("execution_policy") == "proposal_only"))
 
 
-_delivery: ContextVar[Optional[Callable[[dict, str, Optional[dict], Optional[dict]], None]]] = ContextVar(
+_delivery: ContextVar[Optional[Callable[[dict, str, Optional[dict], Optional[dict]], Optional[dict]]]] = ContextVar(
     "current_interactive_delivery", default=None,
 )
 _context: ContextVar[Optional[dict]] = ContextVar("current_interaction_context", default=None)
@@ -132,9 +132,15 @@ def send_current_message(text: str, reply_markup=None, metadata=None) -> dict:
     message_id = f"msg_{uuid4().hex}"
     # The caller owns delivery; do not fall back to another channel on failure.
     try:
-        deliver(deepcopy(message), message_id, current_interaction_context(), deepcopy(metadata))
+        receipt = deliver(deepcopy(message), message_id, current_interaction_context(), deepcopy(metadata))
+        if isinstance(receipt, dict):
+            if receipt.get("success") is not True:
+                return receipt
+            message_id = receipt.get("message_id", message_id)
     except Exception:
         return {"error": "Current conversation delivery is unavailable; no other channel was used"}
     return {"success": True, "message_id": message_id, "message": message,
+            **({key: receipt[key] for key in ("publication", "duplicate") if key in receipt}
+               if isinstance(receipt, dict) else {}),
             **({"metadata": metadata} if metadata is not None else {}),
             **({"context": current_interaction_context()} if _context.get() is not None else {})}

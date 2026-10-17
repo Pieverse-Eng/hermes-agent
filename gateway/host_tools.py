@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from uuid import uuid4
+from gateway.publication_receipts import PUBLICATION_OPERATION, PUBLICATION_REQUEST_BYTES
 
 
 def _encoded(value, limit):
@@ -47,7 +48,7 @@ class HostToolBroker:
         if name not in self.names:
             return _error("HOST_TOOL_UNAVAILABLE")
         try:
-            encoded = _encoded(arguments, 8192)
+            encoded = _encoded(arguments, PUBLICATION_REQUEST_BYTES if name == PUBLICATION_OPERATION else 8192)
         except (ValueError, TypeError, RecursionError):
             return _error("HOST_REQUEST_INVALID")
         call_id = uuid4().hex
