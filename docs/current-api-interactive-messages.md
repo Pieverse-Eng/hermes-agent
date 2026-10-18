@@ -16,6 +16,14 @@ Paper tool schemas are frozen for the Run and skip native between-turn MCP disco
 
 ## Current-Run host tools (v1)
 
+Client-visible native tool lifecycle events, session message history and terminal
+turn transcripts share the same structured credential redaction. Known public
+wallet/market identities, validated receipt cursors and tool-call IDs remain
+intact; credential fields and nested JSON-encoded credentials are masked.
+This is an outbound presentation boundary: stored SQLite messages and the
+conversation passed to model continuation are not rewritten. Unaffected strings
+retain their exact bytes, including meaningful whitespace.
+
 Platform plugins can register schemas in `api_host_tools`. They are proxies:
 registry dispatch uses only the current Run broker and never calls a local handler.
 Only tools enabled for the authenticated API platform can be admitted. Telegram,
