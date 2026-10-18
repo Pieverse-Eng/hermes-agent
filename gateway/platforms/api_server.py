@@ -7331,7 +7331,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         r"[A-Za-z][A-Za-z0-9_-]{0,31}:[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}:[1-9][0-9]{0,9}", value)):
                     return value
             if normalized == "scope_key" and isinstance(value, str) and re.fullmatch(
-                    r"[a-z][a-z0-9_-]{0,31}:(?:spot|perp):[A-Za-z0-9@._-]{1,64}(?::[A-Za-z0-9_.-]{1,128})?", value):
+                    r"(?:wallet:[A-Z][A-Z0-9]{0,15}|[a-z][a-z0-9_-]{0,31}:(?:spot|perp):[A-Za-z0-9@._-]{1,64}(?::[A-Za-z0-9_.-]{1,128})?)", value):
                 if redact_sensitive_text(value, force=True, redact_url_credentials=True) == value:
                     return value
             if normalized not in public_cursor_fields or not isinstance(value, str) or len(value) > 2048:

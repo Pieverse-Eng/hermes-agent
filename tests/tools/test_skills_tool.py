@@ -349,6 +349,40 @@ class TestModelHiddenSkills:
 
 
 class TestSkillView:
+    @pytest.mark.parametrize("path", ["references/api.md", "my-skill/references/api.md"])
+    def test_scoped_reference_reads_current_skill(self, tmp_path, path):
+        from tools.execution_scope import proposal_only_scope
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            root = _make_skill(tmp_path, "my-skill")
+            (root / "references").mkdir()
+            (root / "references/api.md").write_text("# Scoped reference\nVerified content.")
+            with proposal_only_scope(True):
+                result = json.loads(skill_view("my-skill", file_path=path))
+        assert result["success"] is True
+        assert "Verified content." in result["content"]
+
+    @pytest.mark.parametrize("path", ["other-skill/references/api.md", "my-skill/../references/api.md", "/my-skill/references/api.md", "my-skill/scripts/run.py", "my-skill/references/../../private.md"])
+    def test_scoped_reference_rejects_outside_or_executable_paths(self, tmp_path, path):
+        from tools.execution_scope import proposal_only_scope
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            with proposal_only_scope(True):
+                result = json.loads(skill_view("my-skill", file_path=path))
+        assert result["success"] is False
+
+    def test_scoped_reference_rejects_external_symlink(self, tmp_path):
+        from tools.execution_scope import proposal_only_scope
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            root = _make_skill(tmp_path, "my-skill")
+            (root / "references").mkdir()
+            outside = tmp_path / "outside.md"
+            outside.write_text("Private outside content")
+            (root / "references/api.md").symlink_to(outside)
+            with proposal_only_scope(True):
+                result = json.loads(skill_view("my-skill", file_path="my-skill/references/api.md"))
+        assert result["success"] is False
+        assert "Private outside content" not in json.dumps(result)
+
     def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(

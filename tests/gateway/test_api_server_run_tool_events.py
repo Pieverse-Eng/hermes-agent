@@ -396,6 +396,7 @@ async def test_run_public_receipt_fields_and_page_cursor_survive_replay(represen
     payload = {"status": "ready", "callId": "broker_read_1", "data": {
         "nextReviewCursor": cursor,
         "nextSpotReviewCursor": cursor,
+        "wallet": {"account": {"scopeKey": "wallet:USDC"}},
         "action": {"commandKey": None},
         "completedAction": {"commandKey": "coach:00000000-0000-4000-8000-000000000001:2"},
         "reviews": [{"scopeKey": "orderly:perp:USDC:pieverse_orderly"}, {"scopeKey": "orderly:perp:USDC:pool.dot"}],
@@ -408,6 +409,7 @@ async def test_run_public_receipt_fields_and_page_cursor_survive_replay(represen
     for stream in (events, replay):
         output = next(event["result"] for event in stream if event["event"] == "tool.completed")
         output = json.loads(output.removeprefix("stdout: ")) if isinstance(output, str) else output
+        assert output["data"]["wallet"]["account"]["scopeKey"] == "wallet:USDC"
         assert output["data"]["nextReviewCursor"] == cursor
         assert output["data"]["nextSpotReviewCursor"] == cursor
         assert output["data"]["action"]["commandKey"] is None

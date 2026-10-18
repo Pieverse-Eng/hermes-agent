@@ -1161,6 +1161,11 @@ def skill_view(
     try:
         from tools.execution_scope import is_proposal_only_scope
         readonly = is_proposal_only_scope()
+        # Some callers repeat the selected skill's name in its reference path.
+        # Normalize only that exact prefix; the existing reference allowlist and
+        # resolved-directory checks still reject traversal and foreign skills.
+        if readonly and file_path and file_path.startswith(f"{name}/references/"):
+            file_path = file_path[len(name) + 1:]
         if readonly and (
             ":" in name
             or (file_path is not None and not (file_path.startswith("references/") and file_path.endswith(".md")))
