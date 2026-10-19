@@ -14,10 +14,13 @@ from tests.gateway.test_api_server_run_tool_events import _run_with_tools
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("representation", ["json", "stdout", "nested"])
-async def test_native_history_matches_sse_redaction_and_keeps_raw_state(tmp_path, representation):
-    cursor = base64.urlsafe_b64encode(json.dumps({
-        "v": "pc1", "at": "2026-10-18T12:00:00.123456Z", "id": "42", "q": [],
-    }).encode()).decode().rstrip("=")
+@pytest.mark.parametrize("cursor_payload", [
+    {"v": "pc1", "at": "2026-10-18T12:00:00.123456Z", "id": "42", "q": []},
+    {"hash": "0123456789abcdef" * 4, "at": "2026-10-19T04:03:04.123456Z",
+     "id": "11111111-1111-4111-8111-111111111111"},
+], ids=["keyset", "paper-facts"])
+async def test_native_history_matches_sse_redaction_and_keeps_raw_state(tmp_path, representation, cursor_payload):
+    cursor = base64.urlsafe_b64encode(json.dumps(cursor_payload).encode()).decode().rstrip("=")
     payload = {
         "scopeKey": "wallet:USDC", "marketKey": "hyperliquid:perp:BTC",
         "commandKey": "paper:11111111-1111-4111-8111-111111111111:1",
@@ -91,3 +94,65 @@ def test_terminal_transcript_redacts_tools_without_mutating_model_messages():
     transcript = APIServerAdapter._turn_transcript_messages([], "read", {"messages": [message]})
     assert json.loads(transcript[0]["content"]) == {"scopeKey": "wallet:USDC", "api_key": "***"}
     assert message["content"] == content
+
+
+@pytest.mark.parametrize("changes", [
+    {"hash": "not-a-query-digest"},
+    {"hash": "0123456789abcdef" * 4 + "x"},
+    {"id": "not-a-cycle-id"},
+    {"at": "not-a-timestamp"},
+    {"token": "opaque-pagination-secret"},
+    {"sub": "credential-subject", "exp": 9999999999},
+])
+def test_paper_cursor_allowlist_does_not_preserve_unproven_or_credential_payloads(changes):
+    from gateway.platforms.api_server_tool_payloads import safe_tool_value
+
+    payload = {"hash": "0123456789abcdef" * 4, "at": "2026-10-19T04:03:04.123456Z",
+               "id": "11111111-1111-4111-8111-111111111111", **changes}
+    cursor = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    result = safe_tool_value({"nextCursor": cursor, "token": cursor})
+    assert result["nextCursor"] != cursor
+    assert result["token"] == "***"
+
+
+@pytest.mark.parametrize("payload", [
+    '{"hash":"sk-proj-hidden-cursor-credential1234567890",'
+    '"hash":"' + "0123456789abcdef" * 4 + '",'
+    '"at":"2026-10-19T04:03:04.123456Z","id":"11111111-1111-4111-8111-111111111111"}',
+    '{"v":"pc1","at":"2026-10-19T04:03:04.123456Z","id":"42",'
+    '"q":["sk-proj-hidden-cursor-credential1234567890"],"q":[]}',
+], ids=["paper-facts", "keyset"])
+def test_cursor_allowlist_does_not_return_encoded_credentials_hidden_by_duplicate_keys(payload):
+    from gateway.platforms.api_server_tool_payloads import safe_tool_value
+
+    cursor = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    assert safe_tool_value({"nextCursor": cursor})["nextCursor"] != cursor
+
+
+@pytest.mark.parametrize("payload", [
+    {"hash": "0123456789abcdef" * 4, "at": "2026-10-19T04:03:04.123456Z",
+     "id": "11111111-1111-4111-8111-111111111111"},
+    {"v": "pc", "at": "2026-10-19T04:03:04.123456Z", "id": "42", "q": []},
+], ids=["paper-facts", "keyset"])
+@pytest.mark.parametrize("tamper", [None, "credential-suffix", "whitespace", "extra-padding"])
+def test_cursor_projection_accepts_only_exact_padded_or_unpadded_base64(payload, tamper):
+    from gateway.platforms.api_server_tool_payloads import safe_tool_value
+
+    cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
+    assert cursor.endswith("=")
+    if tamper is None:
+        unpadded = cursor.rstrip("=")
+        assert safe_tool_value({"cursor": cursor, "nextCursor": unpadded}) == {
+            "cursor": cursor, "nextCursor": unpadded,
+        }
+        return
+    secret = "sk-proj-testonly1234567890testonly1234567890"
+    if tamper == "credential-suffix":
+        invalid = cursor + secret
+    elif tamper == "whitespace":
+        invalid = cursor[:20] + " " + cursor[20:]
+    else:
+        invalid = cursor + "="
+    result = safe_tool_value({"nextCursor": invalid})["nextCursor"]
+    assert result != invalid
+    assert secret not in result

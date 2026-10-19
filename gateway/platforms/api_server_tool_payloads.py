@@ -27,6 +27,14 @@ def _credential_field(key):
 public_cursor_fields = frozenset({"cursor", "next_cursor", "next_review_cursor", "next_spot_review_cursor"})
 not_public = object()
 
+def _unique_cursor_object(pairs):
+    decoded = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError("Duplicate cursor field")
+        decoded[key] = value
+    return decoded
+
 def _public_receipt_value(key, value):
     normalized = _normalize_key(key)
     if normalized == "command_key":
@@ -40,12 +48,27 @@ def _public_receipt_value(key, value):
             return value
     if normalized not in public_cursor_fields or not isinstance(value, str) or len(value) > 2048:
         return not_public
-    # A keyset cursor is base64 JSON, not a one-segment JWT. Only this
-    # bounded, noncredential shape bypasses the generic JWT heuristic.
+    # Keyset and Paper fact-query cursors are base64 JSON, not single-
+    # segment JWTs. Only their bounded, noncredential schemas bypass it.
     import base64
     try:
-        decoded = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+        payload = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        # Python's decoder ignores whitespace and trailing bytes after padding.
+        # Only exempt the exact complete encoding, never an accepted prefix.
+        encoded = base64.urlsafe_b64encode(payload).decode("ascii")
+        if value not in (encoded, encoded.rstrip("=")):
+            return not_public
+        decoded = json.loads(payload, object_pairs_hook=_unique_cursor_object)
     except (ValueError, TypeError):
+        return not_public
+    if isinstance(decoded, dict) and set(decoded) == {"hash", "at", "id"}:
+        # Paper facts bind pagination to a SHA-256 query digest and one
+        # closed cycle. Keep its exact cursor in both SSE and history;
+        # shortening it breaks pagination and broker receipt confirmation.
+        if (isinstance(decoded["hash"], str) and re.fullmatch(r"[0-9a-f]{64}", decoded["hash"])
+                and isinstance(decoded["at"], str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", decoded["at"])
+                and isinstance(decoded["id"], str) and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", decoded["id"])):
+            return value
         return not_public
     if (not isinstance(decoded, dict) or set(decoded) != {"v", "at", "id", "q"}
             or not isinstance(decoded["v"], str) or not re.fullmatch(r"[A-Za-z0-9:_-]{1,64}", decoded["v"])
