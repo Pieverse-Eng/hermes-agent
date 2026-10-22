@@ -219,3 +219,22 @@ async def test_finished_host_call_has_typed_nonexecution_acknowledgement(host_pl
         assert (await client.post(route, headers=headers, json=body)).status == 410
     assert original["error"]["code"] == ("HOST_CALL_CANCELLED" if closed else "HOST_CALL_UNKNOWN")
     broker.close()
+
+
+def test_publication_proxy_has_its_own_opt_in_and_budget_without_exposing_an_agent_tool():
+    from gateway.host_tools import HostToolBroker
+    requests = []
+    def publish(request):
+        requests.append(request)
+        broker.resolve(request['callId'], request['requestHash'], {'status': 'ready'})
+    broker = HostToolBroker('run', ['test_host_read', '__publish_current_message'], publish, timeout=0.05)
+    large = {'message': {'text': 'x' * 60000}}
+    assert broker.call('__publish_current_message', large)['status'] == 'ready'
+    assert broker.call('test_host_read', large)['error']['code'] == 'HOST_REQUEST_INVALID'
+    assert broker.call('__publish_current_message', {'value': 'x' * 65536})['error']['code'] == 'HOST_REQUEST_INVALID'
+    disabled = HostToolBroker('run', [], lambda request: pytest.fail('Unadmitted publication'), timeout=0.05)
+    assert disabled.call('__publish_current_message', {})['error']['code'] == 'HOST_TOOL_UNAVAILABLE'
+    expired = HostToolBroker('run', ['__publish_current_message'], lambda request: None, timeout=0.01)
+    assert expired.call('__publish_current_message', {})['error']['code'] == 'HOST_CALL_UNKNOWN'
+    broker.close()
+    assert broker.call('__publish_current_message', {})['error']['code'] == 'HOST_CALL_CANCELLED'

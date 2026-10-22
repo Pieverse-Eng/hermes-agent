@@ -13,7 +13,10 @@ def test_host_rejection_never_reports_a_usable_message():
 
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from uuid import uuid4
+
+import pytest
 
 from gateway.publication_receipts import AcknowledgedPublisher, PUBLICATION_OPERATION
 
@@ -58,13 +61,48 @@ def test_native_publication_returns_original_registered_resource_for_followup_sa
             result['registered'] = {'coachCard': {'id': '72a71769-36a3-428d-a47c-00ebcddf85a6', 'kind': 'playbook_proposal', 'version': 1}}
             return result
     host, visible = RegisteredHost(), []
-    with current_message_scope(AcknowledgedPublisher(host, lambda *args: visible.append(args))):
+    # A registered acknowledgement also hands its presentation to delivery.
+    with current_message_scope(AcknowledgedPublisher(host, lambda *args, **kwargs: visible.append(args))):
         first = send_current_message('Your preferences', metadata=CARD)
         retried = send_current_message('Your preferences', metadata=CARD)
     assert first['registered']['coachCard']['id'] == '72a71769-36a3-428d-a47c-00ebcddf85a6'
     assert first['registered'] == retried['registered']
     assert first['registered']['coachCard']['id'] != first['message_id']
     assert len(host.calls) == len(visible) == 1
+
+
+@pytest.mark.parametrize('registered_context', [True, False])
+def test_registered_acknowledgement_round_trips_beside_presented_card_scope_and_context(registered_context):
+    # The visible message carries only the registered card, callback scope and
+    # context; the tool result carries those and the whole bounded acknowledgement.
+    registered = {'coachCard': {'id': 'card-id', 'kind': 'playbook_proposal', 'version': 1},
+                  'callbackScope': {'id': 'scope-id'}, 'resources': [{'kind': 'playbook', 'id': 'resource-id'}],
+                  **({'context': {'version': 2, 'execution_policy': 'pawpilot', 'host_data': {'page': 'saved'}}}
+                     if registered_context else {})}
+    class RegisteredHost(Host):
+        def call(self, operation, payload):
+            return {**super().call(operation, payload), 'registered': deepcopy(registered)}
+    host, attempts = RegisteredHost(), []
+    def deliver(*args, **kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise TimeoutError()
+    run_context = {'version': 2, 'execution_policy': 'pawpilot'}
+    with current_message_scope(AcknowledgedPublisher(host, deliver), run_context):
+        unseen = send_current_message('Your preferences', metadata=CARD)
+        first = send_current_message('Your preferences', metadata=CARD)
+        duplicate = send_current_message('Your preferences', metadata=CARD)
+    shown = {'coachCard': registered['coachCard'], 'callbackScope': registered['callbackScope'],
+             'context': registered.get('context')}
+    assert unseen['error'] == 'CURRENT_MESSAGE_DELIVERY_UNKNOWN'
+    assert attempts == [{'presentation': shown}] * 2
+    assert len(host.calls) == 1
+    for result in (first, duplicate):
+        assert result['success'] is True and result['message_id'] == unseen['message_id']
+        assert result['registered'] == registered
+        assert {key: result[key] for key in shown} == shown
+        assert result['context'] != run_context
+    assert duplicate['duplicate'] is True
 
 
 def test_unknown_registration_retries_original_message_and_rejection_stays_failed():

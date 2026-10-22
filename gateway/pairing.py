@@ -865,15 +865,21 @@ class PairingStore:
                     })
         return results
 
-    def clear_pending(self, platform: str = None) -> int:
-        """Clear all pending requests. Returns count removed."""
+    def clear_pending(self, platform: str = None, user_id: str = None) -> int:
+        """Clear pending requests, optionally for one user of one platform."""
+        if user_id is not None and platform is None:
+            raise ValueError("A user-scoped clear requires a platform")
         with self._lock:
             count = 0
             platforms = [platform] if platform else self._all_platforms("pending")
             for p in platforms:
                 pending = self._load_json(self._pending_path(p))
-                count += len(pending)
-                self._save_json(self._pending_path(p), {})
+                retained = {} if user_id is None else {
+                    key: entry for key, entry in pending.items()
+                    if not isinstance(entry, dict) or not self._user_ids_match(p, str(entry.get("user_id", "")), user_id)
+                }
+                count += len(pending) - len(retained)
+                self._save_json(self._pending_path(p), retained)
         return count
 
     # ----- Rate limiting and lockout -----

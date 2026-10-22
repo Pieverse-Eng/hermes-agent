@@ -234,6 +234,27 @@ class RunIdempotencyStore:
             "updated_at": float(row[5] or 0),
         }
 
+    def run_for_key(self, scope: str, key: str):
+        """Read a scoped native run identity without resubmitting its input.
+
+        Used when an authenticated caller retained its idempotency key but
+        lost the acknowledgement. It neither reserves nor extends retention.
+        Status and owner-death reconciliation stay in the existing reader.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._prune_stale_terminal_locked(time.time())
+                row = self._conn.execute(
+                    "SELECT run_id FROM run_idempotency WHERE scope=? AND idempotency_key=?",
+                    (scope, key),
+                ).fetchone()
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return row[0] if row else None
+
     def _prune_stale_terminal_locked(self, now: float) -> None:
         """Prune replay records only after their stored run is terminal.
 
