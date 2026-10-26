@@ -252,6 +252,21 @@ async def test_real_run_clarifies_and_resumes_with_the_original_answer(detach_st
             status = await client.get(f'/v1/runs/{run_id}')
             assert (await status.json())['pending_clarify_id'] == entries[0].clarify_id
             if detach_stream:
+                # Registration precedes publication. Simulate losing the stream
+                # only after the client has received the question it will answer.
+                stream = await client.get(f"/v1/runs/{run_id}/events")
+                try:
+                    async with asyncio.timeout(5):
+                        while True:
+                            line = await stream.content.readline()
+                            assert line, "Run ended before the clarification was published"
+                            if line.startswith(b"data:"):
+                                event = json.loads(line[5:])
+                                if event.get("event") == "message.interactive":
+                                    assert event["clarify_id"] == entries[0].clarify_id
+                                    break
+                finally:
+                    stream.release()
                 adapter._run_streams.pop(run_id, None)
             answer = await client.post(f"/v1/runs/{run_id}/clarify", json={"clarify_id": entries[0].clarify_id, "response": "ETH"})
             assert answer.status == 200
@@ -426,3 +441,146 @@ def test_paper_scope_blocks_tool_search_bridges_and_dispatch_middleware_before_e
     with current_message_scope(lambda *args:None,{'version':1,'mode':'paper','account_id':'account'}):
         for name in ['tool_call','tool_search','terminal']:
             assert json.loads(handle_function_call(name,{'tool':'terminal','arguments':{'command':'Live trade'}}))['error_type']=='proposal_only'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('accepted', [True, False])
+async def test_publication_ack_waits_for_authenticated_registration_before_delivery(accepted):
+    adapter, agent = _make_adapter('test-key'), PublishingAgent(metadata={'coachCard': {'private': 'marker'}})
+    headers = {'Authorization': 'Bearer test-key'}
+    with patch.object(adapter, '_create_agent', return_value=agent):
+        async with TestClient(TestServer(_interactive_app(adapter))) as client:
+            response = await client.post('/v1/runs', headers=headers, json={
+                'input': 'Publish this reply', 'publication_ack': True,
+            })
+            assert response.status == 202
+            run_id = (await response.json())['run_id']
+            stream = await client.get(f'/v1/runs/{run_id}/events', headers=headers)
+            try:
+                while True:
+                    line = await asyncio.wait_for(stream.content.readline(), 2)
+                    assert line, 'Native run ended without registration'
+                    if not line.startswith(b'data:'):
+                        continue
+                    event = json.loads(line[5:])
+                    assert event.get('event') != 'message.interactive', 'Published before registration'
+                    if event.get('event') == 'host_tool.request':
+                        break
+                assert event['name'] == '__publish_current_message'
+                assert agent.results == []
+                publication = event['arguments']
+                result = {'status': 'ready' if accepted else 'blocked',
+                          'publication': {'status': 'registered' if accepted else 'rejected',
+                                          'messageId': publication['message_id'], 'runId': '00000000-0000-4000-8000-000000000001',
+                                          'sessionId': '00000000-0000-4000-8000-000000000002', 'hash': 'b' * 64},
+                          'registered': {'coachCard': {'version': 1, 'id': 'card-id', 'kind': 'paper_practice_invite'},
+                                         'resources': [{'kind': 'playbook', 'id': 'resource-id'}]}}
+                route = f"/v1/runs/{run_id}/host-tools/{event['callId']}/result"
+                wire = {'requestHash': event['requestHash'], 'result': result}
+                assert (await client.post(route, json=wire)).status == 401
+                assert (await client.post(route, headers=headers, json={**wire, 'requestHash': 'wrong'})).status == 409
+                assert (await client.post(route, headers=headers, json=wire)).status == 200
+                await settle(adapter, run_id)
+                rest = await stream.text()
+                if accepted:
+                    assert 'message.interactive' in rest
+                    assert agent.results[0]['coachCard'] == result['registered']['coachCard']
+                    # The saved tool result keeps the whole acknowledgement; the
+                    # visible message carries only the registered presentation.
+                    assert agent.results[0]['registered'] == result['registered']
+                    shown = next(json.loads(line[5:]) for line in rest.splitlines()
+                                 if line.startswith('data:') and '"message.interactive"' in line)
+                    assert shown['coachCard'] == result['registered']['coachCard']
+                    assert shown['context'] is None
+                    assert 'registered' not in shown and 'resources' not in shown
+                else:
+                    assert 'message.interactive' not in rest
+                    assert 'error' in agent.results[0]
+            finally:
+                await client.post(f'/v1/runs/{run_id}/stop', headers=headers)
+                stream.release()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('flag', [True, 'true', 1])
+async def test_publication_ack_requires_configured_auth_and_a_boolean_flag(flag):
+    adapter = _make_adapter('' if flag is True else 'test-key')
+    with patch.object(adapter, '_create_agent', return_value=PublishingAgent()):
+        async with TestClient(TestServer(_interactive_app(adapter))) as client:
+            response = await client.post('/v1/runs', headers={'Authorization': 'Bearer test-key'},
+                                         json={'input': 'Publish', 'publication_ack': flag})
+            assert response.status == 400
+            assert not adapter._active_run_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_registered", [False, True], ids=["omitted", "empty"])
+async def test_publication_without_registered_context_keeps_legacy_ack_usable(include_registered):
+    adapter = _make_adapter("test-key")
+    agent = PublishingAgent(metadata={"coachCard": {"version": 1}})
+    run_context = {"version": 2, "execution_policy": "pawpilot", "host_data": {"page": "original"}}
+    headers = {"Authorization": "Bearer test-key"}
+    with patch.object(adapter, "_create_agent", return_value=agent):
+        async with TestClient(TestServer(_interactive_app(adapter))) as client:
+            response = await client.post("/v1/runs", headers=headers, json={
+                "input": "Registered reply", "publication_ack": True,
+                "interaction_context": run_context,
+            })
+            assert response.status == 202
+            run_id = (await response.json())["run_id"]
+            stream = await client.get(f"/v1/runs/{run_id}/events", headers=headers)
+            try:
+                while True:
+                    line = await asyncio.wait_for(stream.content.readline(), 5)
+                    assert line, "Run ended before publication registration"
+                    if line.startswith(b"data:"):
+                        event = json.loads(line[5:])
+                        assert event.get("event") != "message.interactive"
+                        if event.get("event") == "host_tool.request":
+                            break
+                result = {"status": "ready", "publication": {
+                    "status": "registered", "messageId": event["arguments"]["message_id"],
+                    "runId": "00000000-0000-4000-8000-000000000001",
+                    "sessionId": "00000000-0000-4000-8000-000000000002", "hash": "a" * 64,
+                }}
+                if include_registered:
+                    result["registered"] = {}
+                route = f"/v1/runs/{run_id}/host-tools/{event['callId']}/result"
+                response = await client.post(route, headers=headers, json={
+                    "requestHash": event["requestHash"], "result": result,
+                })
+                assert response.status == 200
+                await settle(adapter, run_id)
+                events = [json.loads(line[5:]) for line in (await stream.text()).splitlines()
+                          if line.startswith("data:")]
+                visible = next(event for event in events if event.get("event") == "message.interactive")
+                assert agent.results[0]["success"] is True
+                assert visible["context"] is None
+                assert agent.results[0]["context"] is None
+            finally:
+                await client.post(f"/v1/runs/{run_id}/stop", headers=headers)
+                stream.release()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_publication_registration_without_delivery_or_another_channel():
+    adapter, agent = _make_adapter('test-key'), PublishingAgent()
+    headers = {'Authorization': 'Bearer test-key'}
+    with patch.object(adapter, '_create_agent', return_value=agent):
+        async with TestClient(TestServer(_interactive_app(adapter))) as client:
+            response = await client.post('/v1/runs', headers=headers,
+                                         json={'input': 'Publish', 'publication_ack': True})
+            run_id = (await response.json())['run_id']
+            stream = await client.get(f'/v1/runs/{run_id}/events', headers=headers)
+            try:
+                while True:
+                    line = await asyncio.wait_for(stream.content.readline(), 2)
+                    if line.startswith(b'data:') and json.loads(line[5:]).get('event') == 'host_tool.request':
+                        break
+                task = adapter._active_run_tasks[run_id]
+                assert (await client.post(f'/v1/runs/{run_id}/stop', headers=headers)).status == 200
+                await asyncio.wait_for(task, 2)
+                assert 'error' in agent.results[0]
+                assert 'message.interactive' not in await stream.text()
+            finally:
+                stream.release()

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -238,7 +239,8 @@ def _load_hermes_env() -> None:
     ``os.getenv(...)`` on each call. The gateway process does two things at
     startup that ``hermes send`` must replicate when invoked standalone:
 
-    1. ``load_dotenv(~/.hermes/.env)`` — brings bot tokens into the env.
+    1. Load ``~/.hermes/.env`` in the selected format — brings bot tokens
+       into the env, preserving opaque values in hosted literal mode.
     2. Bridge top-level simple values from ``~/.hermes/config.yaml`` into
        ``os.environ`` (without overriding existing env vars). This is where
        ``TELEGRAM_HOME_CHANNEL`` and friends live when the user saved them
@@ -261,7 +263,11 @@ def _load_hermes_env() -> None:
         return
 
     env_path = home / ".env"
-    if load_dotenv and env_path.exists():
+    from hermes_cli.env_format import literal_env_values_enabled, parse_literal_env
+
+    if env_path.exists() and literal_env_values_enabled():
+        os.environ.update(parse_literal_env(env_path.read_text(encoding="utf-8-sig")))
+    elif load_dotenv and env_path.exists():
         try:
             load_dotenv(str(env_path), override=True, encoding="utf-8")
         except UnicodeDecodeError:
@@ -275,7 +281,6 @@ def _load_hermes_env() -> None:
     # Step 2: bridge top-level config.yaml values into the environment so
     # gateway.config.load_gateway_config() sees them. Scalars only; don't
     # override values already in the env.
-    import os
     config_path = home / "config.yaml"
     if not config_path.exists():
         return

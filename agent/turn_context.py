@@ -616,8 +616,10 @@ def build_turn_context(
     # build strips both fields from every outgoing copy.
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-        if persist_user_display_metadata:
-            user_msg["display_metadata"] = persist_user_display_metadata
+    # Server run provenance also belongs on ordinary user rows. It must not
+    # turn those rows into synthetic timeline events or wait for completion.
+    if persist_user_display_metadata:
+        user_msg["display_metadata"] = persist_user_display_metadata
 
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1

@@ -28,6 +28,8 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Dict, Mapping, Optional
 
+from hermes_cli.env_format import literal_env_values_enabled, parse_literal_env
+
 
 # ── multiplex-active flag ────────────────────────────────────────────────
 # Process-global: set once at gateway startup when gateway.multiplex_profiles
@@ -243,6 +245,9 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
         text = env_path.read_text(encoding="utf-8-sig")
     except (FileNotFoundError, OSError, UnicodeDecodeError):
         return secrets
+
+    if literal_env_values_enabled():
+        return parse_literal_env(text)
 
     # Parse values with the canonical Hermes parser: save_env_value
     # escapes " and \ inside double quotes, and every other reader

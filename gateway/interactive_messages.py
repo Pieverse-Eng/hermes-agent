@@ -206,7 +206,9 @@ def send_current_message(text: str, reply_markup=None, metadata=None, *, _messag
     except Exception:
         return {"error": "Current conversation delivery is unavailable; no other channel was used"}
     return {"success": True, "message_id": message_id, "message": message,
-            **({key: receipt[key] for key in ("publication", "registered", "duplicate") if key in receipt}
+            **({key: receipt[key] for key in ("publication", "registered", "duplicate", "coachCard", "callbackScope")
+                if key in receipt}
                if isinstance(receipt, dict) else {}),
             **({"metadata": metadata} if metadata is not None else {}),
-            **({"context": current_interaction_context()} if _context.get() is not None else {})}
+            **({"context": receipt["context"]} if isinstance(receipt, dict) and "context" in receipt else
+               {"context": current_interaction_context()} if _context.get() is not None else {})}

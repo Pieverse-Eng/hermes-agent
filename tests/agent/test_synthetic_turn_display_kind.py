@@ -104,3 +104,13 @@ def test_a_real_user_turn_stays_untyped(agent_db):
 
     row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
     assert row.get("display_kind") is None
+
+
+def test_api_run_provenance_survives_turn_start_without_typing_a_user_as_synthetic(agent_db):
+    agent, db, sid = agent_db
+    metadata = {"api_run": {"id": "run_native", "idempotency_key": "platform-run-id"}}
+    _build(agent, user_message="Private follow-up", persist_user_display_metadata=metadata)
+    row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
+    assert row.get("display_kind") is None
+    assert row.get("display_metadata") == metadata
+    assert row["content"] == "Private follow-up"

@@ -31,6 +31,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
+from hermes_cli.env_format import (
+    literal_env_values_enabled,
+    parse_literal_env,
+    quote_literal_env_value,
+)
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -3730,7 +3735,7 @@ def load_env() -> Dict[str, str]:
     Normalizes line endings before parsing while treating each assignment's
     value as opaque data for boundary discovery.
 
-    The parsed dict is memoised keyed on the .env file mtime, because
+    The parsed dict is memoised keyed on file metadata and literal mode, because
     ``get_env_value()`` is called dozens-to-hundreds of times per
     interactive menu render (`hermes tools`, `hermes setup`, status
     panels). Sanitisation is O(lines), so re-parsing the
@@ -3740,13 +3745,14 @@ def load_env() -> Dict[str, str]:
     """
     global _env_cache
     env_path = get_env_path()
+    literal = literal_env_values_enabled()
 
     try:
         mtime = env_path.stat().st_mtime
         size = env_path.stat().st_size
-        cache_key = (str(env_path), mtime, size)
+        cache_key = (str(env_path), mtime, size, literal)
     except FileNotFoundError:
-        cache_key = (str(env_path), None, None)
+        cache_key = (str(env_path), None, None, literal)
     except Exception:
         cache_key = None
 
@@ -3757,7 +3763,9 @@ def load_env() -> Dict[str, str]:
 
     env_vars: Dict[str, str] = {}
 
-    if env_path.exists():
+    if env_path.exists() and literal:
+        env_vars = parse_literal_env(env_path.read_text(encoding="utf-8-sig"))
+    elif env_path.exists():
         # On Windows, open() defaults to the system locale (cp1252) which can
         # fail on UTF-8 .env files. Always use explicit UTF-8; tolerate BOM
         # via utf-8-sig since users may edit .env in Notepad which adds one.
@@ -3783,12 +3791,12 @@ def load_env() -> Dict[str, str]:
     return env_vars
 
 
-# Module-level memo for load_env(), keyed on (path, mtime, size).
+# Module-level memo for load_env(), keyed on (path, mtime, size, literal mode).
 # Editing .env bumps mtime → next load_env() rebuilds. invalidate_env_cache()
 # is the explicit knob for writers that update .env via this module
 # (set_env_value, save_env, etc.) without relying on filesystem mtime
 # resolution.
-_env_cache: Optional[Tuple[Tuple[str, Optional[float], Optional[int]], Dict[str, str]]] = None
+_env_cache: Optional[Tuple[Tuple[str, Optional[float], Optional[int], bool], Dict[str, str]]] = None
 
 
 def invalidate_env_cache() -> None:
@@ -3831,6 +3839,8 @@ def sanitize_env_file() -> int:
     Returns the number of lines whose safe formatting was normalized. Returns
     0 when no changes are needed.
     """
+    if literal_env_values_enabled():
+        return 0
     env_path = get_env_path()
     if not env_path.exists():
         return 0
@@ -3912,6 +3922,8 @@ def _check_non_ascii_credential(key: str, value: str) -> str:
 
 def _quote_env_value(value: str) -> str:
     """Quote .env values containing characters with special dotenv meaning."""
+    if literal_env_values_enabled():
+        return quote_literal_env_value(value)
     if value == "":
         return value
     # Internal whitespace (space/tab/etc.) must be quoted so shell `set -a; . file`
@@ -3945,8 +3957,12 @@ def _env_line_defines_key(line: str, key: str) -> bool:
     return stripped.startswith(f"{key}=")
 
 
-def save_env_value(key: str, value: str):
-    """Save or update a value in ~/.hermes/.env."""
+def save_env_value(key: str, value: str, *, update_process_env: bool = True):
+    """Save a profile value, optionally leaving the process environment alone.
+
+    Scoped hosted callers set ``update_process_env=False`` so editing one
+    profile's file cannot change a different profile's live credentials.
+    """
     if is_managed():
         managed_error(f"set {key}")
         return
@@ -3966,15 +3982,17 @@ def save_env_value(key: str, value: str):
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     _reject_denylisted_env_var(key)
-    value = value.replace("\n", "").replace("\r", "")
-    # API keys / tokens must be ASCII — strip non-ASCII with a warning.
-    value = _check_non_ascii_credential(key, value)
+    literal = literal_env_values_enabled()
+    if not literal:
+        value = value.replace("\n", "").replace("\r", "")
+        # Ordinary API keys / tokens retain the existing ASCII sanitization.
+        value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
     env_path = get_env_path()
 
     # On Windows, open() defaults to the system locale (cp1252) which can
     # cause OSError errno 22 on UTF-8 .env files.
-    read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
+    read_kw = {"encoding": "utf-8-sig", "errors": "strict" if literal else "replace"}
     write_kw = {"encoding": "utf-8"}
 
     lines = []
@@ -3982,7 +4000,8 @@ def save_env_value(key: str, value: str):
         with open(env_path, **read_kw) as f:
             lines = f.readlines()
         # Normalize safe line formatting without interpreting values as syntax.
-        lines = _sanitize_env_lines(lines)
+        if not literal:
+            lines = _sanitize_env_lines(lines)
 
     serialized_value = _quote_env_value(value)
 
@@ -4035,7 +4054,8 @@ def save_env_value(key: str, value: str):
             pass
         raise
 
-    os.environ[key] = value
+    if update_process_env:
+        os.environ[key] = value
     invalidate_env_cache()
 
 
@@ -4058,9 +4078,10 @@ def custom_endpoint_key_env(identity: str) -> str:
     return f"HERMES_CUSTOM_{slug}_API_KEY" if slug else "HERMES_CUSTOM_API_KEY"
 
 
-def remove_env_value(key: str) -> bool:
+def remove_env_value(key: str, *, update_process_env: bool = True) -> bool:
     """Remove a key from ~/.hermes/.env and os.environ.
 
+    Scoped hosted callers can leave the process environment unchanged.
     Returns True if the key was found and removed, False otherwise.
     """
     if is_managed():
@@ -4082,15 +4103,19 @@ def remove_env_value(key: str) -> bool:
         raise ValueError(f"Invalid environment variable name: {key!r}")
     env_path = get_env_path()
     if not env_path.exists():
-        os.environ.pop(key, None)
+        if update_process_env:
+            os.environ.pop(key, None)
+        invalidate_env_cache()
         return False
 
-    read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
+    literal = literal_env_values_enabled()
+    read_kw = {"encoding": "utf-8-sig", "errors": "strict" if literal else "replace"}
     write_kw = {"encoding": "utf-8"}
 
     with open(env_path, **read_kw) as f:
         lines = f.readlines()
-    lines = _sanitize_env_lines(lines)
+    if not literal:
+        lines = _sanitize_env_lines(lines)
 
     new_lines = [line for line in lines if not _env_line_defines_key(line, key)]
     found = len(new_lines) < len(lines)
@@ -4126,7 +4151,8 @@ def remove_env_value(key: str) -> bool:
                 pass
             raise
 
-    os.environ.pop(key, None)
+    if update_process_env:
+        os.environ.pop(key, None)
     invalidate_env_cache()
     return found
 

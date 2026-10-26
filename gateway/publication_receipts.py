@@ -113,14 +113,26 @@ class AcknowledgedPublisher:
                 # Opaque, bounded host acknowledgement (not model metadata).
                 # Follow-up operations need its original resource identities.
                 entry['registered'] = json.loads(encoded)
+                # Older hosts may omit registered entirely. They still confirm
+                # publication, but never register the original Run context.
+                entry["presentation"] = {"context": None}
+                entry["presentation"].update({
+                    key: deepcopy(entry["registered"][key])
+                    for key in ("context", "coachCard", "callbackScope")
+                    if key in entry["registered"]
+                })
             receipt = deepcopy(entry["registration"])
             try:
-                self._deliver(message, message_id, context, metadata)
+                self._deliver(message, message_id, context, metadata,
+                              presentation=deepcopy(entry["presentation"]))
             except Exception:
                 return {"success": False, "message_id": message_id,
                         "error": "CURRENT_MESSAGE_DELIVERY_UNKNOWN", "publication": receipt,
                         "retrySameInput": True}
-            delivered = {"success": True, "message_id": message_id, "publication": receipt}
+            # The tool result keeps both: the presented card, callback scope and
+            # context at top level, and the whole acknowledgement as `registered`.
+            delivered = {"success": True, "message_id": message_id, "publication": receipt,
+                         **deepcopy(entry["presentation"])}
             if entry.get('registered'):
                 delivered['registered'] = deepcopy(entry['registered'])
             if structured:

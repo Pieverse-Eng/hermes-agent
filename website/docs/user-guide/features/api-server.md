@@ -14,6 +14,17 @@ Your agent handles requests with its full toolset (terminal, file operations, we
 Hermes itself needs a configured provider and tool backends for the API server to be useful. A [Nous Portal](/user-guide/features/tool-gateway) subscription handles both — 300+ models plus web/image/TTS/browser via the Tool Gateway. Run `hermes setup --portal` once before starting the API server and frontends like Open WebUI or LobeChat get a fully tool-equipped backend.
 :::
 
+## Recovering a lost run acknowledgement
+
+`POST /v1/runs/lookup` accepts `{"idempotency_key":"<the original key>"}`
+with the same bearer credential and optional profile URL prefix used for run
+submission. It returns only `run_id` and `status`, without resubmitting a
+message or extending retention. The mapping survives a gateway restart in the
+existing durable run store. An unknown, expired or differently scoped key
+returns 404; missing authentication returns 401. The capabilities response
+advertises `features.runs_idempotency_lookup` when available.
+
+
 ## Quick Start
 
 ### 1. Enable the API server

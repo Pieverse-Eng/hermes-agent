@@ -234,6 +234,55 @@ class RunIdempotencyStore:
             "updated_at": float(row[5] or 0),
         }
 
+    def run_for_key(self, scope: str, key: str) -> str | None:
+        """Read a scoped native run identity without resubmitting its input.
+
+        Used when an authenticated caller retained its idempotency key but
+        lost the acknowledgement. It neither reserves nor extends retention.
+        Expired terminal rows are hidden without acquiring a write transaction
+        or pruning unrelated runs; reservation paths still own physical cleanup.
+        Status and owner-death reconciliation stay in the existing reader.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT run_id, status_json, retention_until, acknowledged_at, updated_at
+                     FROM run_idempotency WHERE scope=? AND idempotency_key=?""",
+                (scope, key),
+            ).fetchone()
+        if row is None or self._expired_terminal_record(*row[1:], now=time.time()):
+            return None
+        return row[0]
+
+    def _expired_terminal_record(
+        self, status_json: str, retention_until: float,
+        acknowledged_at: float | None, updated_at: float, *, now: float,
+    ) -> bool:
+        """Share the expiry contract between recovery reads and write cleanup."""
+        expired = bool(
+            (
+                acknowledged_at is not None
+                and float(acknowledged_at)
+                <= now - self.ACKNOWLEDGED_RETENTION_SECONDS
+            )
+            or (
+                float(retention_until or 0) > 0
+                and now >= float(retention_until)
+            )
+            or (
+                float(retention_until or 0) <= 0
+                and float(updated_at or 0) < now - self.RETENTION_SECONDS
+            )
+        )
+        if not expired:
+            return False
+        try:
+            return json.loads(status_json).get("status") in {
+                "completed", "failed", "cancelled", "interrupted",
+            }
+        except Exception:
+            # Corrupt or unknown status cannot release an in-flight reservation.
+            return False
+
     def _prune_stale_terminal_locked(self, now: float) -> None:
         """Prune replay records only after their stored run is terminal.
 
@@ -262,31 +311,9 @@ class RunIdempotencyStore:
             acknowledged_at,
             updated_at,
         ) in stale:
-            try:
-                terminal = json.loads(stale_status).get("status") in {
-                    "completed",
-                    "failed",
-                    "cancelled",
-                    "interrupted",
-                }
-            except Exception:
-                terminal = False
-            expired = bool(
-                (
-                    acknowledged_at is not None
-                    and float(acknowledged_at)
-                    <= now - self.ACKNOWLEDGED_RETENTION_SECONDS
-                )
-                or (
-                    float(retention_until or 0) > 0
-                    and now >= float(retention_until)
-                )
-                or (
-                    float(retention_until or 0) <= 0
-                    and float(updated_at or 0) < now - self.RETENTION_SECONDS
-                )
-            )
-            if terminal and expired:
+            if self._expired_terminal_record(
+                stale_status, retention_until, acknowledged_at, updated_at, now=now,
+            ):
                 self._conn.execute(
                     """DELETE FROM run_idempotency
                          WHERE scope=? AND idempotency_key=?""",

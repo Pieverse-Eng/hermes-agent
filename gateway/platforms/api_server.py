@@ -1465,6 +1465,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Durable reservations and bounded, replayable run event streams.
         self._run_idempotency_store = RunIdempotencyStore()
+        self._fallback_pairing_stores = {}
         self._run_idempotency_ids: set[str] = set()
         self._run_owners: Dict[str, str] = {}
         self._run_host_tools: Dict[str, Any] = {}
@@ -2064,6 +2065,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/internal/platform/gateway/status", self._handle_internal_gateway_status),
             ("POST", "/internal/platform/runtime-sync", self._handle_internal_runtime_sync),
+            ("POST", "/internal/platform/pairing/{operation}", self._handle_internal_pairing),
+            ("POST", "/internal/platform/logs/tail", self._handle_internal_logs_tail),
             ("GET", "/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users),
             ("POST", "/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users),
             ("POST", "/internal/platform/gateway/reload", self._handle_internal_gateway_reload),
@@ -2101,6 +2104,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("POST", "/v1/runs/lookup", self._handle_run_lookup),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -3081,13 +3085,40 @@ class APIServerAdapter(BasePlatformAdapter):
             return f"{pid}:unknown"
 
     def _platform_pairing_store(self):
+        """Resolve control operations to the store used by this profile's authz."""
         runner = getattr(self, "gateway_runner", None)
-        store = getattr(runner, "pairing_store", None)
+        profile = _api_request_profile.get()
+        stores = getattr(runner, "pairing_stores", None)
+        store = (
+            (stores or {}).get(profile)
+            if profile is not None
+            else getattr(runner, "pairing_store", None)
+        )
         if store is not None:
             return store
         from gateway.pairing import PairingStore
 
-        return PairingStore()
+        primary = getattr(runner, "pairing_store", None)
+        primary_home = getattr(primary, "home", None)
+        if profile is not None and primary_home is not None:
+            from hermes_cli.profiles import get_profile_dir
+
+            # The profile map is populated after adapter startup. Reuse the
+            # primary store's lock during that window only if its home matches;
+            # request-local profile helpers cannot identify the process owner.
+            if Path(primary_home).resolve() == get_profile_dir(profile).resolve():
+                store = primary
+        # Reuse the lock when no runner store has been attached yet. A named
+        # profile must never fall back to the default profile's grant file.
+        if store is None:
+            if profile not in self._fallback_pairing_stores:
+                self._fallback_pairing_stores[profile] = PairingStore(profile=profile)
+            store = self._fallback_pairing_stores[profile]
+        if profile is not None and runner is not None:
+            if stores is None:
+                stores = runner.pairing_stores = {}
+            stores[profile] = store
+        return store
 
     @staticmethod
     def _platform_runtime_target(filename: str) -> tuple[Path, int]:
@@ -3463,6 +3494,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "version": _hermes_version(),
             "pid": os.getpid(),
             "processMarker": self._platform_process_marker(),
+            "stateProcessMarker": f"{runtime.get('pid')}:{runtime.get('start_time')}",
             "gatewayState": runtime.get("gateway_state"),
             "platforms": runtime.get("platforms", {}),
             "updatedAt": runtime.get("updated_at"),
@@ -3502,6 +3534,84 @@ class APIServerAdapter(BasePlatformAdapter):
             "reloadRecommended": bool(written),
         })
 
+    async def _handle_internal_logs_tail(self, request: "web.Request") -> "web.Response":
+        """Bounded gateway log tail; never accepts a path or command."""
+        if not self._expected_api_key():
+            return web.json_response(_openai_error("API_SERVER_KEY is required"), status=401)
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err is not None:
+            return err
+        from gateway.platform_logs import read_gateway_log
+        from hermes_constants import get_hermes_home
+        try:
+            return web.json_response(read_gateway_log(Path(get_hermes_home()), body))
+        except ValueError:
+            return web.json_response(_openai_error("Invalid log operation"), status=400)
+        except OSError:
+            return web.json_response(_openai_error("Log source unavailable"), status=503)
+
+    async def _handle_internal_pairing(self, request: "web.Request") -> "web.Response":
+        """Closed pairing operations for hosted controllers without container exec.
+
+        Grants discovered here are projected back from the platform's durable
+        configuration. No request selects a file, profile or command.
+        """
+        if not self._expected_api_key():
+            return web.json_response(_openai_error("API_SERVER_KEY is required"), status=401)
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        operation = request.match_info["operation"]
+        body, err = await self._read_json_body(request)
+        if err is not None:
+            return err
+        if not isinstance(body, dict) or body.get("channel") not in ("telegram", "line"):
+            return web.json_response(_openai_error("Invalid pairing channel"), status=400)
+        channel = body["channel"]
+        if operation == "approve":
+            if set(body) != {"channel", "code"} or not isinstance(body["code"], str) or not re.fullmatch(r"[A-Z0-9]{8}", body["code"]):
+                return web.json_response(_openai_error("Invalid pairing operation"), status=400)
+        elif operation == "allow-from":
+            if set(body) != {"channel"}:
+                return web.json_response(_openai_error("Invalid pairing operation"), status=400)
+        elif operation == "revoke":
+            mode = body.get("mode")
+            expected = {"channel", "mode", "entry"} if mode == "entry" else {"channel", "mode"}
+            if mode not in ("entry", "account", "requests") or set(body) != expected or (mode == "entry" and
+                    (not isinstance(body["entry"], str) or not re.fullmatch(r"[\x21-\x7e]{1,128}", body["entry"]))):
+                return web.json_response(_openai_error("Invalid pairing operation"), status=400)
+        else:
+            return web.json_response(_openai_error("Unknown pairing operation"), status=404)
+        store = self._platform_pairing_store()
+        if operation == "approve":
+            try:
+                result = await asyncio.to_thread(store.approve_code, channel, body["code"])
+                if result is None:
+                    return web.json_response({"status": "not_found"})
+                approved = await asyncio.to_thread(store.list_approved, channel)
+            except Exception:
+                # The grant may already be durable before a mirror update
+                # fails. The controller must reconcile, never infer refusal.
+                return web.json_response({"status": "incomplete"})
+        elif operation == "revoke":
+            removed, pending, approved = await asyncio.to_thread(
+                store.revoke_pairings, channel,
+                body.get("entry") if mode == "entry" else None,
+                pending_only=(mode == "requests"),
+            )
+        else:
+            approved = await asyncio.to_thread(store.list_approved, channel)
+        allow_from = [user["user_id"] for user in approved]
+        if operation == "revoke":
+            return web.json_response({"changed": bool(removed or pending), "removedAllowFromCount": removed,
+                                      "removedRequestCount": pending, "allowFrom": allow_from})
+        if operation == "approve":
+            return web.json_response({"status": "approved", "allowFrom": allow_from})
+        return web.json_response({"allowFrom": allow_from})
+
     async def _handle_internal_telegram_approved_users(self, request: "web.Request") -> "web.Response":
         """GET/POST /internal/platform/telegram/approved-users."""
         auth_err = self._check_auth(request)
@@ -3513,14 +3623,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({
                 "ok": True,
                 "platform": "telegram",
-                "users": store.list_approved("telegram"),
+                "users": await asyncio.to_thread(store.list_approved, "telegram"),
             })
 
         body, err = await self._read_json_body(request)
         if err:
             return err
         try:
-            users = store.replace_approved("telegram", self._approved_users_from_body(body))
+            users = await asyncio.to_thread(
+                store.replace_approved, "telegram", self._approved_users_from_body(body)
+            )
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc)), status=400)
         except Exception:
@@ -3747,6 +3859,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "runs_idempotency_lookup": True,
+                "session_run_provenance": True,
                 "runs_idempotency": {
                     "supported": True,
                     "durable": self._run_idempotency_store.durable,
@@ -3942,6 +4056,13 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_content",
         )
         payload = {key: message.get(key) for key in safe_keys if key in message}
+        metadata = message.get("display_metadata")
+        run = metadata.get("api_run") if isinstance(metadata, dict) else None
+        if (message.get("role") == "user" and isinstance(run, dict)
+                and isinstance(run.get("id"), str) and re.fullmatch(r"run_[0-9a-f]{32}", run["id"])
+                and isinstance(run.get("idempotency_key"), str)
+                and re.fullmatch(r"[\x21-\x7e]{1,255}", run["idempotency_key"])):
+            payload["api_run"] = {"id": run["id"], "idempotency_key": run["idempotency_key"]}
         if payload.get("role") == "tool" and "content" in payload:
             payload["content"] = _safe_tool_value(payload["content"])
         if isinstance(payload.get("tool_calls"), list):
@@ -6990,11 +7111,8 @@ class APIServerAdapter(BasePlatformAdapter):
         identity = self._expected_api_key() or "unauthenticated-test-listener"
         return hashlib.sha256(f"{profile}\0{identity}".encode()).hexdigest()
 
-    def _durable_run_status(self, request, run_id):
-        scope = self._run_idempotency_scope(request)
-        owner = self._run_owners.get(run_id)
-        if owner is not None and owner != scope:
-            return None
+    def _local_run_status(self, run_id):
+        """Return authoritative local state, excluding another worker's snapshot."""
         status = self._run_statuses.get(run_id)
         if status is not None and (
             run_id in self._active_run_tasks
@@ -7002,6 +7120,10 @@ class APIServerAdapter(BasePlatformAdapter):
             or status.get("status") in {"completed", "failed", "cancelled", "interrupted"}
         ):
             return status
+        return None
+
+    def _load_durable_run_status(self, scope, run_id):
+        """Read and reconcile storage without accessing event-loop-owned caches."""
         # A status hydrated from another worker is only a snapshot. Refresh it
         # until terminal so completion and owner death cannot stay cached away.
         record = self._run_idempotency_store.status_for_run(scope, run_id)
@@ -7019,10 +7141,44 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if status is None:
                 return None
-        self._run_statuses[run_id] = status
-        self._run_owners[run_id] = scope
-        self._run_idempotency_ids.add(run_id)
         return status
+
+    def _cache_durable_run_status(self, scope, run_id, status):
+        owner = self._run_owners.get(run_id)
+        if owner is not None and owner != scope:
+            return None
+        # A local run may have completed while a durable read was in flight.
+        local = self._local_run_status(run_id)
+        if local is not None:
+            return local
+        if status is not None:
+            self._run_statuses[run_id] = status
+            self._run_owners[run_id] = scope
+            self._run_idempotency_ids.add(run_id)
+        return status
+
+    def _durable_run_status(self, request, run_id):
+        scope = self._run_idempotency_scope(request)
+        owner = self._run_owners.get(run_id)
+        if owner is not None and owner != scope:
+            return None
+        local = self._local_run_status(run_id)
+        if local is not None:
+            return local
+        return self._cache_durable_run_status(
+            scope, run_id, self._load_durable_run_status(scope, run_id)
+        )
+
+    async def _durable_run_status_async(self, request, run_id):
+        scope = self._run_idempotency_scope(request)
+        owner = self._run_owners.get(run_id)
+        if owner is not None and owner != scope:
+            return None
+        local = self._local_run_status(run_id)
+        if local is not None:
+            return local
+        status = await asyncio.to_thread(self._load_durable_run_status, scope, run_id)
+        return self._cache_durable_run_status(scope, run_id, status)
 
     def _run_replay_response(self, request, outcome, record, gateway_session_key):
         if outcome == "conflict":
@@ -7151,6 +7307,29 @@ class APIServerAdapter(BasePlatformAdapter):
             # so clients can observe delegate_task timeouts and failures.
 
         return _callback
+
+    async def _handle_run_lookup(self, request: "web.Request") -> "web.Response":
+        """Recover a native run ID under the same profile/bearer scope as submit."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        key = body.get("idempotency_key")
+        if (set(body) != {"idempotency_key"} or not isinstance(key, str)
+                or not key or len(key) > 255
+                or any(ord(ch) < 33 or ord(ch) > 126 for ch in key)):
+            return web.json_response(_openai_error("Invalid idempotency key", code="invalid_idempotency_key"), status=400)
+        run_id = await asyncio.to_thread(
+            self._run_idempotency_store.run_for_key,
+            self._run_idempotency_scope(request), key,
+        )
+        status = await self._durable_run_status_async(request, run_id) if run_id else None
+        if status is None:
+            return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
+        # Content-free recovery: do not expose a saved input/output/fingerprint.
+        return web.json_response({"run_id": run_id, "status": status["status"]})
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
@@ -7578,11 +7757,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
 
                     effective_task_id = session_id or run_id
-                    def _deliver_current(message, message_id, context, metadata=None):
+                    def _deliver_current(message, message_id, context, metadata=None, *, presentation=None):
+                        # Only the host-registered presentation subset reaches the
+                        # visible message; the opaque `registered` acknowledgement
+                        # stays in the tool result.
+                        shown = ({key: presentation[key] for key in ("coachCard", "callbackScope", "context")
+                                  if key in presentation} if presentation is not None else {})
                         _publish_interactive({
                             "event": "message.interactive", "run_id": run_id,
                             "timestamp": time.time(), "message_id": message_id,
-                            "message": message, "context": context,
+                            "message": message,
+                            "context": shown.get("context") if presentation is not None else context,
+                            **shown,
                             **({"metadata": metadata} if metadata is not None else {}),
                         })
                     deliver_current = AcknowledgedPublisher(host_broker, _deliver_current) if publication_ack else _deliver_current
@@ -7627,6 +7813,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
+                                **({"persist_user_display_metadata": {"api_run": {
+                                    "id": run_id, "idempotency_key": idempotency_key,
+                                }}} if idempotency_key else {}),
                                 **({"reload_session_history": True} if native_session_continuation else {}),
                             )
                         finally:

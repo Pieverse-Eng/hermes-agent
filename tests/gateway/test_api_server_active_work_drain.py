@@ -166,4 +166,21 @@ class TestDrainAdmission:
                     assert response.headers["Retry-After"] == "1"
                     assert payload["error"]["code"] == "gateway_draining"
 
+    @pytest.mark.asyncio
+    async def test_drain_still_answers_content_free_run_lookup(self):
+        # Recovery of a submitted run ID starts nothing; a client retrying across a
+        # drain must still learn whether its run exists instead of a draining refusal.
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        runner = SimpleNamespace(_draining=True, _external_drain_active=False)
+        app = web.Application()
+        app.router.add_post("/v1/runs/lookup", adapter._handle_run_lookup)
+
+        with patch("gateway.run._gateway_runner_ref", lambda: runner):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post("/v1/runs/lookup", json={"idempotency_key": "missing-key"})
+                payload = await response.json()
+
+        assert response.status == 404
+        assert payload["error"]["code"] == "run_not_found"
+
 

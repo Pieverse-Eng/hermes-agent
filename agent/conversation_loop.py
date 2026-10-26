@@ -1264,9 +1264,9 @@ def run_conversation(
             Display-only: transcript surfaces render the row as a timeline
             event instead of a user bubble, while the model still receives
             the message unchanged.
-        persist_user_display_metadata: Optional payload for that event
-            (e.g. a delegation's task count).
-                or queuing follow-up prefetch work.
+        persist_user_display_metadata: Optional display-only metadata for a
+            persisted user turn, including event details (e.g. a delegation's
+            task count) or API run provenance on an ordinary user message.
 
     Returns:
         Dict: Complete conversation result with final response and message history

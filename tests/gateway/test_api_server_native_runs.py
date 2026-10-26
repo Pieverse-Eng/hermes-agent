@@ -16,9 +16,47 @@ class RecordingAgent:
     session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
     def __init__(self):
         self.histories = []
-    def run_conversation(self, *, user_message, conversation_history, task_id, reload_session_history=False):
+    def run_conversation(self, *, user_message, conversation_history, task_id, reload_session_history=False, **kwargs):
         self.histories.append(conversation_history)
         return {"final_response": "done"}
+
+
+@pytest.mark.asyncio
+async def test_native_transcript_retains_server_run_identity_for_duplicate_inputs(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("news", "api_server")
+    adapter = _make_adapter()
+    adapter._session_db = db
+    class PersistingAgent(RecordingAgent):
+        def run_conversation(self, *, user_message, **kwargs):
+            db.append_message("news", "user", user_message,
+                display_metadata=kwargs.get("persist_user_display_metadata"))
+            db.append_message("news", "assistant", "reply")
+            return {"final_response": "reply"}
+    try:
+        with patch.object(adapter, "_create_agent", return_value=PersistingAgent()):
+            app = _create_runs_app(adapter)
+            app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
+            async with TestClient(TestServer(app)) as cli:
+                native_ids = []
+                for key in ["turn-one", "turn-two"]:
+                    response = await cli.post("/v1/runs", json={"input": "same text", "session_id": "news"},
+                        headers={"Idempotency-Key": key})
+                    assert response.status == 202
+                    run_id = (await response.json())["run_id"]
+                    native_ids.append(run_id)
+                    await settle(adapter, run_id)
+                rows = (await (await cli.get("/api/sessions/news/messages")).json())["data"]
+                users = [row for row in rows if row["role"] == "user"]
+                assert [row.get("api_run") for row in users] == [
+                    {"id": native_ids[0], "idempotency_key": "turn-one"},
+                    {"id": native_ids[1], "idempotency_key": "turn-two"},
+                ]
+        db.close()
+        db = SessionDB(tmp_path / "state.db")
+        assert [row["display_metadata"]["api_run"]["id"] for row in db.get_messages("news") if row["role"] == "user"] == native_ids
+    finally:
+        db.close()
 
 @pytest.mark.asyncio
 async def test_native_history_preserves_tool_metadata(tmp_path):
