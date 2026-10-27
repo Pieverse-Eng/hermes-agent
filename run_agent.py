@@ -7619,7 +7619,10 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if len(tool_calls) <= 1:
+            # A model can prequeue several interactive questions before seeing
+            # any answer. Keep that exceptional batch together so the native
+            # executor collects one full answer, even across read segments.
+            if len(tool_calls) <= 1 or sum(tc.function.name == "clarify" for tc in tool_calls) > 1:
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )

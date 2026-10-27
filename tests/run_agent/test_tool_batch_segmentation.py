@@ -411,6 +411,97 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_prequeued_clarifies_share_one_complete_native_answer(self, agent, mixed):
+        """An answer that supplies every order field must not meet a stale second prompt."""
+        calls = [
+            _tc("clarify", json.dumps({"question": "Which venue?", "choices": ["Hyperliquid", "Lighter"]}), call_id="venue"),
+            _tc("clarify", json.dumps({"question": "What amount and leverage?", "choices": ["100 USDC, 5x cross", "Other"]}), call_id="sizing"),
+        ]
+        if mixed:
+            calls[1:1] = [_tc("web_search", call_id="read1"), _tc("web_search", call_id="read2")]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        original_arguments = [call.function.arguments for call in calls]
+        prompts, completed = [], []
+        answer = "Hyperliquid, 10 USDC margin, 3x isolated, market, no TP/SL"
+
+        def callback(question, choices, multi_select=False):
+            prompts.append((question, choices, multi_select))
+            return answer
+
+        agent.clarify_callback = callback
+        agent.tool_complete_callback = lambda call_id, name, args, result: completed.append((call_id, name, result))
+        messages = []
+        with patch("run_agent.handle_function_call", return_value='{"ok":true}'):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert len(prompts) == 1
+        assert "1. Which venue?" in prompts[0][0]
+        assert "2. What amount and leverage?" in prompts[0][0]
+        assert "Hyperliquid" in prompts[0][0] and "100 USDC, 5x cross" in prompts[0][0]
+        assert prompts[0][1:] == (None, False)
+        assert [message["tool_call_id"] for message in messages] == [call.id for call in calls]
+        responses = [json.loads(message["content"]) for message in messages if message["tool_call_id"] in {"venue", "sizing"}]
+        assert all(response["user_response"] == answer for response in responses)
+        assert all(response["question"] == prompts[0][0] for response in responses)
+        assert [call.function.arguments for call in calls] == original_arguments
+        assert [call_id for call_id, _, _ in completed] == [call.id for call in calls]
+
+    def test_prequeued_clarify_failure_does_not_prompt_again(self, agent):
+        prompts = []
+
+        def cancelled(question, choices):
+            prompts.append(question)
+            raise TimeoutError("Clarification timed out")
+
+        agent.clarify_callback = cancelled
+        messages = []
+        agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=[
+            _tc("clarify", '{"question":"Venue?"}', call_id="venue"),
+            _tc("clarify", '{"question":"Amount?"}', call_id="sizing"),
+        ]), messages, "task-1")
+        assert len(prompts) == 1
+        assert [message["tool_call_id"] for message in messages] == ["venue", "sizing"]
+        assert all("timed out" in message["content"] for message in messages)
+
+    def test_single_clarify_retains_native_select_choices(self, agent):
+        prompts = []
+        agent.clarify_callback = lambda question, choices, multi_select=False: prompts.append((question, choices, multi_select)) or '["Hyperliquid"]'
+        messages = []
+        agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=[
+            _tc("clarify", '{"question":"Venue?","choices":["Hyperliquid","Lighter"],"multi_select":true}', call_id="venue"),
+        ]), messages, "task-1")
+        assert prompts == [("Venue?", ["Hyperliquid", "Lighter"], True)]
+        assert json.loads(messages[0]["content"])["user_response"] == ["Hyperliquid"]
+
+    def test_oversized_clarify_batch_is_rejected_without_losing_a_question(self, agent):
+        agent.clarify_callback = lambda *args, **kwargs: pytest.fail("An oversized batch must not publish a truncated prompt")
+        messages = []
+        agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=[
+            _tc("clarify", json.dumps({"question": "a" * 3000}), call_id="first"),
+            _tc("clarify", json.dumps({"question": "b" * 3000}), call_id="second"),
+        ]), messages, "task-1")
+        assert [message["tool_call_id"] for message in messages] == ["first", "second"]
+        assert all("4096" in message["content"] and "error" in message["content"] for message in messages)
+
+    def test_interrupt_during_combined_clarify_cancels_remaining_calls(self, agent):
+        prompts = []
+
+        def interrupted(question, choices):
+            prompts.append(question)
+            agent._interrupt_requested = True
+            return ""
+
+        agent.clarify_callback = interrupted
+        messages = []
+        agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=[
+            _tc("clarify", '{"question":"Venue?"}', call_id="venue"),
+            _tc("clarify", '{"question":"Amount?"}', call_id="sizing"),
+        ]), messages, "task-1")
+        assert len(prompts) == 1
+        assert [message["tool_call_id"] for message in messages] == ["venue", "sizing"]
+        assert "skipped" in messages[1]["content"].lower()
+
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
         after both finish; results land in the model's emission order."""

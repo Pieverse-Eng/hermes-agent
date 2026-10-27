@@ -30,6 +30,14 @@ High-level categories:
 | **Automation** | `cronjob` | Scheduled tasks with create/list/update/pause/resume/run/remove actions. Outbound delivery is handled by cron's own delivery, the `hermes send` CLI, and the gateway notifier — not by an agent-callable tool. |
 | **Integrations** | `ha_*`, MCP server tools | Home Assistant, MCP, and other integrations. |
 
+If a model queues several `clarify` calls before receiving an answer, Hermes
+collects them in one native free-text question. The original numbered questions
+and options stay visible, and the complete answer is returned to every original
+tool call. A single clarification keeps its normal buttons and multi-select
+behavior. Combined prompts over 4096 characters are refused without publishing
+or truncating a question. Cancellation or timeout does not open another queued
+prompt.
+
 For the authoritative code-derived registry, see [Built-in Tools Reference](/reference/tools-reference) and [Toolsets Reference](/reference/toolsets-reference).
 
 :::tip Nous Tool Gateway

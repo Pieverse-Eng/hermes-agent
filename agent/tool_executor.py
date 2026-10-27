@@ -1618,6 +1618,33 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    # Keep original assistant messages and tool IDs immutable. Only the actual
+    # native invocation is combined; every original call still follows normal
+    # middleware, result persistence and completion/cancellation processing.
+    clarify_arguments = []
+    clarify_ids = set()
+    for call in assistant_message.tool_calls:
+        if call.function.name != "clarify":
+            continue
+        args, malformed = _parse_tool_arguments(call.function.arguments)
+        if (
+            malformed is None
+            and isinstance(args.get("question"), str)
+            and args["question"].strip()
+            and (args.get("choices") is None or isinstance(args["choices"], list))
+        ):
+            clarify_arguments.append(args)
+            clarify_ids.add(call.id)
+    combined_question = None
+    shared_clarify_result = None
+    if len(clarify_arguments) > 1:
+        from tools.clarify_tool import combined_clarify_question
+        try:
+            combined_question = combined_clarify_question(clarify_arguments)
+        except ValueError as error:
+            shared_clarify_result = json.dumps({"error": str(error)})
+    else:
+        clarify_ids.clear()
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -1826,7 +1853,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
         elif function_name == "clarify":
+            grouped = tool_call.id in clarify_ids
+            if grouped and combined_question is not None:
+                function_args = {"question": combined_question}
             def _execute(next_args: dict) -> Any:
+                if grouped and shared_clarify_result is not None:
+                    return shared_clarify_result
                 from tools.clarify_tool import clarify_tool as _clarify_tool
                 return _clarify_tool(
                     question=next_args.get("question", ""),
@@ -1844,6 +1876,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 scope_block=_ts_scope_block,
                 display_index=i,
             ))
+            if grouped:
+                shared_clarify_result = function_result
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
