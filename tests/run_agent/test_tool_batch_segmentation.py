@@ -410,16 +410,321 @@ def agent():
         return a
 
 
+@pytest.fixture()
+def clarify_relay(agent):
+    pytest.importorskip("nemo_relay")
+    from agent import relay_runtime
+
+    relay_runtime._reset_for_tests()
+    agent.session_id = "clarify-session"
+    lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
+        profile_key=relay_runtime.current_profile_key(),
+        session_id=agent.session_id,
+        platform="cli",
+    )
+    turn = relay_runtime.SESSION_COORDINATOR.begin_turn(lease, turn_id="turn-1", task_id="task-1")
+    lease.host.retain_managed_execution("test.clarify")
+    try:
+        yield lease.host.relay
+    finally:
+        lease.host.release_managed_execution("test.clarify")
+        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
+        relay_runtime.SESSION_COORDINATOR.release_conversation(lease)
+        relay_runtime._reset_for_tests()
+
+
 class TestSegmentedDispatchIntegration:
-    @pytest.mark.parametrize("mixed", [False, True])
-    def test_prequeued_clarifies_share_one_complete_native_answer(self, agent, mixed):
+    def test_clarify_policy_waits_for_intervening_file_write(self, agent, monkeypatch, tmp_path):
+        from hermes_cli import plugins
+        from tools import file_tools, terminal_tool
+        from tools.environments.local import LocalEnvironment
+        from tools.file_operations import ShellFileOperations
+
+        marker = tmp_path / "policy-ready.txt"
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=5)
+        file_ops = ShellFileOperations(env)
+        monkeypatch.setitem(terminal_tool._active_environments, "default", env)
+        monkeypatch.setitem(terminal_tool._active_environments, "clarify-barrier", env)
+        monkeypatch.setattr(file_tools, "_get_file_ops", lambda task_id="default": file_ops)
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"write_file"}
+        manager = plugins.PluginManager()
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        policy_inputs, prompts, events, messages = [], [], [], []
+
+        def policy(tool_call_id, **kwargs):
+            ready = marker.exists() and marker.read_text() == "ready"
+            policy_inputs.append((tool_call_id, ready))
+            if tool_call_id == "second" and not ready:
+                return {"action": "block", "message": "The intervening write has not completed"}
+
+        manager._hooks["pre_tool_call"] = [policy]
+        agent.clarify_callback = lambda question, choices: prompts.append((question, choices)) or "Answer"
+        agent.tool_start_callback = lambda call_id, *args: events.append(("start", call_id))
+        agent.tool_complete_callback = lambda call_id, *args: events.append(("complete", call_id))
+        try:
+            agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=[
+                _tc("clarify", '{"question":"Which topic?","choices":["General","Specific"]}', call_id="first"),
+                _tc("write_file", json.dumps({"path": str(marker), "content": "ready"}), call_id="write"),
+                _tc("clarify", '{"question":"Which post-write detail?","choices":["Summary","Full"]}', call_id="second"),
+            ]), messages, "clarify-barrier")
+        finally:
+            env.cleanup()
+
+        assert marker.read_text() == "ready"
+        assert policy_inputs == [("first", False), ("write", False), ("second", True)]
+        assert prompts == [("Which topic?", ["General", "Specific"]), ("Which post-write detail?", ["Summary", "Full"])]
+        assert [message["tool_call_id"] for message in messages] == ["first", "write", "second"]
+        assert json.loads(messages[2]["content"])["user_response"] == "Answer"
+        assert events == [("start", "first"), ("complete", "first"), ("start", "write"), ("complete", "write"), ("start", "second"), ("complete", "second")]
+
+    @pytest.mark.parametrize("managed", [False, True])
+    def test_stop_cancels_clarify_batch_waiting_for_second_call_approval(self, agent, monkeypatch, request, managed):
+        from hermes_cli import plugins
+        from tools import approval
+        from tools.interrupt import set_interrupt
+        from tools.thread_context import propagate_context_to_thread
+
+        relay = request.getfixturevalue("clarify_relay") if managed else None
+        if relay is not None:
+            async def wrap(name, args, next_call):
+                return relay.ToolExecutionInterceptOutcome(await next_call(args))
+            relay.intercepts.register_tool_execution("test.clarify.approval", 1, wrap)
+
+        manager = plugins.PluginManager()
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        manager._hooks["pre_tool_call"] = [
+            lambda tool_call_id, **kwargs: {"action": "approve", "message": "Approve the second question"} if tool_call_id == "second" else None
+        ]
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setattr(approval, "_get_approval_config", lambda: {"mode": "manual", "timeout": 300})
+        session_key = "clarify-stop-approval"
+        session_token = approval.set_current_session_key(session_key)
+        notified, finished = threading.Event(), threading.Event()
+        prompts, messages, errors, approval_tids = [], [], [], []
+        agent.clarify_callback = lambda question, choices: prompts.append(question) or "Answer"
+
+        def notify(data):
+            approval_tids.append(threading.get_ident())
+            notified.set()
+
+        def execute():
+            agent._execution_thread_id = threading.get_ident()
+            try:
+                agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=[
+                    _tc("clarify", '{"question":"Which topic?"}', call_id="first"),
+                    _tc("clarify", '{"question":"Which protected detail?"}', call_id="second"),
+                ]), messages, "task-1")
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        approval.register_gateway_notify(session_key, notify)
+        thread = threading.Thread(target=propagate_context_to_thread(execute), daemon=True)
+        try:
+            thread.start()
+            assert notified.wait(5), "The second question never reached the real approval queue"
+            agent.interrupt("stop")
+            assert finished.wait(3), "Stop did not release the queued clarification approval"
+            assert errors == []
+            assert prompts == []
+            assert [message["tool_call_id"] for message in messages] == ["first", "second"]
+            assert "cancel" in messages[0]["content"].lower()
+            assert "skipped" in messages[1]["content"].lower()
+            assert not approval.has_blocking_approval(session_key)
+            assert not agent._tool_worker_threads
+        finally:
+            # Release the real approval queue even when the regression fails;
+            # this cleanup must not supply the interrupt the assertion tests.
+            approval.unregister_gateway_notify(session_key)
+            thread.join(5)
+            approval.reset_current_session_key(session_token)
+            approval.clear_session(session_key)
+            for thread_id in [thread.ident, *approval_tids]:
+                set_interrupt(False, thread_id)
+            if relay is not None:
+                relay.intercepts.deregister_tool_execution("test.clarify.approval")
+
+    @pytest.mark.parametrize("count", [8, 9])
+    def test_clarify_batch_respects_worker_bound_without_partial_publication(self, agent, count):
+        prompts, messages = [], []
+        calls = [_tc("clarify", json.dumps({"question": f"Question {index}?"}), call_id=f"q{index}") for index in range(count)]
+        agent.clarify_callback = lambda question, choices: prompts.append(question) or "All answered"
+
+        agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=calls), messages, "task-1")
+
+        assert [message["tool_call_id"] for message in messages] == [f"q{index}" for index in range(count)]
+        if count == 8:
+            assert len(prompts) == 1
+            assert "1. Question 0?" in prompts[0] and "8. Question 7?" in prompts[0]
+            assert all(json.loads(message["content"])["user_response"] == "All answered" for message in messages)
+        else:
+            assert prompts == []
+            assert all("8" in json.JSONDecoder().raw_decode(message["content"])[0]["error"] for message in messages)
+
+    @pytest.mark.parametrize("blocked_ids", [("second",), ("first",), ("first", "second")])
+    @pytest.mark.parametrize("block_stage", ["pre_tool_call", "tool_execution"])
+    def test_clarify_batch_publishes_only_individually_authorized_questions(self, agent, monkeypatch, blocked_ids, block_stage):
+        from hermes_cli import plugins
+
+        manager = plugins.PluginManager()
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        questions = {
+            "first": {"question": "Which topic?", "choices": ["General", "Specific"]},
+            "second": {"question": "Which restricted detail?", "choices": ["Private", "Internal"]},
+        }
+        execution_inputs, policy_inputs, post_inputs, prompts, completed = [], [], [], [], []
+
+        def policy(tool_call_id, args, **kwargs):
+            policy_inputs.append((tool_call_id, args))
+            if block_stage == "pre_tool_call" and tool_call_id in blocked_ids:
+                return {"action": "block", "message": f"Denied {tool_call_id}"}
+
+        def execution(tool_call_id, args, next_call, **kwargs):
+            execution_inputs.append((tool_call_id, args))
+            if block_stage == "tool_execution" and tool_call_id in blocked_ids:
+                return json.dumps({"error": f"Denied {tool_call_id}"})
+            return next_call(args)
+
+        manager._hooks["pre_tool_call"] = [policy]
+        manager._hooks["post_tool_call"] = [lambda tool_call_id, args, **kwargs: post_inputs.append((tool_call_id, args))]
+        manager._middleware["tool_execution"] = [execution]
+        agent.clarify_callback = lambda question, choices, multi_select=False: prompts.append((question, choices, multi_select)) or "General"
+        agent.tool_complete_callback = lambda call_id, *args: completed.append(call_id)
+        calls = [_tc("clarify", json.dumps(args), call_id=call_id) for call_id, args in questions.items()]
+        messages = []
+
+        agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=calls), messages, "task-1")
+
+        allowed = [call_id for call_id in questions if call_id not in blocked_ids]
+        assert prompts == [(questions[call_id]["question"], questions[call_id]["choices"], False) for call_id in allowed]
+        assert execution_inputs == list(questions.items())
+        assert policy_inputs == [(call_id, args) for call_id, args in questions.items() if block_stage == "pre_tool_call" or call_id in allowed]
+        assert post_inputs == list(questions.items())
+        assert [message["tool_call_id"] for message in messages] == ["first", "second"]
+        for message in messages:
+            response = json.loads(message["content"])
+            if message["tool_call_id"] in blocked_ids:
+                assert response == {"error": f"Denied {message['tool_call_id']}"}
+            else:
+                assert response["user_response"] == "General"
+        assert completed == (allowed if block_stage == "pre_tool_call" else list(questions))
+
+    @pytest.mark.parametrize("rewrite_stage", ["tool_request", "tool_execution"])
+    def test_clarify_batch_uses_sanitized_args_and_preserves_per_call_wrappers(self, agent, monkeypatch, rewrite_stage):
+        from hermes_cli import plugins
+        from tools.env_passthrough import get_all_passthrough, scoped_env_passthrough
+
+        manager = plugins.PluginManager()
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        original = {
+            "first": {"question": "Which topic?", "choices": ["General", "Specific"]},
+            "second": {"question": "Raw private question?", "choices": ["Raw private option"]},
+        }
+        sanitized = {"question": "Which public region?", "choices": ["Europe", "Asia"]}
+        requests, policy_inputs, wrapper_scopes, prompts, completed, events = [], [], [], [], [], []
+        grants = {"first": "CLARIFY_FIRST_TOKEN", "second": "CLARIFY_SECOND_TOKEN"}
+        baseline_grants = get_all_passthrough()
+
+        def request(tool_call_id, args, **kwargs):
+            requests.append((tool_call_id, args))
+            if rewrite_stage == "tool_request" and tool_call_id == "second":
+                return {"args": sanitized, "source": "test-sanitizer"}
+
+        def execution(tool_call_id, args, next_call, **kwargs):
+            wrapper_scopes.append(("before", tool_call_id, get_all_passthrough()))
+            if rewrite_stage == "tool_execution" and tool_call_id == "second":
+                args = sanitized
+            with scoped_env_passthrough([grants[tool_call_id]]):
+                result = json.loads(next_call(args))
+                wrapper_scopes.append(("after", tool_call_id, get_all_passthrough()))
+                result["wrapped_call_id"] = tool_call_id
+                return json.dumps(result)
+
+        manager._middleware["tool_request"] = [request]
+        manager._middleware["tool_execution"] = [execution]
+        manager._hooks["pre_tool_call"] = [lambda tool_call_id, args, **kwargs: policy_inputs.append((tool_call_id, args))]
+        agent.clarify_callback = lambda question, choices, multi_select=False: prompts.append((question, choices, multi_select)) or "General, Europe"
+        agent.tool_start_callback = lambda call_id, *args: events.append(("start", call_id))
+
+        def complete(call_id, name, args, result):
+            completed.append((call_id, args))
+            events.append(("complete", call_id))
+
+        agent.tool_complete_callback = complete
+        calls = [_tc("clarify", json.dumps(args), call_id=call_id) for call_id, args in original.items()]
+        original_arguments = [call.function.arguments for call in calls]
+        messages = []
+
+        agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=calls), messages, "task-1")
+
+        assert len(prompts) == 1
+        assert "1. Which topic?" in prompts[0][0]
+        assert "2. Which public region?" in prompts[0][0]
+        assert "Europe" in prompts[0][0] and "Asia" in prompts[0][0]
+        assert "Raw private" not in prompts[0][0]
+        assert prompts[0][1:] == (None, False)
+        assert requests == list(original.items())
+        assert policy_inputs == [("first", original["first"]), ("second", sanitized)]
+        assert [message["tool_call_id"] for message in messages] == ["first", "second"]
+        for message in messages:
+            response = json.loads(message["content"])
+            assert response["user_response"] == "General, Europe"
+            assert response["wrapped_call_id"] == message["tool_call_id"]
+        assert completed == policy_inputs
+        assert events == [("start", "first"), ("complete", "first"), ("start", "second"), ("complete", "second")]
+        assert [call.function.arguments for call in calls] == original_arguments
+        assert [scope for stage, _, scope in wrapper_scopes if stage == "before"] == [baseline_grants, baseline_grants]
+        for stage, call_id, scope in wrapper_scopes:
+            if stage == "after":
+                assert scope == baseline_grants | {grants[call_id]}
+        assert get_all_passthrough() == baseline_grants
+
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_clarify_batch_keeps_managed_relay_intercepts(self, agent, clarify_relay, batched):
+        relay = clarify_relay
+
+        def rewrite(name, args):
+            if name == "clarify" and args["question"] == "Raw private question?":
+                return {"question": "Which public region?"}
+            return args
+
+        async def wrap(name, args, next_call):
+            result = await next_call(args)
+            return relay.ToolExecutionInterceptOutcome(json.dumps({**json.loads(result), "relay_wrapped": True}))
+
+        relay.intercepts.register_tool_request("test.clarify.request", 1, False, rewrite)
+        relay.intercepts.register_tool_execution("test.clarify.execution", 1, wrap)
+        prompts, messages = [], []
+        agent.clarify_callback = lambda question, choices: prompts.append(question) or "General, Europe"
+        calls = [
+            _tc("clarify", '{"question":"Which topic?"}', call_id="first"),
+            _tc("clarify", '{"question":"Raw private question?"}', call_id="second"),
+        ]
+        try:
+            for group in ([calls] if batched else [[call] for call in calls]):
+                agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=group), messages, "task-1")
+        finally:
+            relay.intercepts.deregister_tool_execution("test.clarify.execution")
+            relay.intercepts.deregister_tool_request("test.clarify.request")
+
+        assert len(prompts) == (1 if batched else 2)
+        assert "Which public region?" in prompts[-1]
+        assert all("Raw private" not in prompt for prompt in prompts)
+        assert [message["tool_call_id"] for message in messages] == ["first", "second"]
+        assert all(json.loads(message["content"])["relay_wrapped"] for message in messages)
+
+    @pytest.mark.parametrize("count", [2, 3])
+    def test_prequeued_clarifies_share_one_complete_native_answer(self, agent, count):
         """An answer that supplies every order field must not meet a stale second prompt."""
         calls = [
             _tc("clarify", json.dumps({"question": "Which venue?", "choices": ["Hyperliquid", "Lighter"]}), call_id="venue"),
             _tc("clarify", json.dumps({"question": "What amount and leverage?", "choices": ["100 USDC, 5x cross", "Other"]}), call_id="sizing"),
         ]
-        if mixed:
-            calls[1:1] = [_tc("web_search", call_id="read1"), _tc("web_search", call_id="read2")]
+        if count == 3:
+            calls.append(_tc("clarify", json.dumps({"question": "What order type?", "choices": ["Market", "Limit"]}), call_id="order-type"))
         msg = SimpleNamespace(content="", tool_calls=calls)
         original_arguments = [call.function.arguments for call in calls]
         prompts, completed = [], []
@@ -432,16 +737,17 @@ class TestSegmentedDispatchIntegration:
         agent.clarify_callback = callback
         agent.tool_complete_callback = lambda call_id, name, args, result: completed.append((call_id, name, result))
         messages = []
-        with patch("run_agent.handle_function_call", return_value='{"ok":true}'):
-            agent._execute_tool_calls(msg, messages, "task-1")
+        agent._execute_tool_calls(msg, messages, "task-1")
 
         assert len(prompts) == 1
         assert "1. Which venue?" in prompts[0][0]
         assert "2. What amount and leverage?" in prompts[0][0]
         assert "Hyperliquid" in prompts[0][0] and "100 USDC, 5x cross" in prompts[0][0]
+        if count == 3:
+            assert "3. What order type?" in prompts[0][0] and "Market" in prompts[0][0]
         assert prompts[0][1:] == (None, False)
         assert [message["tool_call_id"] for message in messages] == [call.id for call in calls]
-        responses = [json.loads(message["content"]) for message in messages if message["tool_call_id"] in {"venue", "sizing"}]
+        responses = [json.loads(message["content"]) for message in messages]
         assert all(response["user_response"] == answer for response in responses)
         assert all(response["question"] == prompts[0][0] for response in responses)
         assert [call.function.arguments for call in calls] == original_arguments

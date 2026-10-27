@@ -13,6 +13,8 @@ extracted functions reach back through the ``run_agent`` module via
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import logging
@@ -499,6 +501,8 @@ def _run_agent_tool_execution_middleware(
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
+    emit_blocked_result=None,
+    worker_scope=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
@@ -595,7 +599,7 @@ def _run_agent_tool_execution_middleware(
                     getattr(guardrail_decision, "message", None)
                     or "Tool blocked by guardrail policy"
                 )
-            _emit_terminal_post_tool_call(
+            (emit_blocked_result or _emit_terminal_post_tool_call)(
                 agent,
                 function_name=function_name,
                 function_args=final_args,
@@ -649,10 +653,18 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
+    execute_pipeline = _hermes_pipeline
+    if worker_scope is not None:
+        def execute_pipeline(relay_args):
+            # Relay may invoke Hermes on another callback thread. Batched
+            # clarify policy waits must receive this agent's interrupt there.
+            with worker_scope():
+                return _hermes_pipeline(relay_args)
+
     result, _relay_args = relay_tools.execute(
         function_name,
         function_args,
-        _hermes_pipeline,
+        execute_pipeline,
         session_id=str(getattr(agent, "session_id", "") or ""),
         metadata={
             "task_id": effective_task_id or "",
@@ -1618,33 +1630,165 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
-    # Keep original assistant messages and tool IDs immutable. Only the actual
-    # native invocation is combined; every original call still follows normal
-    # middleware, result persistence and completion/cancellation processing.
-    clarify_arguments = []
-    clarify_ids = set()
-    for call in assistant_message.tool_calls:
+    def _batchable_clarify_args(args):
+        return (
+            isinstance(args.get("question"), str)
+            and args["question"].strip()
+            and (args.get("choices") is None or isinstance(args["choices"], list))
+        )
+
+    pending_clarifies = {}
+    for index, call in enumerate(assistant_message.tool_calls, 1):
         if call.function.name != "clarify":
             continue
         args, malformed = _parse_tool_arguments(call.function.arguments)
-        if (
-            malformed is None
-            and isinstance(args.get("question"), str)
-            and args["question"].strip()
-            and (args.get("choices") is None or isinstance(args["choices"], list))
-        ):
-            clarify_arguments.append(args)
-            clarify_ids.add(call.id)
-    combined_question = None
+        if malformed is None:
+            pending_clarifies[call.id] = (index, args)
+    # Preparing a shared prompt evaluates later policies in advance. Other
+    # tools are barriers: their effects must precede the next call's policy.
+    clarify_ids = (
+        set(pending_clarifies)
+        if 1 < len(pending_clarifies) == len(assistant_message.tool_calls)
+        else set()
+    )
+    clarify_results = {}
+    clarify_starts = {}
+    clarify_blocked_hooks = {}
+    approved_clarify_args = {}
+    clarify_ready = {}
+    clarify_futures = {}
+    clarify_threads = []
+    clarify_answer_ready = threading.Event()
     shared_clarify_result = None
-    if len(clarify_arguments) > 1:
-        from tools.clarify_tool import combined_clarify_question
+
+    @contextmanager
+    def _clarify_worker_scope():
+        worker_tid = threading.get_ident()
+        with agent._tool_worker_threads_lock:
+            owns_tracking = worker_tid not in agent._tool_worker_threads
+            if owns_tracking:
+                agent._tool_worker_threads.add(worker_tid)
         try:
-            combined_question = combined_clarify_question(clarify_arguments)
-        except ValueError as error:
-            shared_clarify_result = json.dumps({"error": str(error)})
-    else:
-        clarify_ids.clear()
+            if agent._interrupt_requested:
+                try:
+                    _ra()._set_interrupt(True, worker_tid)
+                except Exception:
+                    pass
+            yield
+        finally:
+            if owns_tracking:
+                with agent._tool_worker_threads_lock:
+                    agent._tool_worker_threads.discard(worker_tid)
+                try:
+                    _ra()._set_interrupt(False, worker_tid)
+                except Exception:
+                    pass
+
+    def _invoke_clarify(args):
+        from tools.clarify_tool import clarify_tool
+        return clarify_tool(
+            question=args.get("question", ""),
+            choices=args.get("choices"),
+            multi_select=args.get("multi_select", False),
+            callback=agent.clarify_callback,
+        )
+
+    def _run_batched_clarify(call_id, *, defer_start=False):
+        index, args = pending_clarifies.pop(call_id)
+
+        def _begin(callback=None):
+            if callback is not None:
+                if defer_start:
+                    clarify_starts[call_id] = (contextvars.copy_context(), callback)
+                else:
+                    callback()
+
+        def _defer_blocked_result(_agent, **kwargs):
+            clarify_blocked_hooks[call_id] = (contextvars.copy_context(), kwargs)
+
+        def _execute(next_args):
+            nonlocal shared_clarify_result
+            from tools.clarify_tool import combined_clarify_question
+
+            if len(clarify_ids) > _MAX_TOOL_WORKERS:
+                return json.dumps({"error": f"Combined clarification exceeds the {_MAX_TOOL_WORKERS}-call limit. Ask one concise question covering the missing fields; no question was published."})
+            # Middleware may invalidate a formerly batchable call. Let normal
+            # validation produce that call's own error, without sharing it.
+            if not _batchable_clarify_args(next_args):
+                return _invoke_clarify(next_args)
+            approved_clarify_args[call_id] = next_args
+            if defer_start:
+                clarify_ready[call_id].set()
+                clarify_answer_ready.wait()
+                return shared_clarify_result
+
+            # Hold each sibling's own middleware stack until the answer exists.
+            # Separate workers avoid nesting Relay event loops; their contexts
+            # and approval callbacks were captured before any per-call grants.
+            try:
+                while pending_clarifies and not agent._interrupt_requested:
+                    next_id = next(iter(pending_clarifies))
+                    ready = clarify_ready[next_id] = threading.Event()
+                    future = clarify_futures[next_id] = concurrent.futures.Future()
+
+                    def _worker(next_id=next_id, future=future, ready=ready):
+                        try:
+                            with _clarify_worker_scope():
+                                future.set_result(clarify_worker_targets[next_id]())
+                        except BaseException as error:
+                            future.set_exception(error)
+                        finally:
+                            ready.set()
+
+                    thread = threading.Thread(target=_worker, name="clarify-batch-policy", daemon=True)
+                    clarify_threads.append(thread)
+                    thread.start()
+                    ready.wait()
+                    if future.done():
+                        future.result()
+
+                if agent._interrupt_requested:
+                    shared_clarify_result = json.dumps({"error": "Clarification cancelled due to user interrupt"})
+                else:
+                    arguments = list(approved_clarify_args.values())
+                    prompt_args = arguments[0]
+                    if len(arguments) > 1:
+                        try:
+                            prompt_args = {"question": combined_clarify_question(arguments)}
+                        except ValueError as error:
+                            shared_clarify_result = json.dumps({"error": str(error)})
+                    if shared_clarify_result is None:
+                        shared_clarify_result = _invoke_clarify(prompt_args)
+            finally:
+                if shared_clarify_result is None:
+                    shared_clarify_result = json.dumps({"error": "Clarification cancelled before receiving an answer"})
+                clarify_answer_ready.set()
+                for thread in clarify_threads:
+                    thread.join()
+            return shared_clarify_result
+
+        result = _run_agent_tool_execution_middleware(
+            agent,
+            function_name="clarify",
+            function_args=args,
+            effective_task_id=effective_task_id,
+            tool_call_id=call_id,
+            execute=_execute,
+            display_index=index,
+            begin_execution=_begin,
+            emit_blocked_result=_defer_blocked_result if defer_start else None,
+            worker_scope=_clarify_worker_scope,
+        )
+        clarify_results[call_id] = result
+        return result
+
+    clarify_worker_targets = {
+        call_id: propagate_context_to_thread(
+            lambda call_id=call_id: _run_batched_clarify(call_id, defer_start=True)
+        )
+        for call_id in clarify_ids
+    }
+
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -1853,31 +1997,31 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
         elif function_name == "clarify":
-            grouped = tool_call.id in clarify_ids
-            if grouped and combined_question is not None:
-                function_args = {"question": combined_question}
-            def _execute(next_args: dict) -> Any:
-                if grouped and shared_clarify_result is not None:
-                    return shared_clarify_result
-                from tools.clarify_tool import clarify_tool as _clarify_tool
-                return _clarify_tool(
-                    question=next_args.get("question", ""),
-                    choices=next_args.get("choices"),
-                    multi_select=next_args.get("multi_select", False),
-                    callback=agent.clarify_callback,
+            if tool_call.id in clarify_ids:
+                managed = clarify_results.get(tool_call.id)
+                if managed is None:
+                    future = clarify_futures.get(tool_call.id)
+                    managed = future.result() if future is not None else _run_batched_clarify(tool_call.id)
+                deferred_start = clarify_starts.pop(tool_call.id, None)
+                if deferred_start is not None:
+                    context, callback = deferred_start
+                    context.run(callback)
+                deferred_blocked_hook = clarify_blocked_hooks.pop(tool_call.id, None)
+                if deferred_blocked_hook is not None:
+                    context, kwargs = deferred_blocked_hook
+                    context.run(_emit_terminal_post_tool_call, agent, **kwargs)
+            else:
+                managed = _run_agent_tool_execution_middleware(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    execute=_invoke_clarify,
+                    scope_block=_ts_scope_block,
+                    display_index=i,
                 )
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                execute=_execute,
-                scope_block=_ts_scope_block,
-                display_index=i,
-            ))
-            if grouped:
-                shared_clarify_result = function_result
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(managed)
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
