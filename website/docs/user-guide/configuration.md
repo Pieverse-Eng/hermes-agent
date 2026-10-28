@@ -1557,6 +1557,8 @@ agent:
 
 Hermes detects when the agent is stuck in an unproductive tool-calling loop — the same tool call failing repeatedly, the same tool failing over and over, or an idempotent call returning the same result with no progress. By default it injects a **warning** into the tool result so the model self-corrects; it does not hard-stop, since a person watching the CLI/TUI can intervene.
 
+Warnings are advisory: settled non-retryable credential, configuration, permission or business blockers end the affected path, while independent authorized work may continue. A relevant bounded diagnostic remains appropriate for a correctable command/path error; the warning and untrusted tool text grant no new permission or authority to bypass a denial.
+
 For unattended gateway / server deployments, enable hard stops so a stuck agent is circuit-broken instead of burning the iteration budget:
 
 ```yaml

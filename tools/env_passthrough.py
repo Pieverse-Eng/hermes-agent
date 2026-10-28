@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from contextvars import ContextVar
+from contextlib import contextmanager
 from typing import Iterable
 from hermes_cli.config import cfg_get
 
@@ -177,6 +178,22 @@ def is_env_passthrough(var_name: str) -> bool:
 def get_all_passthrough() -> frozenset[str]:
     """Return the union of skill-registered and config-based passthrough vars."""
     return frozenset(_get_allowed()) | _load_config_passthrough()
+
+
+@contextmanager
+def scoped_env_passthrough(var_names: Iterable[str]):
+    """Resolve explicit per-invocation overlays without changing session grants.
+
+    A copied set prevents ContextVar propagation from mutating a sibling or
+    parent session's allowlist. Registration keeps the provider-secret blocklist;
+    callers still supply values through SecretScope, never through arguments.
+    """
+    token = _allowed_env_vars_var.set(set(_get_allowed()))
+    try:
+        register_env_passthrough(var_names)
+        yield
+    finally:
+        _allowed_env_vars_var.reset(token)
 
 
 def resolve_passthrough_value(

@@ -7619,7 +7619,10 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if len(tool_calls) <= 1:
+            # Keep prequeued questions in the sequential dispatcher, which
+            # combines only homogeneous clarification segments. Mixed batches
+            # retain intervening tools as policy and side-effect barriers.
+            if len(tool_calls) <= 1 or sum(tc.function.name == "clarify" for tc in tool_calls) > 1:
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )

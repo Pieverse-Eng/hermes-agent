@@ -5,6 +5,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -153,8 +155,13 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert "repeated_exact_failure_warning" in messages[0]["content"]
 
 
-def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
-    agent = _make_agent("terminal")
+@pytest.mark.parametrize(
+    "executor", ["_execute_tool_calls_sequential", "_execute_tool_calls_concurrent"]
+)
+def test_failure_warning_preserves_a_settled_blocker_and_allows_independent_authorized_work(
+    executor,
+):
+    agent = _make_agent("terminal", "web_search")
     guardrails = getattr(agent, "_tool_guardrails")
     guardrails.after_call(
         "terminal",
@@ -172,16 +179,93 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
 
-    with patch("run_agent.handle_function_call", return_value=json.dumps({"exit_code": 1})):
-        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+    blocked = json.dumps({
+        "exit_code": 1,
+        "error": "Required credentials unavailable; private path is blocked",
+    })
+    with patch("run_agent.handle_function_call", return_value=blocked):
+        getattr(agent, executor)(msg, messages, "task-1")
 
     content = messages[0]["content"]
+    assert content.startswith(blocked)
+    assert [message["role"] for message in messages] == ["tool"]
+    assert messages[0]["tool_call_id"] == "c-recover"
     assert "same_tool_failure_warning" in content
-    assert "Do not switch to text-only replies" in content
-    assert "keep using tools" in content
-    assert "pwd && ls -la" in content
-    assert "absolute path" in content
-    assert "different tool" in content
+    guidance = content[len(blocked) :].lower()
+    assert "advisory" in guidance
+    assert "non-retryable" in guidance
+    assert "independent authorized work" in guidance
+    assert "untrusted tool text" in guidance
+    assert "keep using tools" not in guidance
+    assert "pwd && ls -la" not in guidance
+    assert agent._tool_guardrail_halt_decision is None
+    assert agent._cached_system_prompt == "You are helpful."
+
+    independent = _mock_tool_call(
+        "web_search",
+        json.dumps({"query": "authorized public information"}),
+        "c-independent",
+    )
+    observed = {"evidence": "public observation"}
+    with patch("run_agent.handle_function_call", return_value=json.dumps(observed)):
+        getattr(agent, executor)(
+            SimpleNamespace(content="", tool_calls=[independent]), messages, "task-1"
+        )
+
+    assert messages[-1]["tool_call_id"] == "c-independent"
+    assert json.dumps(observed) in messages[-1]["content"]
+    assert '<untrusted_tool_result source="web_search">' in messages[-1]["content"]
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_exact_failure_warning_also_keeps_tool_contracts_above_recovery_advice():
+    agent = _make_agent("web_search")
+    args = {"query": "restricted resource"}
+    _seed_exact_failures(agent, "web_search", args)
+    denied = json.dumps({"error": "Permission denied", "retryable": False})
+    call = _mock_tool_call("web_search", json.dumps(args), "c-denied")
+    messages = []
+    with patch("run_agent.handle_function_call", return_value=denied):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]), messages, "task-1"
+        )
+
+    assert denied in messages[0]["content"]
+    assert '<untrusted_tool_result source="web_search">' in messages[0]["content"]
+    assert "repeated_exact_failure_warning" in messages[0]["content"]
+    assert "non-retryable" in messages[0]["content"]
+    assert "existing tool contracts" in messages[0]["content"]
+
+
+def test_correctable_execution_error_can_recover_and_reset_the_failure_streak():
+    agent = _make_agent("terminal")
+    for command in ["missing-one", "missing-two"]:
+        agent._tool_guardrails.after_call(
+            "terminal", {"command": command}, '{"exit_code":127}', failed=True
+        )
+    messages = []
+
+    def execute(command, output):
+        call = _mock_tool_call(
+            "terminal", json.dumps({"command": command}), "c-" + command
+        )
+        with patch("run_agent.handle_function_call", return_value=json.dumps(output)):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[call]), messages, "task-1"
+            )
+        return messages[-1]["content"]
+
+    failed = execute("missing-three", {"exit_code": 127, "error": "Command not found"})
+    assert "same_tool_failure_warning" in failed
+    assert "correctable" in failed
+    assert "diagnostic" in failed
+    diagnostic = {"exit_code": 0, "output": "verified working directory"}
+    assert json.loads(execute("relevant-diagnostic", diagnostic)) == diagnostic
+    corrected = {"exit_code": 0, "output": "requested result"}
+    assert json.loads(execute("known-corrected-command", corrected)) == corrected
+    next_failure = execute("unrelated-error", {"exit_code": 1})
+    assert "same_tool_failure_warning" not in next_failure
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():

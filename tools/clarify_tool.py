@@ -23,6 +23,31 @@ from typing import List, Optional, Callable
 MAX_CHOICES = 4
 
 
+def combined_clarify_question(arguments: list[dict]) -> str:
+    """Recover a model's prequeued questions with one native free-text prompt.
+
+    Each original question and its normalized options stay visible. This is
+    deliberately not used for a single call: native radio/checkbox semantics
+    remain unchanged there. Refuse oversized batches rather than silently
+    losing a material question; 4096 is the native API transport bound.
+    """
+    sections = []
+    for index, args in enumerate(arguments, 1):
+        section = f"{index}. {args['question'].strip()}"
+        choices = args.get("choices")
+        if choices:
+            normalized = [choice for choice in (_flatten_choice(c) for c in choices) if choice]
+            if normalized:
+                if args.get("multi_select", False):
+                    section += " (Select all that apply.)"
+                section += "\n" + "\n".join(f"   - {choice}" for choice in normalized[:MAX_CHOICES])
+        sections.append(section)
+    question = "\n\n".join(sections)
+    if len(question) > 4096:
+        raise ValueError("Combined clarification exceeds 4096 characters. Ask one concise question covering the missing fields; no question was published.")
+    return question
+
+
 def _flatten_choice(c) -> str:
     """Coerce a single choice into its user-facing display string.
 
