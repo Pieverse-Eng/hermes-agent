@@ -20,6 +20,15 @@ return the existing Run; they do not rebuild or resend it.
 Legacy room identities also refuse ordinary Runs instead of falling back to
 an owner's private policy, including after a platform rollback.
 
+Capabilities and admission refuse externally configured runtimes. The resolved
+Agent transport must use `chat_completions`, `codex_responses`,
+`anthropic_messages` or `bedrock_converse` in Hermes' own tool loop. Codex
+app-server and ACP transports refuse before Agent/client construction. Turn
+entry checks again if an Agent's mode changed. Room Agents have no inherited
+fallback chain. Capability discovery reads configuration only and does not
+resolve or refresh provider credentials; actual resolved modes are checked
+again after request overrides. Private runtime selection stays unchanged.
+
 Room turns never load native session history. They use a fixed system prompt,
 not the caller's instructions or the owner's configured prompt. The actual
 Agent constructor disables built-in and provider memory, owner context files,

@@ -611,6 +611,11 @@ def init_agent(
     from tools.execution_scope import is_public_room_scope
     agent.public_room_policy = is_public_room_scope()
     if agent.public_room_policy:
+        # A fallback may select a subprocess provider outside this policy.
+        fallback_model = None
+        if api_mode is not None:
+            from gateway.public_room import require_room_runtime
+            require_room_runtime(api_mode, provider=provider, base_url=base_url)
         skip_context_files = True
         skip_memory = True
         load_soul_identity = False
@@ -671,6 +676,10 @@ def init_agent(
         agent.api_mode = nous_api_mode(agent.model)
     else:
         agent.api_mode = "chat_completions"
+
+    if agent.public_room_policy:
+        from gateway.public_room import require_room_runtime
+        require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
 
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent

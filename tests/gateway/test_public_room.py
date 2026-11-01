@@ -217,11 +217,13 @@ def test_actual_agent_constructor_keeps_private_stores_and_context_providers_unl
             agent = AIAgent(api_key="fixture-only", base_url="http://127.0.0.1:1/v1",
                             model="test/model", quiet_mode=True,
                             enabled_toolsets=["memory", "session_search", "terminal"],
-                            skip_memory=False, skip_context_files=False, load_soul_identity=True)
+                            skip_memory=False, skip_context_files=False, load_soul_identity=True,
+                            fallback_model={"provider": "copilot-acp", "model": "external-fixture"})
             try:
                 assert agent._memory_store is None and agent._memory_manager is None
                 assert agent.skip_context_files and not agent.load_soul_identity
                 assert agent._skip_mcp_refresh
+                assert agent._fallback_chain == []
                 prompt = build_system_prompt(agent, system_message="PRIVATE_CALLER_SENTINEL")
                 assert prompt == PUBLIC_ROOM_PROMPT
                 tools = get_tool_definitions(enabled_toolsets=agent.enabled_toolsets,
@@ -238,3 +240,97 @@ def test_actual_agent_constructor_keeps_private_stores_and_context_providers_unl
     market.assert_called_once()
     assert json.loads(handle_function_call("wallet_transfer", {}))["transferred"]
     transfer.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [
+    {"provider": "openai", "openai_runtime": "codex_app_server"},
+    {"provider": "openai-codex", "openai_runtime": "codex_app_server"},
+    {"api_mode": "codex_app_server"}, {"api_mode": "future_external_mode"},
+    {"provider": "copilot-acp"}, {"base_url": "acp+tcp://127.0.0.1:4321"},
+])
+async def test_external_config_neither_advertises_nor_admits_a_room(model, monkeypatch):
+    adapter = _make_adapter("room-fixture-key")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"model": model})
+    app = _create_runs_app(adapter)
+    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    with patch.object(adapter, "_create_agent") as create, patch.object(adapter, "_ensure_session_db_async") as history:
+        async with TestClient(TestServer(app), headers={"Authorization": "Bearer room-fixture-key"}) as client:
+            cap = await (await client.get("/v1/capabilities")).json()
+            assert cap["features"]["squad_room_isolation"] is None
+            assert (await client.post(ROOM_RUN_PATH, json=request_body())).status == 400
+        create.assert_not_called()
+        history.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_config_change_after_capability_cannot_admit_an_external_runtime(monkeypatch):
+    config = {"model": {"provider": "openai", "api_mode": "chat_completions"}}
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: config)
+    adapter = _make_adapter("room-fixture-key")
+    app = _create_runs_app(adapter)
+    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    with patch.object(adapter, "_create_agent") as create:
+        async with TestClient(TestServer(app), headers={"Authorization": "Bearer room-fixture-key"}) as client:
+            cap = await (await client.get("/v1/capabilities")).json()
+            assert cap["features"]["squad_room_isolation"]["policy"] == PUBLIC_ROOM_POLICY
+            config["model"]["openai_runtime"] = "codex_app_server"
+            assert (await client.post(ROOM_RUN_PATH, json=request_body())).status == 400
+        create.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"])
+def test_room_factory_accepts_only_qualified_hermes_loops(mode, monkeypatch):
+    adapter = _make_adapter("room-fixture-key")
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
+        "api_key": "fixture", "base_url": "http://127.0.0.1:1/v1", "provider": "openai", "api_mode": mode})
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test/model")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"model": {"api_mode": mode}})
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    agent = SimpleNamespace(api_mode=mode, provider="openai", base_url="http://127.0.0.1:1/v1")
+    with patch("run_agent.AIAgent", return_value=agent) as create, \
+         patch("gateway.run.GatewayRunner._load_fallback_model") as fallback:
+        assert adapter._public_room_config_supported()
+        assert adapter._create_agent(public_room=True) is agent
+        assert create.call_args.kwargs["fallback_model"] is None
+        assert create.call_args.kwargs["skip_memory"]
+        fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("mode,provider,base", [
+    ("codex_app_server", "openai", "http://127.0.0.1:1/v1"),
+    ("chat_completions", "copilot-acp", "acp://copilot"),
+    ("chat_completions", "custom", "acp+tcp://127.0.0.1:4321"),
+    ("future_external_mode", "openai", "http://127.0.0.1:1/v1"),
+])
+def test_actual_room_constructor_refuses_before_transport_or_subprocess(mode, provider, base):
+    from run_agent import AIAgent
+    with public_room_scope(True), patch.object(AIAgent, "_get_transport") as transport, \
+         patch("subprocess.Popen") as process:
+        with pytest.raises(ValueError, match="supported Hermes tool loop"):
+            AIAgent(api_key="fixture", model="test/model", base_url=base,
+                    provider=provider, api_mode=mode, quiet_mode=True)
+        transport.assert_not_called()
+        process.assert_not_called()
+
+
+def test_resolved_runtime_override_refuses_before_constructing_agent(monkeypatch):
+    adapter = _make_adapter("room-fixture-key")
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
+        "provider": "openai-codex", "api_mode": "codex_app_server"})
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test/model")
+    with patch("run_agent.AIAgent") as create, patch.object(adapter, "_ensure_session_db") as history:
+        with pytest.raises(ValueError, match="supported Hermes tool loop"):
+            adapter._create_agent(public_room=True)
+        create.assert_not_called()
+        history.assert_not_called()
+
+
+def test_room_turn_rechecks_runtime_before_any_external_handoff():
+    from agent.conversation_loop import run_conversation
+    handoff = Mock(side_effect=AssertionError("external subprocess entered"))
+    agent = SimpleNamespace(public_room_policy=True, api_mode="codex_app_server", provider="openai",
+                            base_url="http://127.0.0.1:1/v1", _run_codex_app_server_turn=handoff)
+    with pytest.raises(ValueError, match="supported Hermes tool loop"):
+        run_conversation(agent, "room turn")
+    handoff.assert_not_called()

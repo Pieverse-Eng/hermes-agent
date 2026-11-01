@@ -2903,6 +2903,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._last_resolved_model[_resolved_key] = model
             self._last_resolved_model["*"] = model
 
+        if public_room:
+            from gateway.public_room import require_room_runtime
+            require_room_runtime(runtime_kwargs.get("api_mode"),
+                                 provider=runtime_kwargs.get("provider"),
+                                 base_url=runtime_kwargs.get("base_url"))
         if public_room and (proposal_only or host_tool_names or bound_business_tools):
             raise ValueError("Public room policy cannot bind business tools")
         user_config = _load_gateway_config()
@@ -2933,7 +2938,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = (
             None
-            if confirmed_runtime_lock
+            if confirmed_runtime_lock or public_room
             else GatewayRunner._load_fallback_model()
         )
 
@@ -2970,6 +2975,7 @@ class APIServerAdapter(BasePlatformAdapter):
         with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed), public_room_scope(public_room):
             agent = AIAgent(**agent_kwargs)
         if public_room:
+            require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
             from model_tools import get_tool_definitions
             with public_room_scope(True):
                 raw_tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True,
@@ -3838,6 +3844,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    def _public_room_config_supported(self) -> bool:
+        from gateway.run import _load_gateway_config
+        from gateway.public_room import room_config_supported
+        return room_config_supported(_load_gateway_config())
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -3895,7 +3906,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "live_proposal_only": True,
                 "host_tools_v1": True,
                 "pawpilot_runtime_v2": True,
-                "squad_room_isolation": room_capability(),
+                "squad_room_isolation": (room_capability() if self._public_room_config_supported() else None),
                 "workflow_skill_loading": True,
                 "workflow_resource_loading": True,
                 "compact_host_tools": True,
@@ -7390,6 +7401,9 @@ class APIServerAdapter(BasePlatformAdapter):
             auth_error = self._check_auth(request)
             if auth_error is not None:
                 return auth_error
+            if not self._public_room_config_supported():
+                return web.json_response(_openai_error("Room runtime is unsupported",
+                                                      code="invalid_room_policy"), status=400)
         from gateway.interactive_messages import InteractionContext, current_message_scope, is_proposal_context
         interaction_context = None
         if body.get("interaction_context") is not None:

@@ -16,6 +16,41 @@ PUBLIC_ROOM_PROMPT = (
 )
 
 
+ROOM_API_MODES = frozenset({
+    "chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse",
+})
+
+
+def room_runtime_supported(api_mode, *, provider="", base_url=""):
+    """Only in-process Hermes loops enforce the room tool and context policy."""
+    return (isinstance(api_mode, str) and api_mode in ROOM_API_MODES
+            and str(provider or "").strip().lower() != "copilot-acp"
+            and not str(base_url or "").strip().lower().startswith(("acp://", "acp+tcp://")))
+
+
+def require_room_runtime(api_mode, *, provider="", base_url=""):
+    if not room_runtime_supported(api_mode, provider=provider, base_url=base_url):
+        raise ValueError("Public rooms require a supported Hermes tool loop")
+
+
+def room_config_supported(config):
+    """Conservative capability check; never resolve or refresh credentials here.
+
+    Actual resolved transports are checked again at construction and turn entry,
+    including request overrides and a config change after capability discovery.
+    """
+    model = config.get("model", {})
+    if isinstance(model, str):
+        return True
+    if not isinstance(model, dict):
+        return False
+    mode = model.get("api_mode") or "chat_completions"
+    runtime = str(model.get("openai_runtime") or "auto").strip().lower()
+    return (runtime in {"auto", "api"}
+            and room_runtime_supported(mode, provider=model.get("provider"),
+                                       base_url=model.get("base_url")))
+
+
 def room_capability():
     return {"policy": PUBLIC_ROOM_POLICY, "run_path": ROOM_RUN_PATH,
             "memory": False, "context_files": False,
