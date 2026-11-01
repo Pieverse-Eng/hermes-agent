@@ -2104,6 +2104,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("POST", "/v1/room-runs", self._handle_room_runs),
             ("POST", "/v1/runs/lookup", self._handle_run_lookup),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -2630,6 +2631,7 @@ class APIServerAdapter(BasePlatformAdapter):
         host_tool_names: tuple[str, ...] = (),
         bound_business_tools: bool = False,
         tool_disclosure: str = 'full',
+        public_room: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2901,11 +2903,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._last_resolved_model[_resolved_key] = model
             self._last_resolved_model["*"] = model
 
+        if public_room and (proposal_only or host_tool_names or bound_business_tools):
+            raise ValueError("Public room policy cannot bind business tools")
         user_config = _load_gateway_config()
         # Config enables plugin discovery, but host proxies only exist in an
         # explicitly bound current Run. Ordinary/Live/News retain their tools.
         enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"api_host_tools"})
-        if interactive_messages:
+        if public_room:
+            enabled_toolsets = ["pieverse-market-research"]
+        if interactive_messages and not public_room:
             enabled_toolsets = sorted(set(enabled_toolsets) | {"api_interactions"})
 
         owner_tool_names = None
@@ -2950,6 +2956,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            **({"skip_memory": True, "skip_context_files": True, "load_soul_identity": False}
+               if public_room else {}),
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -2958,8 +2966,17 @@ class APIServerAdapter(BasePlatformAdapter):
         allowed = ((PROPOSAL_ONLY_TOOL_NAMES & (owner_tool_names | {"send_message", "clarify"}))
                    | set(host_tool_names)) if proposal_only else None
         from tools.execution_scope import host_tool_scope
-        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed):
+        from tools.execution_scope import public_room_scope, PUBLIC_ROOM_TOOL_NAMES
+        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed), public_room_scope(public_room):
             agent = AIAgent(**agent_kwargs)
+        if public_room:
+            from model_tools import get_tool_definitions
+            with public_room_scope(True):
+                raw_tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True,
+                                                 skip_tool_search_assembly=True)
+            agent.tools = [tool for tool in raw_tools if tool["function"]["name"] in PUBLIC_ROOM_TOOL_NAMES]
+            agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+            agent._skip_mcp_refresh = True
         if bound_business_tools:
             # Native assembly already keeps bound proxies/current delivery eager
             # and sanitized. Do not append a second unsanitized catalog here.
@@ -3835,6 +3852,7 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.plugins import get_plugin_manager
         plugin_capabilities = get_plugin_manager().api_capabilities(set(self._available_host_tools()))
 
+        from gateway.public_room import room_capability
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3877,6 +3895,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "live_proposal_only": True,
                 "host_tools_v1": True,
                 "pawpilot_runtime_v2": True,
+                "squad_room_isolation": room_capability(),
                 "workflow_skill_loading": True,
                 "workflow_resource_loading": True,
                 "compact_host_tools": True,
@@ -3908,6 +3927,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "room_runs": {"method": "POST", "path": "/v1/room-runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
@@ -7331,6 +7351,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # Content-free recovery: do not expose a saved input/output/fingerprint.
         return web.json_response({"run_id": run_id, "status": status["status"]})
 
+    async def _handle_room_runs(self, request: "web.Request") -> "web.Response":
+        """A dedicated route makes an older/mixed-version pod refuse before inference."""
+        from tools.execution_scope import PUBLIC_ROOM_POLICY
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict) or body.get("room_policy") != PUBLIC_ROOM_POLICY:
+            return web.json_response(_openai_error("Isolated room policy required",
+                                                  code="invalid_room_policy"), status=400)
+        return await self._handle_runs(request)
+
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -7347,6 +7379,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(body, dict):
             return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        from gateway.public_room import validate_room_request, PUBLIC_ROOM_PROMPT
+        from tools.execution_scope import public_room_scope
+        try:
+            public_room = validate_room_request(body, authenticated=bool(self._expected_api_key()))
+        except ValueError:
+            return web.json_response(_openai_error("Invalid isolated room request",
+                                                  code="invalid_room_policy"), status=400)
+        if public_room:
+            auth_error = self._check_auth(request)
+            if auth_error is not None:
+                return auth_error
         from gateway.interactive_messages import InteractionContext, current_message_scope, is_proposal_context
         interaction_context = None
         if body.get("interaction_context") is not None:
@@ -7458,7 +7501,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Classify the caller's input before reading SessionDB so native turns
         # also reload after lease admission; caller snapshots remain authoritative.
         native_session_continuation = bool(
-            session_id and not conversation_history and not previous_response_id
+            not public_room and session_id and not conversation_history and not previous_response_id
             and "conversation_history" not in body
         )
         if native_session_continuation:
@@ -7481,6 +7524,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
         ephemeral_system_prompt = (
+            PUBLIC_ROOM_PROMPT if public_room else
             instructions if instructions is not None else self._configured_system_prompt()
         )
         loop = asyncio.get_running_loop()
@@ -7621,6 +7665,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
                         interactive_messages=True,
+                        public_room=public_room,
                         host_tool_names=host_tool_names,
                         proposal_only=is_proposal_context(interaction_context),
                         bound_business_tools=(interaction_context or {}).get("version") == 2,
@@ -7777,7 +7822,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     with self._profile_scope(request_profile), current_message_scope(
                         deliver_current, interaction_context,
                         available_tools=getattr(agent, "valid_tool_names", None)
-                    ), host_tool_scope(host_broker):
+                    ), host_tool_scope(host_broker), public_room_scope(public_room):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
