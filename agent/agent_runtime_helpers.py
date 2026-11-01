@@ -2806,6 +2806,27 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  skip_tool_request_middleware: bool = False,
                  tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
                  skip_tool_execution_middleware: bool = False) -> str:
+    """Keep direct/local tool invocation inside the Agent's immutable room policy."""
+    from tools.execution_scope import public_room_scope, is_public_room_scope, execution_scope_error
+    room = getattr(agent, "public_room_policy", False) is True or is_public_room_scope()
+    with public_room_scope(room):
+        blocked = execution_scope_error(function_name) if room else None
+        if blocked:
+            return blocked
+        return _invoke_tool(agent, function_name, function_args, effective_task_id,
+                            tool_call_id=tool_call_id, messages=messages,
+                            pre_tool_block_checked=pre_tool_block_checked,
+                            skip_tool_request_middleware=skip_tool_request_middleware,
+                            tool_request_middleware_trace=tool_request_middleware_trace,
+                            skip_tool_execution_middleware=skip_tool_execution_middleware)
+
+
+def _invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
+                 tool_call_id: Optional[str] = None, messages: list = None,
+                 pre_tool_block_checked: bool = False,
+                 skip_tool_request_middleware: bool = False,
+                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+                 skip_tool_execution_middleware: bool = False) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
