@@ -506,6 +506,15 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    from tools.execution_scope import execution_scope_error, is_public_room_scope, public_room_scope
+    public_room = getattr(agent, "public_room_policy", False) is True or is_public_room_scope()
+    with public_room_scope(public_room):
+        blocked = execution_scope_error(function_name) if public_room else None
+    if blocked:
+        # Agent-local memory/session handlers bypass model_tools dispatch.
+        # Refuse them before middleware, Relay callbacks or any handler runs.
+        return _ManagedToolResult(result=blocked, args=function_args,
+                                  middleware_trace=[], blocked=True, dispatched=False)
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -653,12 +662,14 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    execute_pipeline = _hermes_pipeline
+    def execute_pipeline(relay_args):
+        with public_room_scope(public_room):
+            return _hermes_pipeline(relay_args)
     if worker_scope is not None:
         def execute_pipeline(relay_args):
             # Relay may invoke Hermes on another callback thread. Batched
             # clarify policy waits must receive this agent's interrupt there.
-            with worker_scope():
+            with worker_scope(), public_room_scope(public_room):
                 return _hermes_pipeline(relay_args)
 
     result, _relay_args = relay_tools.execute(

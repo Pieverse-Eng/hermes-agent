@@ -167,6 +167,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     session — that's the only way to keep upstream prompt caches
     warm across turns.
     """
+    if getattr(agent, "public_room_policy", False) is True:
+        from gateway.public_room import PUBLIC_ROOM_PROMPT
+        # Return before loading SOUL, skills, cwd files, memory, user profiles
+        # or owner-supplied system_message. The prefix stays immutable.
+        return {"stable": PUBLIC_ROOM_PROMPT, "context": "", "volatile": ""}
+
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.

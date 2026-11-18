@@ -608,6 +608,18 @@ def init_agent(
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
+    from tools.execution_scope import is_public_room_scope
+    agent.public_room_policy = is_public_room_scope()
+    if agent.public_room_policy:
+        # A fallback may select a subprocess provider outside this policy.
+        fallback_model = None
+        if api_mode is not None:
+            from gateway.public_room import require_room_runtime
+            require_room_runtime(api_mode, provider=provider, base_url=base_url)
+        skip_context_files = True
+        skip_memory = True
+        load_soul_identity = False
+        enabled_toolsets = ["pieverse-market-research"]
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
@@ -664,6 +676,10 @@ def init_agent(
         agent.api_mode = nous_api_mode(agent.model)
     else:
         agent.api_mode = "chat_completions"
+
+    if agent.public_room_policy:
+        from gateway.public_room import require_room_runtime
+        require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
 
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
@@ -907,7 +923,7 @@ def init_agent(
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.
-    agent._skip_mcp_refresh = False
+    agent._skip_mcp_refresh = agent.public_room_policy
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
@@ -1683,7 +1699,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    if not agent.public_room_policy and (not skip_memory or _memory_toolset_requested):
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1704,7 +1720,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not agent.public_room_policy and not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
@@ -2399,6 +2415,8 @@ def init_agent(
     except Exception:
         pass
 
+    if agent.public_room_policy:
+        _engine_name = "compressor"
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
         try:

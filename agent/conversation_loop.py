@@ -1271,6 +1271,11 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    from tools.execution_scope import is_public_room_scope
+    if getattr(agent, "public_room_policy", False) is True or is_public_room_scope():
+        from gateway.public_room import require_room_runtime
+        require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn

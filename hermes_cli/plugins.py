@@ -1988,6 +1988,11 @@ class PluginManager:
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
         """
+        from tools.execution_scope import is_public_room_scope
+        if is_public_room_scope():
+            # Owner hooks can recall memory or inject private context. Room
+            # turns execute only the explicitly allowed public tool handler.
+            return []
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
@@ -2020,6 +2025,9 @@ class PluginManager:
         path. Middleware that wants to change behavior must return the shape
         documented by the caller-specific contract.
         """
+        from tools.execution_scope import is_public_room_scope
+        if is_public_room_scope():
+            return []
         callbacks = self._middleware.get(kind, [])
         results: List[Any] = []
         for cb in callbacks:
