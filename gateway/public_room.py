@@ -98,14 +98,48 @@ ROOM_API_MODES = frozenset({
 })
 
 
+# One MoA call sends a request to each reference model and then to the
+# aggregator. A room reply has a fixed number of model requests, so a room
+# does not run MoA: not as the provider, and not as a one-shot turn.
+ROOM_MOA_ERROR = "Shared rooms do not run MoA."
+
+
+class RoomMoaUnsupported(ValueError):
+    """A room Run asked for MoA. The whole message is fixed text."""
+
+    def __init__(self):
+        super().__init__(ROOM_MOA_ERROR)
+
+
+def room_moa_runtime(provider="", base_url="") -> bool:
+    """Whether a runtime is the MoA virtual provider (its Agent uses `moa://local`)."""
+    return (str(provider or "").strip().lower() == "moa"
+            or str(base_url or "").strip().lower().startswith("moa://"))
+
+
+def room_moa_configured(config) -> bool:
+    """Whether the pod's model configuration names MoA."""
+    model = config.get("model") if isinstance(config, dict) else None
+    return isinstance(model, dict) and room_moa_runtime(model.get("provider"), model.get("base_url"))
+
+
+def room_moa_turn(message) -> bool:
+    """Whether an input is a one-shot MoA turn: the hidden marker of `/moa`."""
+    from hermes_cli.moa_config import MOA_MARKER_PREFIX
+    return isinstance(message, str) and message.startswith(MOA_MARKER_PREFIX)
+
+
 def room_runtime_supported(api_mode, *, provider="", base_url=""):
     """Only in-process Hermes loops enforce the room tool and context policy."""
     return (isinstance(api_mode, str) and api_mode in ROOM_API_MODES
             and str(provider or "").strip().lower() != "copilot-acp"
-            and not str(base_url or "").strip().lower().startswith(("acp://", "acp+tcp://")))
+            and not str(base_url or "").strip().lower().startswith(("acp://", "acp+tcp://"))
+            and not room_moa_runtime(provider, base_url))
 
 
 def require_room_runtime(api_mode, *, provider="", base_url=""):
+    if room_moa_runtime(provider, base_url):
+        raise RoomMoaUnsupported()
     if not room_runtime_supported(api_mode, provider=provider, base_url=base_url):
         raise ValueError("Public rooms require a supported Hermes tool loop")
 

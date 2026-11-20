@@ -1170,3 +1170,351 @@ def test_a_spent_reply_sends_no_codex_request_and_a_reconnect_is_a_request_too(r
         client.responses.create.side_effect = connection_error()
         refused(agent, lambda: agent._run_codex_stream(dict(request), client=client))
     client.responses.create.assert_called_once()
+
+
+# --- Bedrock: boto3 retries inside one call, so each HTTP send counts ------------
+
+BEDROCK_REQUEST = {"modelId": "test-model",
+                   "messages": [{"role": "user", "content": [{"text": "public"}]}]}
+UNAVAILABLE = (503, {"__type": "ServiceUnavailableException", "message": "Service unavailable"})
+STREAM_DENIED = (403, {"__type": "AccessDeniedException", "message": (
+    "User is not authorized to perform: bedrock:InvokeModelWithResponseStream")})
+
+
+def converse_tool_answer(n):
+    """A Converse answer that asks for a tool."""
+    use = {"toolUseId": f"tool_{n}", "name": "market_snapshot", "input": {"ticker": f"T{n}"}}
+    return 200, {"output": {"message": {"role": "assistant", "content": [{"toolUse": use}]}},
+                 "stopReason": "tool_use",
+                 "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}}
+
+
+def flaky_bedrock(n):
+    """Answer each third send and fail the two before it with a retryable error."""
+    return UNAVAILABLE if n % 3 else converse_tool_answer(n // 3)
+
+
+@contextmanager
+def bedrock_endpoint(reply, monkeypatch, mode="legacy"):
+    """Hermes' Bedrock runtime client on a local endpoint; `reply(n)` is the status and body of send n.
+
+    `_get_bedrock_runtime_client` builds the client as in production, with the
+    boto3 retry mode `mode`. Yields the client and the list of the sends that arrived.
+    """
+    boto3 = pytest.importorskip("boto3", reason="the Bedrock client needs boto3")
+    import botocore.endpoint
+    from botocore.config import Config
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from agent import bedrock_adapter
+    sends = []
+
+    class Bedrock(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            sends.append(self.path)
+            status, body = reply(len(sends))
+            payload = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            if status >= 400:
+                self.send_header("x-amzn-ErrorType", body["__type"])
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Bedrock)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    # boto3 keeps its own retries; only the wait between them is removed.
+    monkeypatch.setattr(botocore.endpoint, "time", SimpleNamespace(sleep=lambda _seconds: None))
+    endpoint = f"http://127.0.0.1:{server.server_port}"
+    # Only the endpoint, the keys and the retry mode are fixtures.
+    monkeypatch.setattr(bedrock_adapter, "_require_boto3", lambda: SimpleNamespace(
+        client=lambda service, region_name: boto3.client(
+            service, region_name=region_name, endpoint_url=endpoint,
+            aws_access_key_id="fixture", aws_secret_access_key="fixture",
+            config=Config(retries={"mode": mode}))))
+    bedrock_adapter.reset_client_cache()
+    try:
+        yield bedrock_adapter._get_bedrock_runtime_client("us-east-1"), sends
+    finally:
+        bedrock_adapter.reset_client_cache()
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("mode", ["legacy", "standard"])
+def test_boto3_retries_inside_one_call_cannot_send_more_than_the_model_request_cap(
+        research_tools, monkeypatch, mode):
+    """Sixteen Converse calls with two failed sends each would be 48 sends."""
+    with bedrock_endpoint(flaky_bedrock, monkeypatch, mode) as (_client, sends), \
+            public_room_scope(True, policy=PUBLIC_ROOM_RESEARCH_POLICY):
+        agent = research_agent()
+        agent.api_mode, agent._disable_streaming = "bedrock_converse", True
+        try:
+            with patch.object(type(agent), "_handle_max_iterations") as closing_summary:
+                result = agent.run_conversation(ROOM_JSON, conversation_history=[])
+        finally:
+            agent.close()
+    # Exactly the cap left the process: five answered calls of three sends, then one.
+    assert len(sends) == PUBLIC_ROOM_MAX_MODEL_REQUESTS == 16
+    assert set(sends) == {"/model/test%2Fmodel/converse"}
+    assert agent.public_room_budget.requests == PUBLIC_ROOM_MAX_MODEL_REQUESTS
+    assert research_tools["market_snapshot"].call_count == 5
+    assert result["failed"] is True and result["final_response"] is None
+    assert result["error"] == PUBLIC_ROOM_MODEL_BUDGET_ERROR
+    closing_summary.assert_not_called()
+
+
+@pytest.mark.parametrize("stream,left,arrive", [
+    (False, 1, 1),  # the retry of a failed send is refused
+    (False, 2, 2),
+    (True, 1, 1),   # the same inside converse_stream
+    (False, 0, 0),  # a spent reply sends nothing
+    (True, 0, 0),
+])
+def test_each_bedrock_send_of_a_room_reply_counts(research_tools, monkeypatch, stream, left, arrive):
+    with bedrock_endpoint(lambda n: UNAVAILABLE, monkeypatch) as (_client, sends), \
+            room_model_agent("bedrock_converse", left=left) as agent:
+        refused(agent, lambda: entry(agent, stream)(dict(BEDROCK_REQUEST)))
+    assert len(sends) == arrive
+
+
+def test_the_sends_of_the_bedrock_fallback_after_a_denied_stream_count_too(research_tools, monkeypatch):
+    replies = iter([STREAM_DENIED, UNAVAILABLE, UNAVAILABLE])
+    with bedrock_endpoint(lambda n: next(replies), monkeypatch) as (_client, sends), \
+            room_model_agent("bedrock_converse", left=2) as agent:
+        refused(agent, lambda: agent._interruptible_streaming_api_call(dict(BEDROCK_REQUEST)))
+    # The denied stream, one Converse send, and no retry of it.
+    assert sends == ["/model/test-model/converse-stream", "/model/test-model/converse"]
+
+
+def test_a_private_conversation_keeps_the_retries_of_boto3_on_the_shared_client(monkeypatch):
+    """The counter is on the shared client; it acts for a room reply only."""
+    from run_agent import AIAgent
+    with bedrock_endpoint(flaky_bedrock, monkeypatch) as (_client, sends):
+        with room_model_agent("bedrock_converse", left=3) as room:
+            assert room._interruptible_api_call(dict(BEDROCK_REQUEST)).choices
+            assert (len(sends), room.public_room_budget.requests) == (3, PUBLIC_ROOM_MAX_MODEL_REQUESTS)
+        private = AIAgent(api_key="fixture-only", base_url="http://127.0.0.1:1/v1", model="test/model",
+                          quiet_mode=True, skip_memory=True, skip_context_files=True)
+        try:
+            private.api_mode = "bedrock_converse"
+            for _ in range(PUBLIC_ROOM_MAX_MODEL_REQUESTS):
+                assert private._interruptible_api_call(dict(BEDROCK_REQUEST)).choices
+        finally:
+            private.close()
+        # Three sends for each private call, on the client that the room call used.
+        assert len(sends) == 3 + 3 * PUBLIC_ROOM_MAX_MODEL_REQUESTS
+        assert room.public_room_budget.requests == PUBLIC_ROOM_MAX_MODEL_REQUESTS
+        # Still one count for one send: the last request of the next reply leaves.
+        with room_model_agent("bedrock_converse", left=1) as room:
+            refused(room, lambda: room._interruptible_api_call(dict(BEDROCK_REQUEST)))
+        assert len(sends) == 3 + 3 * PUBLIC_ROOM_MAX_MODEL_REQUESTS + 1
+
+
+def test_an_auxiliary_bedrock_call_after_a_room_call_in_the_same_thread_is_not_counted(
+        research_tools, monkeypatch):
+    """Compaction and the title use the shared client outside the count, also in the reply's thread."""
+    from agent.bedrock_adapter import call_converse
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    with bedrock_endpoint(flaky_bedrock, monkeypatch) as (_client, sends), \
+            room_model_agent("bedrock_converse", left=3) as agent:
+        # The room call runs in this thread and uses the last three requests of the reply.
+        assert _dispatch_nonstreaming_api_request(agent, dict(BEDROCK_REQUEST), make_client=None).choices
+        assert (len(sends), agent.public_room_budget.requests) == (3, PUBLIC_ROOM_MAX_MODEL_REQUESTS)
+        # The auxiliary call keeps the retries of boto3, and the spent reply does not refuse it.
+        assert call_converse("us-east-1", "test-model", [{"role": "user", "content": "title"}]).choices
+    assert len(sends) == 6
+
+
+def test_a_room_reply_does_not_probe_the_bedrock_context_window(monkeypatch):
+    """Each probe tier is a request to the model, outside the count; a private Agent still probes."""
+    from agent import bedrock_adapter, model_metadata
+    client, saved = Mock(), []
+    client.converse.side_effect = Exception("prompt is too long: 3000 tokens > 1000000 maximum")
+    monkeypatch.setattr(bedrock_adapter, "_BEDROCK_PROBE_TIERS", (2_000,))
+    monkeypatch.setattr(bedrock_adapter, "_get_bedrock_runtime_client", lambda _region: client)
+    monkeypatch.setattr(model_metadata, "get_cached_context_length", lambda *_args: None)
+    monkeypatch.setattr(model_metadata, "save_context_length", lambda *args: saved.append(args))
+    base = "https://bedrock-runtime.us-east-1.amazonaws.com"
+
+    def window():
+        return model_metadata.get_model_context_length("test-model", base_url=base, provider="bedrock")
+
+    with public_room_scope(True, policy=PUBLIC_ROOM_RESEARCH_POLICY):
+        assert bedrock_adapter.probe_bedrock_context_length("test-model", "us-east-1") is None
+        # The static table, and nothing saved for a later private probe to trust.
+        assert window() == bedrock_adapter._static_bedrock_context_length("test-model")
+    client.converse.assert_not_called()
+    assert saved == []
+    assert window() == 1_000_000
+    client.converse.assert_called_once()
+    assert saved == [("test-model", base, 1_000_000)]
+
+
+# --- MoA: one call is several model requests, so a room does not run it ----------
+
+MOA_MODEL = {"model": {"provider": "moa", "default": "default"}}
+
+
+def moa_turn(prompt="public"):
+    from hermes_cli.moa_config import encode_moa_turn
+    return encode_moa_turn(prompt, {})
+
+
+@contextmanager
+def no_model_request():
+    """Every way a MoA Agent or a room Agent can reach a model. None may be used."""
+    from run_agent import AIAgent
+    with patch("agent.moa_loop.build_moa_facade") as facade, \
+            patch("agent.moa_loop._run_references_parallel") as references, \
+            patch("agent.moa_loop.aggregate_moa_context") as one_shot, \
+            patch.object(AIAgent, "_create_request_openai_client") as client:
+        yield
+    for sender in (facade, references, one_shot, client):
+        sender.assert_not_called()
+
+
+def test_a_moa_agent_in_a_room_fails_with_the_fixed_error_and_sends_nothing(research_tools):
+    from gateway.public_room import ROOM_MOA_ERROR, RoomMoaUnsupported
+    from run_agent import AIAgent
+    assert ROOM_MOA_ERROR == "Shared rooms do not run MoA."
+    for policy in (PUBLIC_ROOM_POLICY, PUBLIC_ROOM_RESEARCH_POLICY):
+        with no_model_request(), public_room_scope(True, policy=policy):
+            # MoA as the provider: no Agent.
+            with pytest.raises(RoomMoaUnsupported) as refusal:
+                AIAgent(provider="moa", model="default", api_key="fixture-only", quiet_mode=True)
+            assert str(refusal.value) == ROOM_MOA_ERROR
+            # An Agent that becomes MoA, a one-shot MoA turn, and an explicit preset: no turn.
+            agent = research_agent()
+            try:
+                for turn in (lambda: agent.run_conversation(moa_turn(), conversation_history=[]),
+                             lambda: agent.run_conversation(ROOM_JSON, conversation_history=[],
+                                                            moa_config={"reference_models": []})):
+                    with pytest.raises(RoomMoaUnsupported) as refusal:
+                        turn()
+                    assert str(refusal.value) == ROOM_MOA_ERROR
+                agent.provider = "moa"
+                with pytest.raises(RoomMoaUnsupported):
+                    agent.run_conversation(ROOM_JSON, conversation_history=[])
+                agent.provider, agent.base_url = "openai", "moa://local"
+                with pytest.raises(RoomMoaUnsupported):
+                    agent.run_conversation(ROOM_JSON, conversation_history=[])
+                assert agent.public_room_budget.requests == 0
+            finally:
+                agent.close()
+
+
+@pytest.mark.asyncio
+async def test_a_moa_pod_declares_no_room_and_refuses_a_room_run_at_admission(research_tools, monkeypatch):
+    from gateway.public_room import ROOM_MOA_ERROR
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: MOA_MODEL)
+    adapter = _make_adapter("room-fixture-key")
+    with no_model_request(), patch.object(adapter, "_create_agent") as create:
+        async with TestClient(TestServer(capabilities_app(adapter)), headers=AUTH) as client:
+            features = (await (await client.get("/v1/capabilities")).json())["features"]
+            assert features["squad_room_isolation"] is None and features[ROOM_RESEARCH_FEATURE] is None
+            for policy in (PUBLIC_ROOM_POLICY, PUBLIC_ROOM_RESEARCH_POLICY):
+                response = await client.post(ROOM_RUN_PATH, json=request_body(policy))
+                error = (await response.json())["error"]
+                assert (response.status, error["message"], error["code"]) == (
+                    400, ROOM_MOA_ERROR, "invalid_room_policy")
+    create.assert_not_called()
+    assert not adapter._run_statuses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delta", [{"provider": "moa"}, {"provider": " MoA "}, {"model": "council"},
+                                   {"model": "council-endpoint"}, {"input": "MOA_TURN"}])
+async def test_a_room_request_for_moa_is_refused_at_admission(research_tools, delta):
+    from gateway.public_room import ROOM_MOA_ERROR
+    if delta.get("input") == "MOA_TURN":
+        delta = {"input": moa_turn()}
+    adapter = _make_adapter("room-fixture-key")
+    # model_routes aliases: one names the provider, one names its virtual endpoint.
+    adapter._model_routes = {"council": {"model": "default", "provider": "moa"},
+                             "council-endpoint": {"model": "default", "base_url": "moa://local"}}
+    with no_model_request(), patch.object(adapter, "_create_agent") as create:
+        async with TestClient(TestServer(_create_runs_app(adapter)), headers=AUTH) as client:
+            for policy in (PUBLIC_ROOM_POLICY, PUBLIC_ROOM_RESEARCH_POLICY):
+                response = await client.post(ROOM_RUN_PATH, json={**request_body(policy), **delta})
+                assert response.status == 400
+                assert (await response.json())["error"]["message"] == ROOM_MOA_ERROR
+            # Without credentials the answer does not depend on the request.
+            anonymous = await client.post(ROOM_RUN_PATH, json={**request_body(), **delta},
+                                          headers={"Authorization": "Bearer wrong"})
+            assert anonymous.status == 401
+    create.assert_not_called()
+    assert not adapter._run_statuses
+
+
+@pytest.mark.asyncio
+async def test_a_moa_runtime_found_after_admission_fails_the_run_without_an_agent(
+        research_tools, monkeypatch):
+    """The configuration names no MoA, and the resolved runtime is MoA."""
+    from gateway.public_room import ROOM_MOA_ERROR
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
+        "api_key": "fixture-only", "base_url": "moa://local", "provider": "moa",
+        "api_mode": "chat_completions"})
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "default")
+    adapter = _make_adapter("room-fixture-key")
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    with no_model_request(), patch("run_agent.AIAgent.__init__") as agent:
+        async with TestClient(TestServer(_create_runs_app(adapter)), headers=AUTH) as client:
+            response = await client.post(ROOM_RUN_PATH, json={**request_body(), "input": ROOM_JSON})
+            assert response.status == 202
+            run = (await response.json())["run_id"]
+            if run in adapter._active_run_tasks:
+                await adapter._active_run_tasks[run]
+            status = await (await client.get(f"/v1/runs/{run}")).json()
+    agent.assert_not_called()
+    assert status["status"] == "failed" and status["error"] == ROOM_MOA_ERROR
+    assert not status.get("output")
+
+
+@pytest.mark.asyncio
+async def test_a_private_conversation_keeps_moa(research_tools, monkeypatch):
+    from gateway.public_room import room_moa_runtime, room_runtime_supported
+    from run_agent import AIAgent
+    # The room rule is about the room only.
+    assert room_moa_runtime("moa") and room_moa_runtime(" MOA ") and room_moa_runtime("", "moa://local")
+    assert not room_moa_runtime("openai", "https://api.openai.com/v1") and not room_moa_runtime(None, None)
+    assert not room_runtime_supported("chat_completions", provider="moa")
+    assert room_runtime_supported("chat_completions", provider="openai")
+    # A private Run on a MoA pod is admitted with the provider it asked for.
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: MOA_MODEL)
+    adapter = _make_adapter("room-fixture-key")
+    created = []
+
+    def create(**kwargs):
+        created.append(kwargs["requested_provider"])
+        return SimpleNamespace(run_conversation=lambda **_: {"final_response": "private reply"},
+                               session_prompt_tokens=0, session_completion_tokens=0,
+                               session_total_tokens=0)
+
+    with patch.object(adapter, "_create_agent", side_effect=create):
+        async with TestClient(TestServer(_create_runs_app(adapter)), headers=AUTH) as client:
+            response = await client.post("/v1/runs", json={"input": moa_turn(), "provider": "moa"})
+            assert response.status == 202
+            run = (await response.json())["run_id"]
+            if run in adapter._active_run_tasks:
+                await adapter._active_run_tasks[run]
+    assert created == ["moa"]
+    # A private one-shot MoA turn still asks its reference models.
+    provider = Provider(lambda n, stream: model_turn(stream=stream, content="A private answer."))
+    agent = AIAgent(api_key="fixture-only", base_url="http://127.0.0.1:1/v1", model="test/model",
+                    quiet_mode=True, skip_memory=True, skip_context_files=True)
+    try:
+        with patch("agent.moa_loop.aggregate_moa_context", return_value="") as one_shot, \
+                patch.object(AIAgent, "_create_request_openai_client", return_value=provider.client), \
+                patch.object(AIAgent, "_close_request_openai_client"):
+            result = agent.run_conversation(moa_turn(), conversation_history=[])
+    finally:
+        agent.close()
+    one_shot.assert_called_once()
+    assert result["final_response"] == "A private answer." and provider.requests == 1

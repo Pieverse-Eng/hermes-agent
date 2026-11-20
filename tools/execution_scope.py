@@ -186,6 +186,17 @@ def public_room_budget_error(agent, name: str):
     return budget.charge(name)
 
 
+def public_room_model_budget(agent):
+    """The budget that the model requests of a room reply spend; None outside a room."""
+    if getattr(agent, "public_room_policy", False) is not True and not is_public_room_scope():
+        return None
+    budget = getattr(agent, "public_room_budget", None)
+    if not isinstance(budget, PublicRoomBudget):
+        # A room Agent without a budget sends nothing.
+        raise PublicRoomModelBudgetExceeded()
+    return budget
+
+
 def charge_public_room_model_request(agent):
     """Count one model request of a room reply. Call it directly before each send.
 
@@ -194,13 +205,9 @@ def charge_public_room_model_request(agent):
     PublicRoomModelBudgetExceeded in place of the request over the cap, so the
     cap holds however the caller handles that error.
     """
-    if getattr(agent, "public_room_policy", False) is not True and not is_public_room_scope():
-        return
-    budget = getattr(agent, "public_room_budget", None)
-    if not isinstance(budget, PublicRoomBudget):
-        # A room Agent without a budget sends nothing.
-        raise PublicRoomModelBudgetExceeded()
-    budget.charge_model_request()
+    budget = public_room_model_budget(agent)
+    if budget is not None:
+        budget.charge_model_request()
 
 @contextmanager
 def proposal_only_scope(enabled: bool, *, host_tools=(), available_tools=None):

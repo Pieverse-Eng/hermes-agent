@@ -1276,8 +1276,12 @@ def run_conversation(
         is_public_room_scope,
     )
     if getattr(agent, "public_room_policy", False) is True or is_public_room_scope():
-        from gateway.public_room import require_room_runtime
+        from gateway.public_room import RoomMoaUnsupported, require_room_runtime, room_moa_turn
         require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
+        # A one-shot MoA turn sends a request to each reference model outside
+        # the count below: a room refuses it before any request.
+        if moa_config is not None or room_moa_turn(user_message):
+            raise RoomMoaUnsupported()
         # One conversation is one room reply: its budget of tool calls and of
         # model requests starts here.
         agent.public_room_budget = PublicRoomBudget()

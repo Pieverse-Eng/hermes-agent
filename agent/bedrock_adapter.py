@@ -31,6 +31,9 @@ import json
 import logging
 import os
 import re
+import weakref
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -95,9 +98,11 @@ def _get_bedrock_runtime_client(region: str):
     """
     if region not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
+        client = boto3.client(
             "bedrock-runtime", region_name=region,
         )
+        # Before the cache gives the client to other threads.
+        _bedrock_runtime_client_cache[region] = _count_room_sends(client)
     return _bedrock_runtime_client_cache[region]
 
 
@@ -131,6 +136,76 @@ def invalidate_runtime_client(region: str) -> bool:
     existed = region in _bedrock_runtime_client_cache
     _bedrock_runtime_client_cache.pop(region, None)
     return existed
+
+
+# ---------------------------------------------------------------------------
+# Model requests of a shared room reply
+# ---------------------------------------------------------------------------
+#
+# One room reply may send a fixed number of model requests
+# (``tools/execution_scope``). boto3 retries inside one SDK call, so a room
+# reply counts each HTTP send, not each call. The runtime client is shared by
+# every conversation of the process: the counter acts only for the thread that
+# is inside ``room_request_scope``, and a private conversation never enters it.
+
+_room_send_budget: ContextVar = ContextVar("bedrock_room_send_budget", default=None)
+_ROOM_SEND_COUNTER = "hermes-public-room-model-requests"
+# The runtime clients that report each send to the counter.
+_send_counting_clients = weakref.WeakSet()
+
+
+def _count_room_send(**_kwargs):
+    """botocore ``before-send``: one model request of the room reply that sends.
+
+    It raises in place of the send over the cap. botocore does not retry that
+    error and gives it to the caller of the SDK.
+    """
+    budget = _room_send_budget.get()
+    if budget is not None:
+        budget.charge_model_request()
+
+
+def _count_room_sends(client):
+    """Register the send counter on a new runtime client and return the client.
+
+    Call it before another thread can use the client. botocore caches the
+    handler list of each event. A registration while another thread emits the
+    event can leave the cached list without the counter.
+    """
+    try:
+        from botocore.hooks import BaseEventHooks
+    except ImportError:
+        return client
+    events = getattr(getattr(client, "meta", None), "events", None)
+    if isinstance(events, BaseEventHooks):
+        events.register("before-send.bedrock-runtime", _count_room_send,
+                        unique_id=_ROOM_SEND_COUNTER)
+        _send_counting_clients.add(client)
+    return client
+
+
+@contextmanager
+def room_request_scope(agent, client):
+    """Count the HTTP sends of the SDK calls in this block against a room reply.
+
+    Outside a room this does nothing.
+    """
+    from tools.execution_scope import public_room_model_budget
+
+    budget = public_room_model_budget(agent)
+    if budget is None:
+        yield
+        return
+    if client not in _send_counting_clients:
+        # The counter does not see the sends of this client: count the call.
+        budget.charge_model_request()
+        yield
+        return
+    token = _room_send_budget.set(budget)
+    try:
+        yield
+    finally:
+        _room_send_budget.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -1496,7 +1571,13 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
     Returns the detected window, or ``None`` if the probe could not run
     (missing credentials, network error, or no parseable limit) so the caller
     can fall back to the static table.
+
+    A shared room reply never probes: each probe tier is a request to the
+    model, with boto3 retries, outside the reply's count of model requests.
     """
+    from tools.execution_scope import is_public_room_scope
+    if is_public_room_scope():
+        return None
     try:
         from agent.model_metadata import parse_context_limit_from_error
     except ImportError:  # pragma: no cover — same package

@@ -3863,6 +3863,17 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.public_room import room_config_supported
         return room_config_supported(_load_gateway_config())
 
+    def _room_moa_requested(self, body) -> bool:
+        """MoA by the pod's configuration, by the provider or model route a request names, or as a one-shot turn."""
+        from gateway.run import _load_gateway_config
+        from gateway.public_room import room_moa_configured, room_moa_runtime, room_moa_turn
+        route = self._resolve_route(body.get("model"))
+        return (room_moa_configured(_load_gateway_config())
+                or room_moa_runtime(_clean_request_string(body.get("provider")))
+                or (isinstance(route, dict)
+                    and room_moa_runtime(route.get("provider"), route.get("base_url")))
+                or room_moa_turn(body.get("input")))
+
     def _room_policy_supported(self, policy) -> bool:
         """v1 needs a qualified runtime; v2 also needs the platform plugin's fixed tools."""
         from gateway.public_room import room_policy_supported
@@ -7447,6 +7458,11 @@ class APIServerAdapter(BasePlatformAdapter):
             auth_error = self._check_auth(request)
             if auth_error is not None:
                 return auth_error
+            if self._room_moa_requested(body):
+                # Before the Run exists: no Agent and no model request.
+                from gateway.public_room import ROOM_MOA_ERROR
+                return web.json_response(_openai_error(ROOM_MOA_ERROR,
+                                                      code="invalid_room_policy"), status=400)
             if not self._room_policy_supported(room_policy):
                 return web.json_response(_openai_error("Room runtime is unsupported",
                                                       code="invalid_room_policy"), status=400)

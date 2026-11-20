@@ -111,15 +111,32 @@ does not make the closing summary request that a private conversation makes at
 its iteration limit: a reply that reaches the limit without an answer fails
 with the same error.
 
-The count covers the requests for the Agent's own model. These are outside it:
+A counted request is one HTTP send. Hermes turns SDK retries off for its
+OpenAI-compatible and Anthropic clients. boto3 retries inside one SDK call, so
+for Bedrock a botocore `before-send` handler counts each send
+(`room_request_scope` in `agent/bedrock_adapter.py`) and refuses send 17
+before it leaves. The runtime client is shared by every conversation of the
+process. Hermes registers the handler when it builds the client, before
+another thread can use it. The handler acts only for the thread that is inside
+the SDK call of a room reply, and does nothing for a private conversation.
 
-- Context compaction and the session title use Hermes' auxiliary model, as
-  they do for each API session.
-- With the `moa` virtual provider, one counted request is one MoA dispatch,
-  which calls each model of the owner's preset.
-- Hermes turns SDK retries off for its OpenAI-compatible and Anthropic clients,
-  so one counted request is one HTTP request there. boto3 keeps its own retry
-  setting inside one counted Bedrock request.
+A room does not probe the context window of a Bedrock model. Each probe tier
+is a request to the model, and boto3 can retry it. A room uses the cached
+window or the static table, and it does not save the table value.
+
+A room does not run MoA: one MoA call sends a request to each reference model
+and then to the aggregator. Capabilities declare no room policy on a pod whose
+configuration names the `moa` provider. Admission refuses a room Run with 400
+and the fixed error `Shared rooms do not run MoA.` for that configuration, for
+a request that names the provider, for a `model_routes` alias that names it,
+and for a one-shot MoA turn (the hidden marker of `/moa`). The Agent
+constructor and the turn entry refuse the same cases. A MoA runtime that only
+the runtime resolution finds therefore fails its Run with that error before an
+Agent exists. No case sends a model request. Private conversations keep MoA.
+
+The count covers the requests for the Agent's own model. Context compaction
+and the session title are outside it: they use Hermes' auxiliary model, as
+they do for each API session.
 
 Qualification for v2 uses `tests/gateway/test_public_room_research.py`. It
 includes a native Run with stubbed inference that proves the fixed rules and
