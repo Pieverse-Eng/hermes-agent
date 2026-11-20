@@ -1269,6 +1269,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         writer_token = {"value": None}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+            from tools.execution_scope import charge_public_room_model_request
+            charge_public_room_model_request(agent)
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
             return active_client.responses.create(**stream_kwargs)

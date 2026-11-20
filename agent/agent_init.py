@@ -617,7 +617,7 @@ def init_agent(
     if agent.public_room_policy:
         from tools.execution_scope import (
             PUBLIC_ROOM_MAX_ITERATIONS, PUBLIC_ROOM_POLICIES, PUBLIC_ROOM_TOOL_TOOLSETS,
-            PublicRoomToolBudget,
+            PublicRoomBudget,
         )
         # A fallback may select a subprocess provider outside this policy.
         fallback_model = None
@@ -630,8 +630,8 @@ def init_agent(
         enabled_toolsets = sorted({PUBLIC_ROOM_TOOL_TOOLSETS[name]
                                    for name in PUBLIC_ROOM_POLICIES[agent.public_room_policy_id]})
         # Tool output is untrusted and can ask for more calls: one reply has a
-        # fixed budget of tool calls and of model calls.
-        agent.public_room_budget = PublicRoomToolBudget()
+        # fixed budget of tool calls and of model requests.
+        agent.public_room_budget = PublicRoomBudget()
         agent.max_iterations = min(agent.max_iterations, PUBLIC_ROOM_MAX_ITERATIONS)
         agent.iteration_budget = IterationBudget(agent.max_iterations)
     agent.skip_context_files = skip_context_files

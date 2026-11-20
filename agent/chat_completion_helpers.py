@@ -479,6 +479,11 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             "anthropic_messages_request", kind="anthropic_messages"
         )
         return agent._anthropic_messages_create(api_kwargs, client=request_client)
+    # A room reply counts each request to the model provider. The Codex and
+    # Anthropic helpers above count where they send, because one call of them
+    # can send twice. Each branch below sends exactly once.
+    from tools.execution_scope import charge_public_room_model_request
+    charge_public_room_model_request(agent)
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
         # normalize_converse_response produces an OpenAI-compatible
@@ -2613,6 +2618,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 writer_token = {"value": None}
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
+                    from tools.execution_scope import charge_public_room_model_request
+                    charge_public_room_model_request(agent)
                     final_kwargs = dict(next_api_kwargs)
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
                     final_kwargs.pop("__bedrock_converse__", None)
@@ -2636,6 +2643,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
+                            # The denied stream was one request; this is the next.
+                            charge_public_room_model_request(agent)
                             return normalize_converse_response(
                                 client.converse(**final_kwargs)
                             )
@@ -3079,6 +3088,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_request_client = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            from tools.execution_scope import charge_public_room_model_request
+            charge_public_room_model_request(agent)
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
@@ -3580,6 +3591,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
+            from tools.execution_scope import charge_public_room_model_request
+            charge_public_room_model_request(agent)
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(
                 final_kwargs,

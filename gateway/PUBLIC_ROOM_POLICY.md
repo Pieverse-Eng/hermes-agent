@@ -97,8 +97,29 @@ with evidence, counter-evidence and source times, and forbids order advice
 Tool output is untrusted data. One room reply (both policies) has at most 12
 tool calls and at most 4 paid searches (`search_web` and `search_x` together).
 The Agent-local tool boundary charges the budget once for each admitted call;
-a refused call returns `public_room_tool_budget` and enters no handler. One
-reply also has at most 16 model calls.
+a refused call returns `public_room_tool_budget` and enters no handler.
+
+One room reply (both policies) also sends at most 16 model requests. Hermes
+counts a request directly before it calls the provider SDK
+(`charge_public_room_model_request`), so each attempt is a request: a first
+try, a retry after a provider error, a stream reconnect, and the non-streaming
+fallback after a refused stream. Hermes does not send the request after the
+sixteenth. The Run then fails with the fixed error `Shared room reply stopped:
+this reply used all 16 of its model requests.` and has no output, so the
+platform publishes nothing. The loop has the same limit of 16 turns. A room Run
+does not make the closing summary request that a private conversation makes at
+its iteration limit: a reply that reaches the limit without an answer fails
+with the same error.
+
+The count covers the requests for the Agent's own model. These are outside it:
+
+- Context compaction and the session title use Hermes' auxiliary model, as
+  they do for each API session.
+- With the `moa` virtual provider, one counted request is one MoA dispatch,
+  which calls each model of the owner's preset.
+- Hermes turns SDK retries off for its OpenAI-compatible and Anthropic clients,
+  so one counted request is one HTTP request there. boto3 keeps its own retry
+  setting inside one counted Bedrock request.
 
 Qualification for v2 uses `tests/gateway/test_public_room_research.py`. It
 includes a native Run with stubbed inference that proves the fixed rules and

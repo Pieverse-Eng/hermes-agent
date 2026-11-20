@@ -43,8 +43,16 @@ PUBLIC_ROOM_SEARCH_TOOL_NAMES = frozenset({"search_web", "search_x"})
 PUBLIC_ROOM_OPTIONAL_TOOL_NAMES = frozenset({"search_x"})
 PUBLIC_ROOM_MAX_TOOL_CALLS = 12
 PUBLIC_ROOM_MAX_SEARCH_CALLS = 4
-# Model calls of one reply: every tool call plus refusals and the final answer.
-PUBLIC_ROOM_MAX_ITERATIONS = PUBLIC_ROOM_MAX_TOOL_CALLS + 4
+# Requests to the model provider of one reply: every tool call plus refusals
+# and the final answer. A retry and a stream reconnect are requests too.
+PUBLIC_ROOM_MAX_MODEL_REQUESTS = PUBLIC_ROOM_MAX_TOOL_CALLS + 4
+# The loop never turns more often than it may ask the model.
+PUBLIC_ROOM_MAX_ITERATIONS = PUBLIC_ROOM_MAX_MODEL_REQUESTS
+# The whole error of a Run that used its model requests. It names no provider,
+# no request and no room text, and it matches no provider error pattern.
+PUBLIC_ROOM_MODEL_BUDGET_ERROR = (
+    f"Shared room reply stopped: this reply used all {PUBLIC_ROOM_MAX_MODEL_REQUESTS} "
+    "of its model requests.")
 PUBLIC_ROOM_POLICIES = MappingProxyType({
     PUBLIC_ROOM_POLICY: PUBLIC_ROOM_TOOL_NAMES,
     PUBLIC_ROOM_RESEARCH_POLICY: PUBLIC_ROOM_RESEARCH_TOOL_NAMES,
@@ -120,13 +128,32 @@ def public_room_research_tools():
     return registered if required <= registered else None
 
 
-class PublicRoomToolBudget:
-    """Tool calls of one room reply. Tool output is untrusted and can ask for more calls."""
+class PublicRoomModelBudgetExceeded(Exception):
+    """One room reply asked for more model requests than its budget has."""
 
-    def __init__(self, max_calls=PUBLIC_ROOM_MAX_TOOL_CALLS, max_searches=PUBLIC_ROOM_MAX_SEARCH_CALLS):
-        self.max_calls, self.max_searches = max_calls, max_searches
-        self.calls = self.searches = 0
+    def __init__(self):
+        super().__init__(PUBLIC_ROOM_MODEL_BUDGET_ERROR)
+
+
+class PublicRoomBudget:
+    """Tool calls and model requests of one room reply.
+
+    Tool output is untrusted and can ask for more calls. A provider that fails
+    can ask for more requests. Neither changes what one reply may spend.
+    """
+
+    def __init__(self, max_calls=PUBLIC_ROOM_MAX_TOOL_CALLS, max_searches=PUBLIC_ROOM_MAX_SEARCH_CALLS,
+                 max_requests=PUBLIC_ROOM_MAX_MODEL_REQUESTS):
+        self.max_calls, self.max_searches, self.max_requests = max_calls, max_searches, max_requests
+        self.calls = self.searches = self.requests = 0
         self._lock = threading.Lock()
+
+    def charge_model_request(self):
+        """Count one request to the model provider; refuse the one over the cap."""
+        with self._lock:
+            if self.requests >= self.max_requests:
+                raise PublicRoomModelBudgetExceeded()
+            self.requests += 1
 
     def charge(self, name: str):
         """Count one admitted call; return a refusal when the reply is over a cap."""
@@ -149,14 +176,31 @@ class PublicRoomToolBudget:
 def public_room_budget_error(agent, name: str):
     """Charge the Agent's reply budget at the Agent-local dispatch boundary."""
     budget = getattr(agent, "public_room_budget", None)
-    if not isinstance(budget, PublicRoomToolBudget):
-        budget = PublicRoomToolBudget()
+    if not isinstance(budget, PublicRoomBudget):
+        budget = PublicRoomBudget()
         try:
             agent.public_room_budget = budget
         except Exception:
             return json.dumps({"error": "Shared room tool budget is unavailable.",
                                "error_type": "public_room_tool_budget", "tool": name, "limit": 0})
     return budget.charge(name)
+
+
+def charge_public_room_model_request(agent):
+    """Count one model request of a room reply. Call it directly before each send.
+
+    Every attempt is a request: a first try, a retry after a provider error and
+    a stream reconnect. Outside a room this does nothing. In a room it raises
+    PublicRoomModelBudgetExceeded in place of the request over the cap, so the
+    cap holds however the caller handles that error.
+    """
+    if getattr(agent, "public_room_policy", False) is not True and not is_public_room_scope():
+        return
+    budget = getattr(agent, "public_room_budget", None)
+    if not isinstance(budget, PublicRoomBudget):
+        # A room Agent without a budget sends nothing.
+        raise PublicRoomModelBudgetExceeded()
+    budget.charge_model_request()
 
 @contextmanager
 def proposal_only_scope(enabled: bool, *, host_tools=(), available_tools=None):

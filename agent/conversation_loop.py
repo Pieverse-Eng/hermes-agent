@@ -1271,13 +1271,16 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    from tools.execution_scope import is_public_room_scope
+    from tools.execution_scope import (
+        PUBLIC_ROOM_MODEL_BUDGET_ERROR, PublicRoomBudget, PublicRoomModelBudgetExceeded,
+        is_public_room_scope,
+    )
     if getattr(agent, "public_room_policy", False) is True or is_public_room_scope():
         from gateway.public_room import require_room_runtime
         require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
-        # One conversation is one room reply: its tool-call budget starts here.
-        from tools.execution_scope import PublicRoomToolBudget
-        agent.public_room_budget = PublicRoomToolBudget()
+        # One conversation is one room reply: its budget of tool calls and of
+        # model requests starts here.
+        agent.public_room_budget = PublicRoomBudget()
 
     if moa_config is None:
         try:
@@ -3529,6 +3532,25 @@ def run_conversation(
                     final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
                 agent._persist_session(messages, conversation_history)
                 break
+
+            except PublicRoomModelBudgetExceeded:
+                # A room reply used all of its model requests, retries
+                # included, and Hermes did not send the request over the cap.
+                # Stop here: no retry, no fallback and no text for the room.
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": None,
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": True,
+                    "error": PUBLIC_ROOM_MODEL_BUDGET_ERROR,
+                }
 
             except Exception as api_error:
                 # Stop spinner silently — retry status is buffered and

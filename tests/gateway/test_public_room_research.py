@@ -7,6 +7,7 @@ declared under its own feature key. Tests stub inference; no paid model call.
 import asyncio
 import json
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
@@ -19,7 +20,8 @@ from gateway.public_room import (
     SESSION_PREFIX, room_capability, room_research_capability,
 )
 from tools.execution_scope import (
-    PUBLIC_ROOM_MAX_ITERATIONS, PUBLIC_ROOM_MAX_SEARCH_CALLS, PUBLIC_ROOM_MAX_TOOL_CALLS,
+    PUBLIC_ROOM_MAX_ITERATIONS, PUBLIC_ROOM_MAX_MODEL_REQUESTS, PUBLIC_ROOM_MAX_SEARCH_CALLS,
+    PUBLIC_ROOM_MAX_TOOL_CALLS, PUBLIC_ROOM_MODEL_BUDGET_ERROR,
     PUBLIC_ROOM_ONLY_TOOLSET, PUBLIC_ROOM_POLICY, PUBLIC_ROOM_RESEARCH_POLICY,
     PUBLIC_ROOM_RESEARCH_TOOL_NAMES, PUBLIC_ROOM_SEARCH_TOOL_NAMES, PUBLIC_ROOM_TOOLSET,
     PUBLIC_ROOM_TOOL_TOOLSETS, execution_scope_error, is_public_room_scope,
@@ -806,13 +808,16 @@ def test_a_model_that_never_stops_calling_tools_is_cut_off(research_tools):
     assert research_tools["search_web"].call_count == PUBLIC_ROOM_MAX_SEARCH_CALLS
     assert sum(handler.call_count for handler in research_tools.values()) == PUBLIC_ROOM_MAX_TOOL_CALLS
     assert (agent.public_room_budget.calls, agent.public_room_budget.searches) == (12, 4)
-    # Sixteen model calls with tools, then at most one closing call without tools.
-    assert PUBLIC_ROOM_MAX_ITERATIONS <= len(model_calls) <= PUBLIC_ROOM_MAX_ITERATIONS + 1
-    assert all(set(tools) == PUBLIC_ROOM_RESEARCH_TOOL_NAMES
-               for tools in model_calls[:PUBLIC_ROOM_MAX_ITERATIONS])
+    # Sixteen model calls with tools, and no closing call without tools.
+    assert len(model_calls) == PUBLIC_ROOM_MAX_ITERATIONS
+    assert all(set(tools) == PUBLIC_ROOM_RESEARCH_TOOL_NAMES for tools in model_calls)
     refusals = [json.loads(m["content"]) for m in result["messages"]
                 if m.get("role") == "tool" and "public_room_tool_budget" in str(m.get("content"))]
     assert refusals and {r["limit"] for r in refusals} <= {4, 12}
+    # A reply without an answer fails; Hermes writes no text of its own for the room.
+    assert result["failed"] is True and result["completed"] is False
+    assert result["error"] == PUBLIC_ROOM_MODEL_BUDGET_ERROR
+    assert result["final_response"] is None
 
 
 def test_each_reply_of_a_reused_agent_starts_a_new_budget(research_tools):
@@ -839,3 +844,329 @@ def test_a_v1_room_prompt_and_wire_are_unchanged():
     assert "Use only public market discovery." in PUBLIC_ROOM_PROMPT
     assert "bullish" not in PUBLIC_ROOM_PROMPT and PUBLIC_ROOM_PROMPT != PUBLIC_ROOM_RESEARCH_PROMPT
     assert PUBLIC_ROOM_RESEARCH_PROMPT.isascii() and len(PUBLIC_ROOM_RESEARCH_PROMPT) < 6000
+
+
+# --- Model requests of one reply: every attempt counts ---------------------------
+
+REQUEST = {"model": "test/model", "messages": [{"role": "user", "content": "public"}]}
+
+
+def model_turn(*, stream, content=None, tool=None, turn=1):
+    """One model turn, as a stream of chunks or as one response."""
+    arguments = json.dumps({"ticker": f"T{turn}"})
+    finish = "tool_calls" if tool else "stop"
+    if not stream:
+        calls = [SimpleNamespace(id=f"call_{turn}", type="function",
+                                 function=SimpleNamespace(name=tool, arguments=arguments))] if tool else None
+        message = SimpleNamespace(content=content, tool_calls=calls)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=finish)],
+                               model="test/model", usage=None)
+
+    def chunk(finish_reason, text=None, tool_calls=None):
+        delta = SimpleNamespace(content=text, tool_calls=tool_calls, reasoning_content=None,
+                                reasoning=None)
+        return SimpleNamespace(model="test/model", usage=None, choices=[
+            SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)])
+
+    calls = [SimpleNamespace(index=0, id=f"call_{turn}",
+                             function=SimpleNamespace(name=tool, arguments=arguments))] if tool else None
+    return iter([chunk(None, content, calls), chunk(finish)])
+
+
+def server_error():
+    import httpx
+    import openai
+    request = httpx.Request("POST", "http://127.0.0.1:1/v1/chat/completions")
+    return openai.InternalServerError("upstream unavailable",
+                                      response=httpx.Response(500, request=request), body=None)
+
+
+def connection_error():
+    import httpx
+    return httpx.ConnectError("connection refused")
+
+
+class Provider:
+    """The model provider behind Hermes' request client: `reply(n, stream)` answers request n."""
+
+    def __init__(self, reply):
+        self.reply, self.requests = reply, 0
+        self.client = Mock()
+        self.client.chat.completions.create.side_effect = self.create
+
+    def create(self, **kwargs):
+        self.requests += 1
+        return self.reply(self.requests, bool(kwargs.get("stream")))
+
+
+def flaky(failure, tool="market_snapshot"):
+    """Answer each third request with a tool call and fail the two before it."""
+    def reply(n, stream):
+        if n % 3:
+            raise failure()
+        return model_turn(stream=stream, tool=tool, turn=n // 3)
+    return reply
+
+
+def converse(agent, provider, *, stream=True):
+    """One reply of a real Agent whose requests reach `provider`; returns (result, closing summary)."""
+    from run_agent import AIAgent
+    agent._disable_streaming = not stream
+    with patch.object(AIAgent, "_create_request_openai_client", return_value=provider.client), \
+         patch.object(AIAgent, "_close_request_openai_client"), \
+         patch.object(AIAgent, "_handle_max_iterations", return_value="A closing summary.") as closing:
+        return agent.run_conversation(ROOM_JSON, conversation_history=[]), closing
+
+
+def test_a_reply_has_a_fixed_number_of_model_requests():
+    from tools.execution_scope import PublicRoomBudget, PublicRoomModelBudgetExceeded
+    budget = PublicRoomBudget()
+    for _ in range(PUBLIC_ROOM_MAX_MODEL_REQUESTS):
+        budget.charge_model_request()
+    for _ in range(3):
+        with pytest.raises(PublicRoomModelBudgetExceeded) as refused:
+            budget.charge_model_request()
+        # The whole error is fixed text.
+        assert str(refused.value) == PUBLIC_ROOM_MODEL_BUDGET_ERROR
+    assert budget.requests == PUBLIC_ROOM_MAX_MODEL_REQUESTS == PUBLIC_ROOM_MAX_ITERATIONS == 16
+    assert PUBLIC_ROOM_MODEL_BUDGET_ERROR == (
+        "Shared room reply stopped: this reply used all 16 of its model requests.")
+    # Tool calls and model requests are separate counts.
+    assert (budget.calls, budget.searches) == (0, 0)
+    assert budget.charge("market_snapshot") is None and budget.requests == 16
+
+
+def test_parallel_model_requests_cannot_pass_the_cap():
+    from tools.execution_scope import PublicRoomBudget, PublicRoomModelBudgetExceeded
+    budget, refused, start = PublicRoomBudget(), [], threading.Barrier(40)
+
+    def send():
+        start.wait()
+        try:
+            budget.charge_model_request()
+        except PublicRoomModelBudgetExceeded:
+            refused.append(1)
+
+    threads = [threading.Thread(target=send) for _ in range(40)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert (budget.requests, len(refused)) == (PUBLIC_ROOM_MAX_MODEL_REQUESTS, 24)
+
+
+def test_the_model_request_count_binds_room_agents_only():
+    from tools.execution_scope import (
+        PublicRoomBudget, PublicRoomModelBudgetExceeded, charge_public_room_model_request,
+    )
+    # A private conversation has no such count.
+    for private in (SimpleNamespace(public_room_policy=False, public_room_budget=None), object()):
+        for _ in range(PUBLIC_ROOM_MAX_MODEL_REQUESTS + 4):
+            charge_public_room_model_request(private)
+    room = SimpleNamespace(public_room_policy=True, public_room_budget=PublicRoomBudget())
+    charge_public_room_model_request(room)
+    assert room.public_room_budget.requests == 1
+    # A room Agent without its budget sends nothing.
+    for broken in (None, object(), 16):
+        with pytest.raises(PublicRoomModelBudgetExceeded):
+            charge_public_room_model_request(
+                SimpleNamespace(public_room_policy=True, public_room_budget=broken))
+    # The ambient room scope binds an Agent that does not carry the flag.
+    with public_room_scope(True, policy=PUBLIC_ROOM_RESEARCH_POLICY):
+        ambient = SimpleNamespace(public_room_budget=PublicRoomBudget())
+        charge_public_room_model_request(ambient)
+        assert ambient.public_room_budget.requests == 1
+        with pytest.raises(PublicRoomModelBudgetExceeded):
+            charge_public_room_model_request(SimpleNamespace())
+
+
+@pytest.mark.parametrize("failure,stream", [
+    (server_error, True),      # the conversation loop retries the call
+    (connection_error, True),  # the stream reconnects inside one call
+    (server_error, False),     # the loop retries a non-streaming call
+])
+def test_provider_retries_cannot_send_more_than_the_model_request_cap(
+        research_tools, monkeypatch, failure, stream):
+    """Sixteen turns with two failed attempts each would be 48 requests."""
+    monkeypatch.setattr("agent.conversation_loop.jittered_backoff", lambda *a, **k: 0.0)
+    provider = Provider(flaky(failure))
+    with public_room_scope(True, policy=PUBLIC_ROOM_RESEARCH_POLICY):
+        agent = research_agent()
+        try:
+            result, closing_summary = converse(agent, provider, stream=stream)
+        finally:
+            agent.close()
+    # Hermes sent exactly the cap: five answered turns of three requests, then one.
+    assert provider.requests == PUBLIC_ROOM_MAX_MODEL_REQUESTS == 16
+    assert agent.public_room_budget.requests == PUBLIC_ROOM_MAX_MODEL_REQUESTS
+    assert research_tools["market_snapshot"].call_count == 5
+    # The Run fails with the fixed error and has no text for the room.
+    assert result["failed"] is True and result["completed"] is False
+    assert result["error"] == PUBLIC_ROOM_MODEL_BUDGET_ERROR
+    assert result["final_response"] is None
+    closing_summary.assert_not_called()
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_each_request_of_a_healthy_reply_counts_once(research_tools, stream):
+    provider = Provider(lambda n, as_stream: (
+        model_turn(stream=as_stream, tool="market_snapshot") if n == 1
+        else model_turn(stream=as_stream, content="Funding looks neutral.")))
+    with public_room_scope(True, policy=PUBLIC_ROOM_RESEARCH_POLICY):
+        agent = research_agent()
+        try:
+            result, closing_summary = converse(agent, provider, stream=stream)
+        finally:
+            agent.close()
+    assert result["final_response"] == "Funding looks neutral." and result["completed"] is True
+    assert provider.requests == 2 == agent.public_room_budget.requests
+    research_tools["market_snapshot"].assert_called_once()
+    closing_summary.assert_not_called()
+
+
+def test_a_private_conversation_has_no_model_request_count_and_keeps_its_closing_summary():
+    """The count and the missing closing summary are room rules only."""
+    from run_agent import AIAgent
+    provider = Provider(lambda n, stream: model_turn(stream=stream, tool="todo", turn=n))
+    agent = AIAgent(api_key="fixture-only", base_url="http://127.0.0.1:1/v1", model="test/model",
+                    quiet_mode=True, max_iterations=1, skip_memory=True, skip_context_files=True)
+    try:
+        assert agent.public_room_policy is False and agent.public_room_budget is None
+        with patch.object(AIAgent, "_create_request_openai_client", return_value=provider.client), \
+             patch.object(AIAgent, "_close_request_openai_client"):
+            # More requests than a room reply may send, on both request paths.
+            for _ in range(PUBLIC_ROOM_MAX_MODEL_REQUESTS + 1):
+                agent._interruptible_api_call(dict(REQUEST))
+                agent._interruptible_streaming_api_call(dict(REQUEST))
+        assert provider.requests == 2 * (PUBLIC_ROOM_MAX_MODEL_REQUESTS + 1)
+        result, closing_summary = converse(agent, provider)
+    finally:
+        agent.close()
+    # At its iteration limit a private conversation still asks for the closing summary.
+    closing_summary.assert_called_once()
+    assert result["final_response"] == "A closing summary." and not result["failed"]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_uses_its_model_requests_is_a_failed_run_without_output(
+        research_tools, monkeypatch):
+    from run_agent import AIAgent
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
+        "api_key": "fixture-only", "base_url": "http://127.0.0.1:1/v1", "provider": "openai",
+        "api_mode": "chat_completions"})
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test/model")
+    monkeypatch.setattr("agent.conversation_loop.jittered_backoff", lambda *a, **k: 0.0)
+    provider = Provider(flaky(server_error))
+    adapter = _make_adapter("room-fixture-key")
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    with patch.object(AIAgent, "_create_request_openai_client", return_value=provider.client), \
+         patch.object(AIAgent, "_close_request_openai_client"), \
+         patch.object(adapter, "_maybe_auto_title") as title:
+        async with TestClient(TestServer(_create_runs_app(adapter)), headers=AUTH) as client:
+            response = await client.post(ROOM_RUN_PATH, json={**request_body(), "input": ROOM_JSON})
+            assert response.status == 202
+            run = (await response.json())["run_id"]
+            if run in adapter._active_run_tasks:
+                await adapter._active_run_tasks[run]
+            status = await (await client.get(f"/v1/runs/{run}")).json()
+    assert provider.requests == PUBLIC_ROOM_MAX_MODEL_REQUESTS
+    # The platform publishes only the output of a completed Run: this Run has none.
+    assert status["status"] == "failed" and status["error"] == PUBLIC_ROOM_MODEL_BUDGET_ERROR
+    assert not status.get("output")
+    title.assert_not_called()
+
+
+# Each place where Hermes sends a model request refuses the request over the cap.
+
+
+@contextmanager
+def room_model_agent(api_mode="chat_completions", *, left=0):
+    """A real room Agent with `left` model requests of its reply remaining."""
+    with public_room_scope(True, policy=PUBLIC_ROOM_RESEARCH_POLICY):
+        agent = research_agent()
+        agent.api_mode = api_mode
+        agent.public_room_budget.requests = PUBLIC_ROOM_MAX_MODEL_REQUESTS - left
+        try:
+            yield agent
+        finally:
+            agent.close()
+
+
+def refused(agent, send):
+    from tools.execution_scope import PublicRoomModelBudgetExceeded
+    with pytest.raises(PublicRoomModelBudgetExceeded):
+        send()
+    assert agent.public_room_budget.requests == PUBLIC_ROOM_MAX_MODEL_REQUESTS
+
+
+def entry(agent, stream):
+    return agent._interruptible_streaming_api_call if stream else agent._interruptible_api_call
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_a_spent_reply_sends_no_chat_completions_request(research_tools, stream):
+    from run_agent import AIAgent
+    with room_model_agent() as agent, \
+         patch.object(AIAgent, "_create_request_openai_client") as client, \
+         patch.object(AIAgent, "_close_request_openai_client"):
+        refused(agent, lambda: entry(agent, stream)(dict(REQUEST)))
+    client.assert_not_called()
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_a_spent_reply_sends_no_anthropic_request(research_tools, stream):
+    from run_agent import AIAgent
+    client = Mock()
+    with room_model_agent("anthropic_messages") as agent, \
+         patch.object(AIAgent, "_create_request_anthropic_client", return_value=client), \
+         patch.object(AIAgent, "_close_request_anthropic_client"):
+        refused(agent, lambda: entry(agent, stream)(dict(REQUEST)))
+    client.messages.stream.assert_not_called()
+    client.messages.create.assert_not_called()
+
+
+def test_the_anthropic_fallback_after_a_refused_stream_is_a_request_too(research_tools):
+    from run_agent import AIAgent
+    client = Mock()
+    client.messages.stream.side_effect = Exception("Streaming is not supported for this model")
+    with room_model_agent("anthropic_messages", left=1) as agent, \
+         patch.object(AIAgent, "_create_request_anthropic_client", return_value=client), \
+         patch.object(AIAgent, "_close_request_anthropic_client"):
+        refused(agent, lambda: agent._interruptible_api_call(dict(REQUEST)))
+    client.messages.stream.assert_called_once()
+    client.messages.create.assert_not_called()
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_a_spent_reply_sends_no_bedrock_request(research_tools, stream):
+    client = Mock()
+    with room_model_agent("bedrock_converse") as agent, \
+         patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=client):
+        refused(agent, lambda: entry(agent, stream)({"modelId": "test/model", "messages": []}))
+    client.converse_stream.assert_not_called()
+    client.converse.assert_not_called()
+
+
+def test_the_bedrock_fallback_after_a_denied_stream_is_a_request_too(research_tools):
+    client = Mock()
+    client.converse_stream.side_effect = Exception(
+        "User is not authorized to perform: bedrock:InvokeModelWithResponseStream")
+    with room_model_agent("bedrock_converse", left=1) as agent, \
+         patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=client):
+        refused(agent, lambda: agent._interruptible_streaming_api_call(
+            {"modelId": "test/model", "messages": []}))
+    client.converse_stream.assert_called_once()
+    client.converse.assert_not_called()
+
+
+def test_a_spent_reply_sends_no_codex_request_and_a_reconnect_is_a_request_too(research_tools):
+    client = Mock()
+    request = {"model": "test/model", "input": []}
+    with room_model_agent("codex_responses") as agent:
+        refused(agent, lambda: agent._run_codex_stream(dict(request), client=client))
+        client.responses.create.assert_not_called()
+        # One request left: Hermes sends it, and refuses the reconnect after the drop.
+        agent.public_room_budget.requests = PUBLIC_ROOM_MAX_MODEL_REQUESTS - 1
+        client.responses.create.side_effect = connection_error()
+        refused(agent, lambda: agent._run_codex_stream(dict(request), client=client))
+    client.responses.create.assert_called_once()

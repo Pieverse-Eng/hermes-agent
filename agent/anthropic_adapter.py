@@ -3108,6 +3108,7 @@ def create_anthropic_message(
     prefer_stream: bool = True,
     on_stream_event=None,
     on_response=None,
+    before_request=None,
 ) -> Any:
     """Create an Anthropic message, aggregating via stream when available.
 
@@ -3131,6 +3132,10 @@ def create_anthropic_message(
     parsed ``Message`` drops — Nous Portal's ``x-nous-credits-*`` balance family
     in particular. Only fires on the streaming path, which is the one the main
     turn loop takes.
+
+    ``before_request``: optional callable invoked directly before each request
+    this helper sends: the stream, and the ``create()`` fallback after a
+    refused stream. An exception it raises stops that request and propagates.
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
@@ -3139,6 +3144,8 @@ def create_anthropic_message(
     if prefer_stream and callable(stream_fn):
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
+        if callable(before_request):
+            before_request()
         try:
             with stream_fn(**stream_kwargs) as stream:
                 if callable(on_response):
@@ -3174,4 +3181,6 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
+    if callable(before_request):
+        before_request()
     return messages_api.create(**create_kwargs)

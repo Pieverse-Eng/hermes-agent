@@ -53,6 +53,12 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+def _is_public_room(agent) -> bool:
+    """Whether this turn is one reply in a shared room (``tools/execution_scope``)."""
+    from tools.execution_scope import is_public_room_scope
+    return getattr(agent, "public_room_policy", False) is True or is_public_room_scope()
+
+
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 
@@ -109,6 +115,7 @@ def finalize_turn(
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False
+    room_model_budget_stop = False
     if continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
@@ -124,6 +131,13 @@ def finalize_turn(
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
+    elif final_response is None and budget_fallback_eligible and _is_public_room(agent):
+        # A room reply has a fixed number of model requests. Its loop ended
+        # without an answer: do not ask the model for a closing summary, fail
+        # the Run and give the room no text.
+        _turn_exit_reason = "public_room_model_budget"
+        failed = True
+        room_model_budget_stop = True
     elif final_response is None and budget_fallback_eligible:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
@@ -672,6 +686,9 @@ def finalize_turn(
         result["error"] = final_response or (
             "session storage could not be written — free disk space and try again"
         )
+    if room_model_budget_stop:
+        from tools.execution_scope import PUBLIC_ROOM_MODEL_BUDGET_ERROR
+        result["error"] = PUBLIC_ROOM_MODEL_BUDGET_ERROR
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).
