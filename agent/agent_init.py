@@ -608,9 +608,17 @@ def init_agent(
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
-    from tools.execution_scope import is_public_room_scope
+    from tools.execution_scope import is_public_room_scope, public_room_policy
     agent.public_room_policy = is_public_room_scope()
+    # The Agent keeps its policy id, so its own tool boundary restores the same
+    # allowlist when ambient context is lost. `public_room_policy` stays a bool.
+    agent.public_room_policy_id = public_room_policy()
+    agent.public_room_budget = None
     if agent.public_room_policy:
+        from tools.execution_scope import (
+            PUBLIC_ROOM_MAX_ITERATIONS, PUBLIC_ROOM_POLICIES, PUBLIC_ROOM_TOOL_TOOLSETS,
+            PublicRoomBudget,
+        )
         # A fallback may select a subprocess provider outside this policy.
         fallback_model = None
         if api_mode is not None:
@@ -619,7 +627,13 @@ def init_agent(
         skip_context_files = True
         skip_memory = True
         load_soul_identity = False
-        enabled_toolsets = ["pieverse-market-research"]
+        enabled_toolsets = sorted({PUBLIC_ROOM_TOOL_TOOLSETS[name]
+                                   for name in PUBLIC_ROOM_POLICIES[agent.public_room_policy_id]})
+        # Tool output is untrusted and can ask for more calls: one reply has a
+        # fixed budget of tool calls and of model requests.
+        agent.public_room_budget = PublicRoomBudget()
+        agent.max_iterations = min(agent.max_iterations, PUBLIC_ROOM_MAX_ITERATIONS)
+        agent.iteration_budget = IterationBudget(agent.max_iterations)
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id

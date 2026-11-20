@@ -52,5 +52,95 @@ Runs and durable replay. Tests use isolated homes and fixture credentials and st
 they make no paid model call. Use `scripts/run_tests.sh -j 1` under the host's
 resource limits.
 
+## Research policy v2
+
+`POST /v1/room-runs` also accepts `room_policy: "squad-public-research-v2"`.
+The v1 declaration above stays byte-identical, because a deployed platform
+validates it with a strict schema. v2 has its own key,
+`features.squad_room_research_v2`:
+
+```json
+{"policy":"squad-public-research-v2","run_path":"/v1/room-runs","memory":false,"context_files":false,"skills":false,"mcp":false,"tools":["compare_trade_routes","discover_markets","market_candles","market_snapshot","onchain_token","plan_spot_purchase","search_news","search_web"],"search_tools":["search_web"],"max_tool_calls":12,"max_search_calls":4}
+```
+
+The key is `null` until the platform plugin registered every required tool, so
+a Hermes that knows the policy but runs with an older plugin keeps v1. A v2
+request to such a pod gets 400 `invalid_room_policy`. `search_x` is optional:
+the platform has no X search route for hosted instances yet. When the plugin
+registers it, `tools` and `search_tools` list it and the search cap covers it.
+A later policy needs another key; never change a declared one.
+
+v2 keeps every v1 exclusion. Admission, the dedicated session, the runtime
+checks, the hook and middleware suppression, and the memory, context-file,
+SOUL, skill and MCP exclusions run on the same code paths for both policies:
+`public_room_policy` stays a boolean, and `public_room_policy_id` selects only
+the prompt and the allowlist. A nested scope can narrow a room policy and can
+never widen it. A room entered without a policy id gets v1.
+
+The allowlist binds each name to the fixed platform toolset that owns it
+(`PUBLIC_ROOM_TOOL_TOOLSETS`). The three existing market tools stay in
+`pieverse-market-research`. The new tools live in `pieverse-room-research`.
+Tools of that toolset exist for rooms only: outside a room they get no schema
+and no dispatch (`public_room_only`), whatever toolsets the owner enabled, and
+`GET /v1/toolsets` does not list the toolset. A tool with an allowlisted name
+from another toolset neither qualifies v2 nor runs in a room.
+
+The v2 prompt is one fixed text (`PUBLIC_ROOM_RESEARCH_PROMPT`). The caller's
+`instructions` never reach a room. The platform's room rules therefore live in
+this prompt: who the Agent is (`self` of the room JSON), who asked
+(`mentionedBy`, `triggerMessageId`), the roster and the `@Name` coordination
+rules. The room JSON is the Run's only user turn and carries the identity and
+roster facts. The prompt also permits a conditional bullish or bearish view
+with evidence, counter-evidence and source times, and forbids order advice
+(size, leverage, entry or exit instructions) and execution.
+
+Tool output is untrusted data. One room reply (both policies) has at most 12
+tool calls and at most 4 paid searches (`search_web` and `search_x` together).
+The Agent-local tool boundary charges the budget once for each admitted call;
+a refused call returns `public_room_tool_budget` and enters no handler.
+
+One room reply (both policies) also sends at most 16 model requests. Hermes
+counts a request directly before it calls the provider SDK
+(`charge_public_room_model_request`), so each attempt is a request: a first
+try, a retry after a provider error, a stream reconnect, and the non-streaming
+fallback after a refused stream. Hermes does not send the request after the
+sixteenth. The Run then fails with the fixed error `Shared room reply stopped:
+this reply used all 16 of its model requests.` and has no output, so the
+platform publishes nothing. The loop has the same limit of 16 turns. A room Run
+does not make the closing summary request that a private conversation makes at
+its iteration limit: a reply that reaches the limit without an answer fails
+with the same error.
+
+A counted request is one HTTP send. Hermes turns SDK retries off for its
+OpenAI-compatible and Anthropic clients. boto3 retries inside one SDK call, so
+for Bedrock a botocore `before-send` handler counts each send
+(`room_request_scope` in `agent/bedrock_adapter.py`) and refuses send 17
+before it leaves. The runtime client is shared by every conversation of the
+process. Hermes registers the handler when it builds the client, before
+another thread can use it. The handler acts only for the thread that is inside
+the SDK call of a room reply, and does nothing for a private conversation.
+
+A room does not probe the context window of a Bedrock model. Each probe tier
+is a request to the model, and boto3 can retry it. A room uses the cached
+window or the static table, and it does not save the table value.
+
+A room does not run MoA: one MoA call sends a request to each reference model
+and then to the aggregator. Capabilities declare no room policy on a pod whose
+configuration names the `moa` provider. Admission refuses a room Run with 400
+and the fixed error `Shared rooms do not run MoA.` for that configuration, for
+a request that names the provider, for a `model_routes` alias that names it,
+and for a one-shot MoA turn (the hidden marker of `/moa`). The Agent
+constructor and the turn entry refuse the same cases. A MoA runtime that only
+the runtime resolution finds therefore fails its Run with that error before an
+Agent exists. No case sends a model request. Private conversations keep MoA.
+
+The count covers the requests for the Agent's own model. Context compaction
+and the session title are outside it: they use Hermes' auxiliary model, as
+they do for each API session.
+
+Qualification for v2 uses `tests/gateway/test_public_room_research.py`. It
+includes a native Run with stubbed inference that proves the fixed rules and
+the room identity reach the model, and that owner prompts and files do not.
+
 Platform Agent asks and tenant-image promotion retain their own release gates.
 Source checks do not activate a feature or qualify a production image.

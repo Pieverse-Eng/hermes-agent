@@ -5992,6 +5992,7 @@ class AIAgent:
         # api_mode-flip race (the Anthropic SDK raises a non-retryable
         # TypeError on them). See #31673.
         from agent.anthropic_adapter import create_anthropic_message
+        from tools.execution_scope import charge_public_room_model_request
         return create_anthropic_message(
             client or self._anthropic_client,
             api_kwargs,
@@ -6001,6 +6002,8 @@ class AIAgent:
             # parsed Message drops. No-ops on providers that don't send the
             # matching header families (x-ratelimit-* / x-nous-credits-*).
             on_response=self._capture_anthropic_response_headers,
+            # A room reply counts each request this helper sends.
+            before_request=lambda: charge_public_room_model_request(self),
         )
 
     def _rebuild_anthropic_client(self) -> None:

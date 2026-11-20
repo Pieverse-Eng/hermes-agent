@@ -489,12 +489,15 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             invalidate_runtime_client,
             is_stale_connection_error,
             normalize_converse_response,
+            room_request_scope,
         )
         region = api_kwargs.pop("__bedrock_region__", "us-east-1")
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
-            raw_response = client.converse(**api_kwargs)
+            # boto3 retries inside this call: a room reply counts each HTTP send.
+            with room_request_scope(agent, client):
+                raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
@@ -502,6 +505,12 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 invalidate_runtime_client(region)
             raise
         return normalize_converse_response(raw_response)
+    # A room reply counts each request to the model provider. The Codex,
+    # Anthropic and Bedrock paths above count where they send, because one call
+    # of them can send more than once. The chat completions call below sends
+    # exactly once. A room never runs MoA (gateway/public_room.py).
+    from tools.execution_scope import charge_public_room_model_request
+    charge_public_room_model_request(agent)
     if agent.provider == "moa":
         # MoA is a virtual chat-completions provider backed by the
         # in-process MoAClient facade. Do not rebuild a request-local
@@ -2607,6 +2616,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     is_stale_connection_error,
                     is_streaming_access_denied_error,
                     normalize_converse_response,
+                    room_request_scope,
                     stream_converse_with_callbacks,
                 )
                 intercepted_events = []
@@ -2618,7 +2628,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
-                        raw_response = client.converse_stream(**final_kwargs)
+                        # boto3 retries inside this call: a room reply counts
+                        # each HTTP send.
+                        with room_request_scope(agent, client):
+                            raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
                         # the fallback inside the same managed Relay attempt so
@@ -2636,9 +2649,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
-                            return normalize_converse_response(
-                                client.converse(**final_kwargs)
-                            )
+                            # The denied stream was one request; these sends are the next.
+                            with room_request_scope(agent, client):
+                                return normalize_converse_response(
+                                    client.converse(**final_kwargs)
+                                )
                         if is_stale_connection_error(_bedrock_exc):
                             invalidate_runtime_client(region)
                         raise
@@ -3079,6 +3094,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_request_client = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            from tools.execution_scope import charge_public_room_model_request
+            charge_public_room_model_request(agent)
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
@@ -3580,6 +3597,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
+            from tools.execution_scope import charge_public_room_model_request
+            charge_public_room_model_request(agent)
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(
                 final_kwargs,

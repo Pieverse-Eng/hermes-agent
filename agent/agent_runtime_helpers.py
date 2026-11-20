@@ -2809,7 +2809,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     """Keep direct/local tool invocation inside the Agent's immutable room policy."""
     from tools.execution_scope import public_room_scope, is_public_room_scope, execution_scope_error
     room = getattr(agent, "public_room_policy", False) is True or is_public_room_scope()
-    with public_room_scope(room):
+    with public_room_scope(room, policy=getattr(agent, "public_room_policy_id", None) if room else None):
         blocked = execution_scope_error(function_name) if room else None
         if blocked:
             return blocked

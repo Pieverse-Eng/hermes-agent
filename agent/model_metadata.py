@@ -2729,10 +2729,11 @@ def get_model_context_length(
                 except Exception:
                     region = ""
             ctx = get_bedrock_context_length(model, region=region, probe=bool(region))
-            if ctx and region:
+            from tools.execution_scope import is_public_room_scope
+            if ctx and region and not is_public_room_scope():
                 # Only persist probe-derived values (region present); a pure
                 # table fallback shouldn't poison the cache against a later
-                # successful probe.
+                # successful probe. A shared room reply does not probe.
                 save_context_length(model, cache_key_url, ctx)
             return ctx
 
