@@ -8,7 +8,7 @@ import asyncio
 import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
@@ -263,6 +263,51 @@ async def test_unknown_policy_is_refused_before_agent_or_history_access(research
         async with TestClient(TestServer(_create_runs_app(adapter)), headers=AUTH) as client:
             response = await client.post(ROOM_RUN_PATH, json=request_body(policy))
             assert response.status == 400
+        create.assert_not_called()
+        history.assert_not_called()
+
+
+UNKNOWN_POLICIES = ["squad-public-research-v3", "squad-public-market-v0", "", 2, None, True,
+                    ["squad-public-research-v2"], {"policy": "squad-public-research-v2"}]
+
+
+@pytest.mark.parametrize("policy", UNKNOWN_POLICIES)
+def test_each_admission_layer_refuses_an_unknown_policy_on_its_own(research_tools, policy):
+    from gateway.public_room import room_policy_supported, validate_room_request
+    body = request_body(policy)
+    with pytest.raises(ValueError, match="Unknown or unauthenticated room policy"):
+        validate_room_request(body, authenticated=True)
+    assert not (isinstance(policy, str) and room_policy_supported(policy))
+    for known in (PUBLIC_ROOM_POLICY, PUBLIC_ROOM_RESEARCH_POLICY):
+        assert validate_room_request(request_body(known), authenticated=True) is True
+        assert room_policy_supported(known)
+        with pytest.raises(ValueError):
+            validate_room_request(request_body(known), authenticated=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", UNKNOWN_POLICIES)
+async def test_the_room_route_refuses_an_unknown_policy_before_the_run_handler(research_tools, policy):
+    from aiohttp import web
+    adapter = _make_adapter("room-fixture-key")
+    # A real response, so a route that forwards the request fails this test at once.
+    runs = AsyncMock(side_effect=lambda _request: web.json_response({"run_id": "entered"}, status=202))
+    with patch.object(adapter, "_handle_runs", runs):
+        async with TestClient(TestServer(_create_runs_app(adapter)), headers=AUTH) as client:
+            response = await client.post(ROOM_RUN_PATH, json=request_body(policy))
+            assert response.status == 400
+            assert (await response.json())["error"]["code"] == "invalid_room_policy"
+        runs.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["squad-public-research-v3", "", 2, None])
+async def test_the_private_route_never_treats_an_unknown_policy_as_a_room(research_tools, policy):
+    adapter = _make_adapter("room-fixture-key")
+    with patch.object(adapter, "_create_agent") as create, \
+         patch.object(adapter, "_ensure_session_db_async") as history:
+        async with TestClient(TestServer(_create_runs_app(adapter)), headers=AUTH) as client:
+            assert (await client.post("/v1/runs", json=request_body(policy))).status == 400
         create.assert_not_called()
         history.assert_not_called()
 
