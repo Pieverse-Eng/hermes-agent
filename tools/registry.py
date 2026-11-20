@@ -694,11 +694,19 @@ class ToolRegistry:
         # TTL clock.
         check_results: Dict[Callable, bool] = {}
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
-        from tools.execution_scope import proposal_available_tools, bound_host_tools
+        from tools.execution_scope import (
+            PUBLIC_ROOM_ONLY_TOOLSET, bound_host_tools, proposal_available_tools,
+            public_room_tool_names,
+        )
         host_scope = (proposal_available_tools() or frozenset()) | bound_host_tools()
+        room_tools = public_room_tool_names() or frozenset()
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:
+                continue
+            # Room research tools have no schema outside a room that admits them,
+            # whichever toolsets the owner enabled.
+            if entry.toolset == PUBLIC_ROOM_ONLY_TOOLSET and name not in room_tools:
                 continue
             # Host proxies need an explicit current-Run binding, including
             # raw catalogues, all/* aliases and messaging plugin discovery.

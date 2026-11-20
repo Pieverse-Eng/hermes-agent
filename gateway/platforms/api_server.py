@@ -2632,6 +2632,7 @@ class APIServerAdapter(BasePlatformAdapter):
         bound_business_tools: bool = False,
         tool_disclosure: str = 'full',
         public_room: bool = False,
+        room_policy: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2903,7 +2904,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._last_resolved_model[_resolved_key] = model
             self._last_resolved_model["*"] = model
 
+        from tools.execution_scope import (
+            PUBLIC_ROOM_MAX_ITERATIONS, PUBLIC_ROOM_POLICIES, PUBLIC_ROOM_POLICY,
+            PUBLIC_ROOM_TOOL_TOOLSETS,
+        )
+        if room_policy is not None and (not public_room or room_policy not in PUBLIC_ROOM_POLICIES):
+            raise ValueError("Unknown public room policy")
         if public_room:
+            # A room without a policy id runs the narrowest policy.
+            room_policy = room_policy or PUBLIC_ROOM_POLICY
             from gateway.public_room import require_room_runtime
             require_room_runtime(runtime_kwargs.get("api_mode"),
                                  provider=runtime_kwargs.get("provider"),
@@ -2915,7 +2924,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # explicitly bound current Run. Ordinary/Live/News retain their tools.
         enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"api_host_tools"})
         if public_room:
-            enabled_toolsets = ["pieverse-market-research"]
+            enabled_toolsets = sorted({PUBLIC_ROOM_TOOL_TOOLSETS[name]
+                                       for name in PUBLIC_ROOM_POLICIES[room_policy]})
         if interactive_messages and not public_room:
             enabled_toolsets = sorted(set(enabled_toolsets) | {"api_interactions"})
 
@@ -2933,6 +2943,9 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets.append("api_host_tools")
 
         max_iterations = _current_max_iterations()
+        if public_room:
+            # Tool output is untrusted: bound the model calls of one room reply.
+            max_iterations = min(max_iterations, PUBLIC_ROOM_MAX_ITERATIONS)
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -2971,16 +2984,17 @@ class APIServerAdapter(BasePlatformAdapter):
         allowed = ((PROPOSAL_ONLY_TOOL_NAMES & (owner_tool_names | {"send_message", "clarify"}))
                    | set(host_tool_names)) if proposal_only else None
         from tools.execution_scope import host_tool_scope
-        from tools.execution_scope import public_room_scope, PUBLIC_ROOM_TOOL_NAMES
-        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed), public_room_scope(public_room):
+        from tools.execution_scope import public_room_scope
+        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed), public_room_scope(public_room, policy=room_policy):
             agent = AIAgent(**agent_kwargs)
         if public_room:
             require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
             from model_tools import get_tool_definitions
-            with public_room_scope(True):
+            with public_room_scope(True, policy=room_policy):
                 raw_tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True,
                                                  skip_tool_search_assembly=True)
-            agent.tools = [tool for tool in raw_tools if tool["function"]["name"] in PUBLIC_ROOM_TOOL_NAMES]
+            room_tools = PUBLIC_ROOM_POLICIES[room_policy]
+            agent.tools = [tool for tool in raw_tools if tool["function"]["name"] in room_tools]
             agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
             agent._skip_mcp_refresh = True
         if bound_business_tools:
@@ -3849,6 +3863,27 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.public_room import room_config_supported
         return room_config_supported(_load_gateway_config())
 
+    def _room_policy_supported(self, policy) -> bool:
+        """v1 needs a qualified runtime; v2 also needs the platform plugin's fixed tools."""
+        from gateway.public_room import room_policy_supported
+        from tools.execution_scope import PUBLIC_ROOM_POLICY
+        if not self._public_room_config_supported():
+            return False
+        if policy == PUBLIC_ROOM_POLICY:
+            return True
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()  # idempotent; the platform plugin registers the v2 tools
+        except Exception:
+            logger.debug("Plugin discovery failed while qualifying a room policy", exc_info=True)
+        return room_policy_supported(policy)
+
+    def _room_research_capability(self):
+        from gateway.public_room import room_research_capability
+        from tools.execution_scope import PUBLIC_ROOM_RESEARCH_POLICY
+        return (room_research_capability()
+                if self._room_policy_supported(PUBLIC_ROOM_RESEARCH_POLICY) else None)
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -3863,7 +3898,7 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.plugins import get_plugin_manager
         plugin_capabilities = get_plugin_manager().api_capabilities(set(self._available_host_tools()))
 
-        from gateway.public_room import room_capability
+        from gateway.public_room import ROOM_RESEARCH_FEATURE, room_capability
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3907,6 +3942,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "host_tools_v1": True,
                 "pawpilot_runtime_v2": True,
                 "squad_room_isolation": (room_capability() if self._public_room_config_supported() else None),
+                # A later policy never changes the declaration above: deployed
+                # platforms validate it with a strict schema.
+                ROOM_RESEARCH_FEATURE: self._room_research_capability(),
                 "workflow_skill_loading": True,
                 "workflow_resource_loading": True,
                 "compact_host_tools": True,
@@ -7364,12 +7402,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_room_runs(self, request: "web.Request") -> "web.Response":
         """A dedicated route makes an older/mixed-version pod refuse before inference."""
-        from tools.execution_scope import PUBLIC_ROOM_POLICY
+        from tools.execution_scope import PUBLIC_ROOM_POLICIES
         try:
             body = await request.json()
         except Exception:
             body = None
-        if not isinstance(body, dict) or body.get("room_policy") != PUBLIC_ROOM_POLICY:
+        policy = body.get("room_policy") if isinstance(body, dict) else None
+        if not isinstance(policy, str) or policy not in PUBLIC_ROOM_POLICIES:
             return web.json_response(_openai_error("Isolated room policy required",
                                                   code="invalid_room_policy"), status=400)
         return await self._handle_runs(request)
@@ -7391,17 +7430,20 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         idempotency_key = request.headers.get("Idempotency-Key", "").strip()
         from gateway.public_room import validate_room_request, PUBLIC_ROOM_PROMPT
-        from tools.execution_scope import public_room_scope
+        from tools.execution_scope import PUBLIC_ROOM_POLICY, public_room_scope
         try:
             public_room = validate_room_request(body, authenticated=bool(self._expected_api_key()))
         except ValueError:
             return web.json_response(_openai_error("Invalid isolated room request",
                                                   code="invalid_room_policy"), status=400)
+        # The validated, server-owned policy id. It is part of the request body
+        # and therefore of the durable idempotency fingerprint.
+        room_policy = body["room_policy"] if public_room else None
         if public_room:
             auth_error = self._check_auth(request)
             if auth_error is not None:
                 return auth_error
-            if not self._public_room_config_supported():
+            if not self._room_policy_supported(room_policy):
                 return web.json_response(_openai_error("Room runtime is unsupported",
                                                       code="invalid_room_policy"), status=400)
         from gateway.interactive_messages import InteractionContext, current_message_scope, is_proposal_context
@@ -7537,8 +7579,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # concurrent runs can intentionally share them, and resolving an
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
+        # A room never takes the caller's instructions. The Agent's fixed room
+        # prompt is its whole system prompt; v1 also repeats it here, as before.
         ephemeral_system_prompt = (
-            PUBLIC_ROOM_PROMPT if public_room else
+            (PUBLIC_ROOM_PROMPT if room_policy == PUBLIC_ROOM_POLICY else None) if public_room else
             instructions if instructions is not None else self._configured_system_prompt()
         )
         loop = asyncio.get_running_loop()
@@ -7680,6 +7724,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent = self._create_agent(
                         interactive_messages=True,
                         public_room=public_room,
+                        room_policy=room_policy,
                         host_tool_names=host_tool_names,
                         proposal_only=is_proposal_context(interaction_context),
                         bound_business_tools=(interaction_context or {}).get("version") == 2,
@@ -7836,7 +7881,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     with self._profile_scope(request_profile), current_message_scope(
                         deliver_current, interaction_context,
                         available_tools=getattr(agent, "valid_tool_names", None)
-                    ), host_tool_scope(host_broker), public_room_scope(public_room):
+                    ), host_tool_scope(host_broker), public_room_scope(public_room, policy=room_policy):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process

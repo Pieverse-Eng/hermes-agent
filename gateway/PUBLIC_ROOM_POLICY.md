@@ -52,5 +52,57 @@ Runs and durable replay. Tests use isolated homes and fixture credentials and st
 they make no paid model call. Use `scripts/run_tests.sh -j 1` under the host's
 resource limits.
 
+## Research policy v2
+
+`POST /v1/room-runs` also accepts `room_policy: "squad-public-research-v2"`.
+The v1 declaration above stays byte-identical, because a deployed platform
+validates it with a strict schema. v2 has its own key,
+`features.squad_room_research_v2`:
+
+```json
+{"policy":"squad-public-research-v2","run_path":"/v1/room-runs","memory":false,"context_files":false,"skills":false,"mcp":false,"tools":["compare_trade_routes","discover_markets","market_candles","market_snapshot","onchain_token","plan_spot_purchase","search_news","search_web"],"search_tools":["search_web"],"max_tool_calls":12,"max_search_calls":4}
+```
+
+The key is `null` until the platform plugin registered every required tool, so
+a Hermes that knows the policy but runs with an older plugin keeps v1. A v2
+request to such a pod gets 400 `invalid_room_policy`. `search_x` is optional:
+the platform has no X search route for hosted instances yet. When the plugin
+registers it, `tools` and `search_tools` list it and the search cap covers it.
+A later policy needs another key; never change a declared one.
+
+v2 keeps every v1 exclusion. Admission, the dedicated session, the runtime
+checks, the hook and middleware suppression, and the memory, context-file,
+SOUL, skill and MCP exclusions run on the same code paths for both policies:
+`public_room_policy` stays a boolean, and `public_room_policy_id` selects only
+the prompt and the allowlist. A nested scope can narrow a room policy and can
+never widen it. A room entered without a policy id gets v1.
+
+The allowlist binds each name to the fixed platform toolset that owns it
+(`PUBLIC_ROOM_TOOL_TOOLSETS`). The three existing market tools stay in
+`pieverse-market-research`. The new tools live in `pieverse-room-research`.
+Tools of that toolset exist for rooms only: outside a room they get no schema
+and no dispatch (`public_room_only`), whatever toolsets the owner enabled. A
+tool with an allowlisted name from another toolset neither qualifies v2 nor
+runs in a room.
+
+The v2 prompt is one fixed text (`PUBLIC_ROOM_RESEARCH_PROMPT`). The caller's
+`instructions` never reach a room. The platform's room rules therefore live in
+this prompt: who the Agent is (`self` of the room JSON), who asked
+(`mentionedBy`, `triggerMessageId`), the roster and the `@Name` coordination
+rules. The room JSON is the Run's only user turn and carries the identity and
+roster facts. The prompt also permits a conditional bullish or bearish view
+with evidence, counter-evidence and source times, and forbids order advice
+(size, leverage, entry or exit instructions) and execution.
+
+Tool output is untrusted data. One room reply (both policies) has at most 12
+tool calls and at most 4 paid searches (`search_web` and `search_x` together).
+The Agent-local tool boundary charges the budget once for each admitted call;
+a refused call returns `public_room_tool_budget` and enters no handler. One
+reply also has at most 16 model calls.
+
+Qualification for v2 uses `tests/gateway/test_public_room_research.py`. It
+includes a native Run with stubbed inference that proves the fixed rules and
+the room identity reach the model, and that owner prompts and files do not.
+
 Platform Agent asks and tenant-image promotion retain their own release gates.
 Source checks do not activate a feature or qualify a production image.

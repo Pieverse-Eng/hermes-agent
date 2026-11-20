@@ -1275,6 +1275,9 @@ def run_conversation(
     if getattr(agent, "public_room_policy", False) is True or is_public_room_scope():
         from gateway.public_room import require_room_runtime
         require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
+        # One conversation is one room reply: its tool-call budget starts here.
+        from tools.execution_scope import PublicRoomToolBudget
+        agent.public_room_budget = PublicRoomToolBudget()
 
     if moa_config is None:
         try:

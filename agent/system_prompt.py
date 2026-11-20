@@ -168,10 +168,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     warm across turns.
     """
     if getattr(agent, "public_room_policy", False) is True:
-        from gateway.public_room import PUBLIC_ROOM_PROMPT
+        from gateway.public_room import room_prompt
         # Return before loading SOUL, skills, cwd files, memory, user profiles
-        # or owner-supplied system_message. The prefix stays immutable.
-        return {"stable": PUBLIC_ROOM_PROMPT, "context": "", "volatile": ""}
+        # or owner-supplied system_message. The prefix stays immutable: one
+        # fixed text per room policy, the v1 text when the Agent names none.
+        return {"stable": room_prompt(getattr(agent, "public_room_policy_id", None)),
+                "context": "", "volatile": ""}
 
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so

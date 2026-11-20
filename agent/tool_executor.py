@@ -506,10 +506,17 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
-    from tools.execution_scope import execution_scope_error, is_public_room_scope, public_room_scope
+    from tools.execution_scope import (
+        execution_scope_error, is_public_room_scope, public_room_budget_error, public_room_scope,
+    )
     public_room = getattr(agent, "public_room_policy", False) is True or is_public_room_scope()
-    with public_room_scope(public_room):
+    # The Agent's own policy id restores its allowlist without ambient context.
+    room_policy = getattr(agent, "public_room_policy_id", None) if public_room else None
+    with public_room_scope(public_room, policy=room_policy):
         blocked = execution_scope_error(function_name) if public_room else None
+    if public_room and not blocked:
+        # Every model tool call passes here exactly once: charge the reply's budget.
+        blocked = public_room_budget_error(agent, function_name)
     if blocked:
         # Agent-local memory/session handlers bypass model_tools dispatch.
         # Refuse them before middleware, Relay callbacks or any handler runs.
@@ -663,13 +670,13 @@ def _run_agent_tool_execution_middleware(
         )
 
     def execute_pipeline(relay_args):
-        with public_room_scope(public_room):
+        with public_room_scope(public_room, policy=room_policy):
             return _hermes_pipeline(relay_args)
     if worker_scope is not None:
         def execute_pipeline(relay_args):
             # Relay may invoke Hermes on another callback thread. Batched
             # clarify policy waits must receive this agent's interrupt there.
-            with worker_scope(), public_room_scope(public_room):
+            with worker_scope(), public_room_scope(public_room, policy=room_policy):
                 return _hermes_pipeline(relay_args)
 
     result, _relay_args = relay_tools.execute(
