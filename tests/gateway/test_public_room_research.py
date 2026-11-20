@@ -739,6 +739,101 @@ async def test_a_v2_run_sends_the_fixed_rules_and_the_room_identity_to_the_model
         assert private not in sent
 
 
+# --- A v2 Run: replay, a looping model and a reused Agent ------------------------
+
+@pytest.mark.asyncio
+async def test_a_replay_returns_the_same_v2_run_and_never_swaps_its_policy(research_tools):
+    adapter = _make_adapter("room-fixture-key")
+    created = []
+
+    def create(**kwargs):
+        created.append(kwargs["room_policy"])
+        return SimpleNamespace(run_conversation=lambda **_: {"final_response": "public reply"},
+                               session_prompt_tokens=0, session_completion_tokens=0,
+                               session_total_tokens=0)
+
+    body = request_body()
+    key = {"Idempotency-Key": "room-research-one"}
+    with patch.object(adapter, "_create_agent", side_effect=create):
+        async with TestClient(TestServer(_create_runs_app(adapter)), headers=AUTH) as client:
+            first = await client.post(ROOM_RUN_PATH, json=body, headers=key)
+            assert first.status == 202
+            run = (await first.json())["run_id"]
+            if run in adapter._active_run_tasks:
+                await adapter._active_run_tasks[run]
+            replay = await client.post(ROOM_RUN_PATH, json=body, headers=key)
+            assert (replay.status, (await replay.json())["run_id"]) == (202, run)
+            # The policy is part of the fingerprint: the same key cannot rerun as v1.
+            swapped = await client.post(ROOM_RUN_PATH, json={**body, "room_policy": PUBLIC_ROOM_POLICY},
+                                        headers=key)
+            assert swapped.status == 409
+            assert (await swapped.json())["error"]["code"] == "idempotency_key_conflict"
+    assert created == [PUBLIC_ROOM_RESEARCH_POLICY]
+
+
+def research_agent():
+    from run_agent import AIAgent
+    return AIAgent(api_key="fixture-only", base_url="http://127.0.0.1:1/v1", model="test/model",
+                   quiet_mode=True, max_iterations=500)
+
+
+def test_a_model_that_never_stops_calling_tools_is_cut_off(research_tools):
+    """Untrusted tool output can ask for more calls; the reply still ends."""
+    from run_agent import AIAgent
+    model_calls = []
+
+    def model(self, api_kwargs, **_):
+        model_calls.append([tool["function"]["name"] for tool in api_kwargs.get("tools") or []])
+        turn = len(model_calls)
+        # A new call id and new arguments each time: this is not one repeated call.
+        call = SimpleNamespace(id=f"call_{turn}", type="function", function=SimpleNamespace(
+            name="search_web" if turn % 2 else "market_snapshot",
+            arguments=json.dumps({"query": f"injected request {turn}"})))
+        message = SimpleNamespace(content=None, tool_calls=[call])
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+                               model="test/model", usage=None)
+
+    with public_room_scope(True, policy=PUBLIC_ROOM_RESEARCH_POLICY):
+        agent = research_agent()
+        try:
+            assert agent.max_iterations == PUBLIC_ROOM_MAX_ITERATIONS == 16
+            with patch.object(AIAgent, "_interruptible_streaming_api_call", model), \
+                 patch.object(AIAgent, "_interruptible_api_call", model):
+                result = agent.run_conversation(ROOM_JSON, conversation_history=[])
+        finally:
+            agent.close()
+    # Four paid searches, then free reads up to the total of twelve handler entries.
+    assert research_tools["search_web"].call_count == PUBLIC_ROOM_MAX_SEARCH_CALLS
+    assert sum(handler.call_count for handler in research_tools.values()) == PUBLIC_ROOM_MAX_TOOL_CALLS
+    assert (agent.public_room_budget.calls, agent.public_room_budget.searches) == (12, 4)
+    # Sixteen model calls with tools, then at most one closing call without tools.
+    assert PUBLIC_ROOM_MAX_ITERATIONS <= len(model_calls) <= PUBLIC_ROOM_MAX_ITERATIONS + 1
+    assert all(set(tools) == PUBLIC_ROOM_RESEARCH_TOOL_NAMES
+               for tools in model_calls[:PUBLIC_ROOM_MAX_ITERATIONS])
+    refusals = [json.loads(m["content"]) for m in result["messages"]
+                if m.get("role") == "tool" and "public_room_tool_budget" in str(m.get("content"))]
+    assert refusals and {r["limit"] for r in refusals} <= {4, 12}
+
+
+def test_each_reply_of_a_reused_agent_starts_a_new_budget(research_tools):
+    from run_agent import AIAgent
+    with public_room_scope(True, policy=PUBLIC_ROOM_RESEARCH_POLICY):
+        agent = research_agent()
+        try:
+            spent = agent.public_room_budget
+            for _ in range(PUBLIC_ROOM_MAX_TOOL_CALLS):
+                assert spent.charge("market_snapshot") is None
+            assert spent.charge("market_snapshot") is not None
+            final = lambda self, api_kwargs, **_: model_reply(content="public reply")  # noqa: E731
+            with patch.object(AIAgent, "_interruptible_streaming_api_call", final), \
+                 patch.object(AIAgent, "_interruptible_api_call", final):
+                assert agent.run_conversation(ROOM_JSON, conversation_history=[])["final_response"] == "public reply"
+            assert agent.public_room_budget is not spent
+            assert (agent.public_room_budget.calls, agent.public_room_budget.searches) == (0, 0)
+        finally:
+            agent.close()
+
+
 def test_a_v1_room_prompt_and_wire_are_unchanged():
     """v1 keeps its text; only v2 gets the research rules."""
     assert "Use only public market discovery." in PUBLIC_ROOM_PROMPT
