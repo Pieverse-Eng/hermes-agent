@@ -81,9 +81,9 @@ The allowlist binds each name to the fixed platform toolset that owns it
 (`PUBLIC_ROOM_TOOL_TOOLSETS`). The three existing market tools stay in
 `pieverse-market-research`. The new tools live in `pieverse-room-research`.
 Tools of that toolset exist for rooms only: outside a room they get no schema
-and no dispatch (`public_room_only`), whatever toolsets the owner enabled. A
-tool with an allowlisted name from another toolset neither qualifies v2 nor
-runs in a room.
+and no dispatch (`public_room_only`), whatever toolsets the owner enabled, and
+`GET /v1/toolsets` does not list the toolset. A tool with an allowlisted name
+from another toolset neither qualifies v2 nor runs in a room.
 
 The v2 prompt is one fixed text (`PUBLIC_ROOM_RESEARCH_PROMPT`). The caller's
 `instructions` never reach a room. The platform's room rules therefore live in

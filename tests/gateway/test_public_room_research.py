@@ -503,6 +503,25 @@ def test_room_research_tools_have_no_schema_and_no_dispatch_outside_a_room(resea
         assert {tool["function"]["name"] for tool in registry.get_definitions(set(room_only))} == room_only
 
 
+@pytest.mark.asyncio
+async def test_the_owner_toolset_catalog_does_not_list_the_room_only_toolset(research_tools):
+    """`/v1/toolsets` describes the private agent, which never gets these tools."""
+    adapter = _make_adapter("room-fixture-key")
+    app = _create_runs_app(adapter)
+    app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    catalog = [(PUBLIC_ROOM_TOOLSET, "Market research", "Shared market tools"),
+               (PUBLIC_ROOM_ONLY_TOOLSET, "Room research", "Room tools")]
+    with patch("hermes_cli.tools_config._get_effective_configurable_toolsets", return_value=catalog), \
+         patch("hermes_cli.tools_config._get_platform_tools",
+               return_value={PUBLIC_ROOM_TOOLSET, PUBLIC_ROOM_ONLY_TOOLSET}):
+        async with TestClient(TestServer(app), headers=AUTH) as client:
+            response = await client.get("/v1/toolsets")
+            assert response.status == 200
+            listed = {entry["name"]: entry["tools"] for entry in (await response.json())["data"]}
+    assert listed == {PUBLIC_ROOM_TOOLSET: ["compare_trade_routes", "discover_markets",
+                                            "plan_spot_purchase"]}
+
+
 # --- Invariant 5: tool output is untrusted; one reply has fixed budgets ----------
 
 def test_one_room_reply_has_a_tool_call_cap(research_tools):

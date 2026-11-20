@@ -4058,7 +4058,11 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             features = get_nous_subscription_features(config)
             data: List[Dict[str, Any]] = []
+            from tools.execution_scope import PUBLIC_ROOM_ONLY_TOOLSET
             for name, label, desc in _get_effective_configurable_toolsets():
+                # Room research tools never reach the agent this catalog describes.
+                if name == PUBLIC_ROOM_ONLY_TOOLSET:
+                    continue
                 try:
                     tools = sorted(set(resolve_toolset(name)))
                 except Exception:
