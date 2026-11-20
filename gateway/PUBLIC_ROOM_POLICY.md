@@ -88,11 +88,13 @@ from another toolset neither qualifies v2 nor runs in a room.
 The v2 prompt is one fixed text (`PUBLIC_ROOM_RESEARCH_PROMPT`). The caller's
 `instructions` never reach a room. The platform's room rules therefore live in
 this prompt: who the Agent is (`self` of the room JSON), who asked
-(`mentionedBy`, `triggerMessageId`), the roster and the `@Name` coordination
-rules. The room JSON is the Run's only user turn and carries the identity and
-roster facts. The prompt also permits a conditional bullish or bearish view
-with evidence, counter-evidence and source times, and forbids order advice
-(size, leverage, entry or exit instructions) and execution.
+(`mentionedBy`, `triggerMessageId`), the earlier message that the trigger
+replies to or quotes (`replyTo` and its optional `quote`), the roster and the
+`@Name` coordination rules. The room JSON is the Run's only user turn and
+carries the identity and roster facts and the referenced message. The prompt
+also permits a conditional bullish or bearish view with evidence,
+counter-evidence and source times, and forbids order advice (size, leverage,
+entry or exit instructions) and execution.
 
 Tool output is untrusted data. One room reply (both policies) has at most 12
 tool calls and at most 4 paid searches (`search_web` and `search_x` together).
