@@ -321,8 +321,11 @@ session (`_room_session_refusal`). It is the rule of `POST /v1/runs`:
 - `POST /v1/chat/completions` with `X-Hermes-Session-Id`;
 - `POST /api/sessions/{id}/fork`: a fork would keep the history under an
   ordinary id;
-- `POST /v1/runs` for a named session without a room policy: the id in each
-  case, and the chain of the session when the Run loads its stored history;
+- `POST /v1/runs` for a named session without a room policy: the id and the
+  chain of the session in each case, also when the request brings its own
+  history (`conversation_history`, a list `input`, `previous_response_id`).
+  Such a Run still writes its turn under the id. When the Run loads its stored
+  history, the tip of the compression chain is examined too;
 - `/resume` in a channel (Telegram, Discord, Matrix and the others). The
   command refuses a room session before the Matrix room check and the owner
   check, so Matrix `--cross-room` and an admin `--all` cannot attach it

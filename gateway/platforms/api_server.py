@@ -7720,6 +7720,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        # The id alone was checked above (validate_room_request). The Run writes
+        # its turn under this id whatever the source of its history, also when the
+        # request brings its own history: a session that continues a room session
+        # (a fork, a compression child) is refused here, before any history or
+        # Agent. A Run without a room policy never writes into a room session.
+        if not public_room and session_id:
+            room_refusal = await self._room_session_refusal(session_id)
+            if room_refusal is not None:
+                return room_refusal
+
         run_id = f"run_{uuid.uuid4().hex}"
         # Continue the named session (fork #47) through one history-loading path.
         # Classify the caller's input before reading SessionDB so native turns
@@ -7734,9 +7744,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
             try:
                 session_id = await asyncio.to_thread(db.resolve_resume_session_id, str(session_id))
-                # The id alone was checked above (validate_room_request). The
-                # session that this Run resumes can still continue a room
-                # session under another id.
+                # The named session was checked above. The session that this
+                # Run resumes is the tip of its compression chain: check it too.
                 from gateway.public_room import is_room_session
                 continues_room = await asyncio.to_thread(is_room_session, session_id, db)
                 if not continues_room:

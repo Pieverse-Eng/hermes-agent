@@ -2058,3 +2058,39 @@ async def test_a_room_session_does_not_continue_as_an_ordinary_chat(memory_room,
             assert unavailable.status == 503, (path, await unavailable.text())
             assert (await unavailable.json())["error"]["code"] == "session_db_unavailable"
         assert started == [] and pod.adapter._active_run_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_its_own_history_does_not_write_into_a_room_session(memory_room, monkeypatch):
+    """A Run that brings its own history still writes its turn under the session id."""
+    pod = Pod(monkeypatch, history=True)
+    body = request_body()
+    room = body["session_id"]
+    own = [{"role": "user", "content": "OWN_HISTORY_SENTINEL"}, {"role": "assistant", "content": "Yes."}]
+    async with TestClient(TestServer(session_app(pod.adapter)), headers=AUTH) as client:
+        await pod.run(client, body, model_reply(content="public reply"))
+        db = pod.adapter._ensure_session_db()
+        # A compression child and a fork continue the room session under other ids.
+        db.end_session(room, "compression")
+        db.create_session("room-child", "api_server", parent_session_id=room)
+        db.create_session("room-fork-of-child", "api_server", parent_session_id="room-child")
+        db.create_session("private-chat", "api_server")
+        rows_before = {sid: len(db.get_messages(sid)) for sid in (room, "room-child", "room-fork-of-child")}
+        for session in ("room-child", "room-fork-of-child"):
+            for history in ({"conversation_history": own},
+                            {"input": [*own, {"role": "user", "content": "Go on."}]},
+                            {"previous_response_id": "resp_unknown", "conversation_history": own}):
+                payload = {"session_id": session, "input": "Go on.", **history}
+                response = await client.post("/v1/runs", json=payload)
+                assert response.status == 400, (session, history, await response.text())
+                assert (await response.json())["error"]["code"] == "invalid_room_policy"
+        # No Agent started, and no room session got a new row.
+        assert pod.adapter._active_run_tasks == {}
+        assert {sid: len(db.get_messages(sid)) for sid in rows_before} == rows_before
+        # An ordinary session with its own history runs as before.
+        status, requests = await pod.run(
+            client, {"session_id": "private-chat", "input": "Go on.", "conversation_history": own},
+            model_reply(content="private reply"), path="/v1/runs")
+        assert status["status"] == "completed"
+        assert "OWN_HISTORY_SENTINEL" in json.dumps(requests[0]["messages"])
+        assert "ROOM_TEXT_SENTINEL" not in json.dumps(requests[0]["messages"])
