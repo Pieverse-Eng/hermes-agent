@@ -8,6 +8,9 @@ from tools.execution_scope import (
 from uuid import UUID
 
 SESSION_PREFIX = "agent-chat-pawchat-isolated-v1-"
+# Each session of a shared room has an id of this family. `SESSION_PREFIX` is
+# the one form that a room Run accepts.
+ROOM_SESSION_FAMILY = "agent-chat-pawchat-"
 ROOM_RUN_PATH = "/v1/room-runs"
 PUBLIC_ROOM_PROMPT = (
     "You are a PawPilot Agent replying in a shared squad room. "
@@ -266,10 +269,35 @@ def room_memory_binding(body):
     return binding["squad_id"], binding["seat_id"]
 
 
+def is_room_session(session_id, db=None) -> bool:
+    """Whether a session is a shared room session, or continues one.
+
+    A room session holds text of other people. It runs only with its room
+    policy, on `ROOM_RUN_PATH`: no other entry loads its history for an Agent
+    with the owner's tools and private context. A session continues a room
+    session when the chain of its `parent_session_id` reaches one: a fork and
+    a compression child keep the room's history under another id.
+
+    `db` is the session store. Without it the id alone decides. A store that
+    cannot answer raises, and the caller refuses the request.
+    """
+    seen: set[str] = set()
+    current = session_id
+    while isinstance(current, str) and current and current not in seen:
+        if current.startswith(ROOM_SESSION_FAMILY):
+            return True
+        if db is None:
+            return False
+        seen.add(current)
+        session = db.get_session(current)
+        current = session.get("parent_session_id") if session else None
+    return False
+
+
 def validate_room_request(body, *, authenticated):
     policy = body.get("room_policy")
     if "room_policy" not in body:
-        if str(body.get("session_id", "")).startswith("agent-chat-pawchat-"):
+        if is_room_session(body.get("session_id")):
             raise ValueError("Room sessions require their isolated policy")
         return False
     if not isinstance(policy, str) or policy not in PUBLIC_ROOM_POLICIES or not authenticated:

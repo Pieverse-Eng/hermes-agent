@@ -223,12 +223,31 @@ call never arrived.
 **Owner view and delete.** Both need this pod's bearer:
 
 - `GET /v1/room-memory/{squad_id}/{seat_id}` returns the notes of that seat.
-- `DELETE /v1/room-memory/{squad_id}/{seat_id}` deletes them. The owner's
-  clear and the platform's delete after a seat left are the same call. It is
-  safe to repeat. It deletes only a store that this seat wrote, so a late call
-  never removes the notes of a later seat. It also ends the memory of each Run
-  in progress for that seat: such a Run cannot write the notes back
-  (`room_memory_closed`).
+- `DELETE /v1/room-memory/{squad_id}/{seat_id}` deletes them. It deletes only
+  a store that this seat wrote, so a late call never removes the notes of a
+  later seat. It also ends the memory of each Run in progress for that seat:
+  such a Run cannot write the notes back (`room_memory_closed`).
+
+**One clear for one request key.** The owner's clear carries the request key
+of the platform in `Idempotency-Key` (a canonical lower-case UUID). The store
+removes the notes and records the key in the same write of the same file
+(`clear_store`): the two happen together or not at all. The answer has
+`deleted` and `replayed`. A second clear with that key for that seat finds the
+record. It answers the first result with `replayed: true`, removes nothing and
+does not end the memory of a Run. This holds for two requests at the same
+moment (all changes of a store run under one lock) and for a request that
+comes again because its answer was lost. So the notes that the Agent saved
+after the first clear stay.
+
+- The record names the seat. A store that another seat wrote keeps its notes:
+  the record alone is added. A clear that a new seat asked for before its first
+  Run is therefore also known when that seat has notes later. The seat fence
+  and the delete below keep the records of other seats.
+- A store remembers the last 16 keys. A clear comes again within moments of
+  the first one.
+- A key of another shape is refused (`400 invalid_room_memory`).
+- The platform's delete after a seat left carries no key. A seat that left
+  saves no more notes, so that delete is safe to repeat as it is.
 
 **The text of a note is in its store and in no other place of the pod.** A
 delete of the store therefore leaves no copy that a session route or a later
@@ -255,6 +274,28 @@ What is not a note: the Agent's own words. A reply that restates a note is a
 message of the room, and the session history keeps it like each other reply.
 The reasoning text of a model can restate a note too, and the session history
 keeps it. A clear of the room memory does not change these.
+
+**A room session runs only with its room policy.** A room session holds text
+of other people and the Agent's replies to it. An ordinary turn on that session
+would give this history to an Agent with the owner's tools and private context.
+Each entry that loads the history of a named session for an ordinary Agent
+refuses a room session with `400 invalid_room_policy`, before it reads the
+session (`_room_session_refusal`). It is the rule of `POST /v1/runs`:
+
+- `POST /api/sessions/{id}/chat` and `POST /api/sessions/{id}/chat/stream`;
+- `POST /v1/chat/completions` with `X-Hermes-Session-Id`;
+- `POST /api/sessions/{id}/fork`: a fork would keep the history under an
+  ordinary id;
+- `POST /v1/runs` for a named session without a room policy: the id in each
+  case, and the chain of the session when the Run loads its stored history.
+
+A room session is a session whose id starts with `agent-chat-pawchat-`, and
+each session whose chain of `parent_session_id` reaches such a session
+(`is_room_session`): a fork and a compression child. When the session store
+cannot answer that question, the entry refuses the request with
+`503 session_db_unavailable`. The session routes that only read
+(`GET /api/sessions…`) are not changed: the platform reads a room session there
+to find the answer of a Run.
 
 Qualification for v3 uses `tests/gateway/test_public_room_memory.py`.
 

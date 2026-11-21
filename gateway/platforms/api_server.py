@@ -3955,22 +3955,36 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_room_memory_delete(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/room-memory/{squad_id}/{seat_id}: forget the notes of one seat.
 
-        The owner's clear and the platform's delete after a seat left are the
-        same call. It is safe to repeat.
+        The owner's clear carries its request key in `Idempotency-Key`. The
+        store clears one time for one key of one seat: it removes the notes
+        and records the key in one write, and a repeat of the key answers
+        the first result with `replayed` and removes nothing. So a request
+        that comes two times, at the same moment or after a lost answer,
+        cannot remove the notes that the Agent saved after the first clear.
+
+        The platform's delete after a seat left carries no key. A seat that
+        left saves no more notes, and that delete is safe to repeat.
         """
         target = self._room_memory_target(request)
         if isinstance(target, web.Response):
             return target
-        from gateway.room_memory import delete_store
+        from gateway.room_memory import clear_store, delete_store, valid_id
+        request_key = request.headers.get("Idempotency-Key")
+        if request_key is not None and not valid_id(request_key):
+            return web.json_response(_openai_error(
+                "Invalid room memory request key", code="invalid_room_memory"), status=400)
         try:
-            deleted = await asyncio.to_thread(delete_store, *target)
+            if request_key is None:
+                result = {"deleted": await asyncio.to_thread(delete_store, *target)}
+            else:
+                result = await asyncio.to_thread(clear_store, *target, request_key)
         except Exception:
             logger.exception("Room memory delete failed")
             return web.json_response(_openai_error(
                 "Room memory is unavailable", code="room_memory_unavailable",
                 err_type="server_error"), status=503)
         return web.json_response({"object": "hermes.room_memory.deleted",
-                                  "squad_id": target[0], "seat_id": target[1], "deleted": deleted})
+                                  "squad_id": target[0], "seat_id": target[1], **result})
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
@@ -4251,6 +4265,38 @@ class APIServerAdapter(BasePlatformAdapter):
             return {}, web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         return body, None
 
+    async def _room_session_refusal(self, session_id) -> Optional["web.Response"]:
+        """Refuse a request that would run a shared room session as an ordinary chat.
+
+        The rule is the one of `POST /v1/runs` (`validate_room_request`): a
+        room session runs only with its room policy, on `POST /v1/room-runs`.
+        A room session holds text of other people. An ordinary turn on it
+        would give that text to an Agent with the owner's tools and private
+        context. Each entry that loads the history of a named session for an
+        ordinary Agent asks here first, before it reads the session. A session
+        that continues a room session (a fork, a compression child) is
+        refused in the same way.
+        """
+        from gateway.public_room import is_room_session
+
+        def refusal():
+            return web.json_response(_openai_error(
+                "Invalid isolated room request", code="invalid_room_policy"), status=400)
+
+        if is_room_session(session_id):
+            return refusal()
+        db = await self._ensure_session_db_async()
+        if db is None:
+            # Without a session store no entry loads a history.
+            return None
+        try:
+            continues_room = await asyncio.to_thread(is_room_session, session_id, db)
+        except Exception:
+            logger.exception("Room session check failed")
+            return web.json_response(_openai_error(
+                "Session database unavailable", code="session_db_unavailable"), status=503)
+        return refusal() if continues_room else None
+
     async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = await self._ensure_session_db_async()
         if db is None:
@@ -4489,6 +4535,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         source_id = request.match_info["session_id"]
+        # A fork would keep the history of a room session under an ordinary id.
+        room_refusal = await self._room_session_refusal(source_id)
+        if room_refusal is not None:
+            return room_refusal
         source, err = await self._get_existing_session_or_404(source_id)
         if err:
             return err
@@ -4537,6 +4587,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
+        # A room session runs only with its room policy (POST /v1/room-runs).
+        room_refusal = await self._room_session_refusal(session_id)
+        if room_refusal is not None:
+            return room_refusal
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
@@ -4654,6 +4708,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
+        # A room session runs only with its room policy (POST /v1/room-runs).
+        room_refusal = await self._room_session_refusal(session_id)
+        if room_refusal is not None:
+            return room_refusal
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
@@ -5006,6 +5064,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     {"error": {"message": "Session ID too long", "type": "invalid_request_error"}},
                     status=400,
                 )
+            # A room session runs only with its room policy (POST /v1/room-runs).
+            room_refusal = await self._room_session_refusal(provided_session_id)
+            if room_refusal is not None:
+                return room_refusal
             session_id = provided_session_id
             try:
                 db = await self._ensure_session_db_async()
@@ -7672,11 +7734,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
             try:
                 session_id = await asyncio.to_thread(db.resolve_resume_session_id, str(session_id))
-                conversation_history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+                # The id alone was checked above (validate_room_request). The
+                # session that this Run resumes can still continue a room
+                # session under another id.
+                from gateway.public_room import is_room_session
+                continues_room = await asyncio.to_thread(is_room_session, session_id, db)
+                if not continues_room:
+                    conversation_history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
             except Exception:
                 logger.exception("Native run history could not be loaded")
                 return web.json_response(_openai_error(
                     "Session history unavailable", code="session_db_unavailable"), status=503)
+            if continues_room:
+                return web.json_response(_openai_error("Invalid isolated room request",
+                                                      code="invalid_room_policy"), status=400)
         self._run_owners[run_id] = idempotency_scope
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated

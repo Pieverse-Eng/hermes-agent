@@ -21,11 +21,12 @@ from gateway import room_memory
 from gateway.public_room import (
     PUBLIC_ROOM_MEMORY_PROMPT, PUBLIC_ROOM_MEMORY_RULES, PUBLIC_ROOM_PROMPT,
     PUBLIC_ROOM_RESEARCH_PROMPT, ROOM_MEMORY_FEATURE, ROOM_RESEARCH_FEATURE, ROOM_RUN_PATH,
-    SESSION_PREFIX, room_capability, room_memory_capability, room_research_capability,
+    ROOM_SESSION_FAMILY, SESSION_PREFIX, is_room_session, room_capability, room_memory_capability,
+    room_research_capability,
 )
 from gateway.room_memory import (
-    MARKER, MAX_BYTES, MAX_NOTE_CHARS, MAX_NOTES, RoomMemory, RoomMemoryRefusal, delete_store,
-    frame_room_input, read_store,
+    MARKER, MAX_BYTES, MAX_CLEARS, MAX_NOTE_CHARS, MAX_NOTES, RoomMemory, RoomMemoryRefusal,
+    clear_store, delete_store, frame_room_input, read_store,
 )
 from gateway.room_memory import memory_line as stored_memory_line
 from tools.execution_scope import (
@@ -1334,19 +1335,19 @@ async def test_a_clear_leaves_no_text_of_a_note_in_the_session_history(memory_ro
         assert [call["function"]["arguments"] for message in served["data"]
                 for call in message.get("tool_calls") or []] == [
             '{"action":"add"}', '{"action":"replace","id":"m1"}']
-        # What a later turn on this session would send to a model, and a fork of it.
+        # What the store gives to a turn that loads this session. A room session has no
+        # fork: the fork route refuses it.
         replay = json.dumps(db.get_messages_as_conversation(first["session_id"]))
         assert "HISTORY_SENTINEL" not in replay and MARKER not in replay
         fork = await client.post(f"/api/sessions/{first['session_id']}/fork", json={"id": "fork-1"})
-        assert fork.status in {200, 201}, await fork.text()
-        assert "HISTORY_SENTINEL" not in await session_history(client, "fork-1")
+        assert fork.status == 400 and db.get_session("fork-1") is None
         # The title model reads the room input and the reply.
         assert pod.titles and all(read == (ROOM_JSON, "public reply") for read in pod.titles)
 
         # The owner clears the memory: no file of the pod holds the text now.
         assert (await (await client.delete(url)).json())["deleted"] is True
         assert home_files_with("HISTORY_SENTINEL") == []
-        for session in (*sessions, "fork-1"):
+        for session in sessions:
             assert "HISTORY_SENTINEL" not in await session_history(client, session)
         run = status["run_id"]
         for read in (await client.get(f"/v1/runs/{run}"),
@@ -1485,3 +1486,352 @@ def test_a_memory_room_writes_no_request_dump(memory_room):
     assert "DUMP_SENTINEL" in written[PUBLIC_ROOM_RESEARCH_POLICY].read_text(encoding="utf-8")
     assert home_files_with("DUMP_SENTINEL") == [
         str(written[PUBLIC_ROOM_RESEARCH_POLICY].relative_to(os.environ["HERMES_HOME"]))]
+
+
+# --- One clear for one request key, in the pod ------------------------------------
+
+KEY, KEY_2, KEY_3 = (f"{letter * 8}-{letter * 4}-4{letter * 3}-8{letter * 3}-{letter * 12}"
+                     for letter in "def")
+
+
+def stored_file(squad=SQUAD_A):
+    return json.loads(store_path(squad).read_text(encoding="utf-8"))
+
+
+def note_texts(squad=SQUAD_A, seat=SEAT_A):
+    return [n["text"] for n in read_store(squad, seat)["notes"]]
+
+
+def test_a_clear_with_a_request_key_runs_one_time_and_keeps_the_later_notes(memory_room):
+    RoomMemory(SQUAD_A, SEAT_A).add("A note before the clear.")
+    assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": False}
+    assert note_texts() == []
+    # One file holds both: no note, and the record of the key.
+    stored = stored_file()
+    assert stored["notes"] == []
+    assert stored["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    # The Agent saves a note after the clear, in a new Run. The note numbers go on.
+    later = RoomMemory(SQUAD_A, SEAT_A)
+    assert later.add("A note after the clear.")["id"] == "m2"
+    # The key comes again: the first result, and nothing is removed.
+    for _ in range(3):
+        assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": True}
+    assert note_texts() == ["A note after the clear."]
+    # A repeat does not end the memory of the Run that started after the first clear.
+    assert later.add("One more note.")["id"] == "m3"
+    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    # Another key is another clear. It ends the memory of that Run.
+    assert clear_store(SQUAD_A, SEAT_A, KEY_2) == {"deleted": True, "replayed": False}
+    assert note_texts() == []
+    with pytest.raises(RoomMemoryRefusal) as closed:
+        later.add("A note of a Run that the clear ended.")
+    assert closed.value.error_type == "room_memory_closed"
+    # A clear of a store without notes removes nothing. Its key is recorded too.
+    assert clear_store(SQUAD_A, SEAT_A, KEY_3) == {"deleted": False, "replayed": False}
+    assert clear_store(SQUAD_A, SEAT_A, KEY_3) == {"deleted": False, "replayed": True}
+    assert [record["key"] for record in stored_file()["clears"]] == [KEY, KEY_2, KEY_3]
+    for seat, key in ((SEAT_A, "key"), (SEAT_A, KEY.upper()), ("seat", KEY), (SEAT_A, None)):
+        with pytest.raises(ValueError):
+            clear_store(SQUAD_A, seat, key)
+
+
+def test_two_clears_with_one_key_at_the_same_moment_remove_one_time(memory_room):
+    RoomMemory(SQUAD_A, SEAT_A).add("A note before the clear.")
+    start, results = threading.Barrier(8), []
+
+    def clear():
+        start.wait(10)
+        results.append(clear_store(SQUAD_A, SEAT_A, KEY))
+
+    threads = [threading.Thread(target=clear) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+    # One request cleared. Each other request found its record and got the same result.
+    assert sorted(result["replayed"] for result in results) == [False] + [True] * 7
+    assert all(result["deleted"] for result in results)
+    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    # A request of that group that reaches the pod late, after the Agent saved a new note.
+    RoomMemory(SQUAD_A, SEAT_A).add("A note after the first clear.")
+    assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": True}
+    assert note_texts() == ["A note after the first clear."]
+
+
+def test_a_clear_and_its_record_are_one_write(memory_room, monkeypatch):
+    RoomMemory(SQUAD_A, SEAT_A).add("A note before the clear.")
+    before = store_path().read_bytes()
+    writes = []
+    replace = os.replace
+
+    def failing(source, target):
+        writes.append(Path(source).read_text(encoding="utf-8"))
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(room_memory.os, "replace", failing)
+    with pytest.raises(OSError):
+        clear_store(SQUAD_A, SEAT_A, KEY)
+    # The write did not take place: the notes are there, and the key is not recorded.
+    assert store_path().read_bytes() == before
+    assert sorted(path.name for path in store_path().parent.iterdir()) == [f"{SQUAD_A}.json"]
+    # The one file that the clear wanted to put in place held both changes.
+    assert len(writes) == 1
+    wanted = json.loads(writes[0])
+    assert wanted["notes"] == [] and wanted["clears"] == [
+        {"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    monkeypatch.setattr(room_memory.os, "replace", replace)
+    # So the same key clears when it comes again.
+    assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": False}
+    assert note_texts() == []
+
+
+def test_a_clear_record_names_its_seat(memory_room):
+    RoomMemory(SQUAD_A, SEAT_A).add("A note of the first seat.")
+    # A new seat clears before its first Run. The pod cannot know which seat is the later
+    # one, so the notes of the other seat stay. The key is recorded for the seat that asked.
+    assert clear_store(SQUAD_A, SEAT_A2, KEY) == {"deleted": False, "replayed": False}
+    assert note_texts(seat=SEAT_A) == ["A note of the first seat."]
+    assert note_texts(seat=SEAT_A2) == []
+    # The first Run of the new seat ends the old notes and keeps the record.
+    second = RoomMemory(SQUAD_A, SEAT_A2)
+    assert second.snapshot() == []
+    assert "first seat" not in store_path().read_text(encoding="utf-8")
+    assert second.add("A note of the second seat.")["id"] == "m1"
+    assert stored_file()["seatId"] == SEAT_A2
+    # The answer of that clear was lost, and the request comes again: the note stays.
+    assert clear_store(SQUAD_A, SEAT_A2, KEY) == {"deleted": False, "replayed": True}
+    assert note_texts(seat=SEAT_A2) == ["A note of the second seat."]
+    # A late clear for the seat that left removes nothing of the later seat: not with
+    # the same key, and not with a new key.
+    for key in (KEY, KEY_2):
+        assert clear_store(SQUAD_A, SEAT_A, key) == {"deleted": False, "replayed": False}
+        assert clear_store(SQUAD_A, SEAT_A, key) == {"deleted": False, "replayed": True}
+    assert note_texts(seat=SEAT_A2) == ["A note of the second seat."]
+    assert stored_file()["seatId"] == SEAT_A2
+    # A write of the later seat keeps each record.
+    second.add("One more note of the second seat.")
+    assert [(record["seatId"], record["key"]) for record in stored_file()["clears"]] == [
+        (SEAT_A2, KEY), (SEAT_A, KEY), (SEAT_A, KEY_2)]
+    # Another squad has its own file and its own records.
+    assert clear_store(SQUAD_B, SEAT_A2, KEY) == {"deleted": False, "replayed": False}
+    assert len(note_texts(seat=SEAT_A2)) == 2
+
+
+def test_the_delete_for_a_seat_that_left_keeps_the_clear_records_of_another_seat(memory_room):
+    RoomMemory(SQUAD_A, SEAT_A).add("A note of the first seat.")
+    clear_store(SQUAD_A, SEAT_A2, KEY)
+    # The platform deletes the notes of the seat that left.
+    assert delete_store(SQUAD_A, SEAT_A) is True
+    assert "first seat" not in store_path().read_text(encoding="utf-8")
+    assert note_texts(seat=SEAT_A) == []
+    RoomMemory(SQUAD_A, SEAT_A2).add("A note of the second seat.")
+    assert clear_store(SQUAD_A, SEAT_A2, KEY) == {"deleted": False, "replayed": True}
+    assert note_texts(seat=SEAT_A2) == ["A note of the second seat."]
+    # The delete for the seat that owns the store and has all its records removes the file.
+    assert delete_store(SQUAD_A, SEAT_A2) is True
+    assert not store_path().exists()
+    assert delete_store(SQUAD_A, SEAT_A2) is False
+
+
+def test_a_store_remembers_a_fixed_number_of_request_keys_and_trusts_no_stored_record(memory_room):
+    keys = [f"{number:08x}-0000-4000-8000-000000000000" for number in range(1, MAX_CLEARS + 2)]
+    for key in keys:
+        assert clear_store(SQUAD_A, SEAT_A, key)["replayed"] is False
+    assert MAX_CLEARS == 16
+    assert [record["key"] for record in stored_file()["clears"]] == keys[1:]
+    RoomMemory(SQUAD_A, SEAT_A).add("A note after the clears.")
+    for key in keys[1:]:
+        assert clear_store(SQUAD_A, SEAT_A, key) == {"deleted": False, "replayed": True}
+    assert note_texts() == ["A note after the clears."]
+    # A file that other code of the pod wrote: only a whole record of the right shape counts.
+    value = stored_file()
+    value["clears"] = [
+        {"seatId": SEAT_A, "key": KEY, "deleted": "yes"}, {"seatId": "seat", "key": KEY, "deleted": True},
+        {"seatId": SEAT_A, "key": "key", "deleted": True}, {"seatId": SEAT_A, "key": KEY_3},
+        "a text", None, 7,
+        {"seatId": SEAT_A, "key": KEY_2, "deleted": False, "notes": ["IGNORED"]},
+        {"seatId": SEAT_A, "key": KEY_2, "deleted": True},
+    ]
+    store_path().write_text(json.dumps(value), encoding="utf-8")
+    assert clear_store(SQUAD_A, SEAT_A, KEY_2) == {"deleted": False, "replayed": True}
+    assert note_texts() == ["A note after the clears."]
+    # The key of a record that does not count clears as a first request.
+    assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": False}
+    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY_2, "deleted": False},
+                                       {"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    # A clear record is no note: a Run reads the notes alone.
+    assert "clears" not in stored_memory_line(RoomMemory(SQUAD_A, SEAT_A))
+
+
+@pytest.mark.asyncio
+async def test_the_delete_route_clears_one_time_for_one_request_key(memory_room, monkeypatch):
+    pod = Pod(monkeypatch)
+    answer = model_reply(content="public reply")
+    save = model_reply(tool="room_memory", arguments={"action": "add", "text": "A note before the clear."})
+    again = model_reply(tool="room_memory", arguments={"action": "add", "text": "A note after the clear."})
+    url = f"/v1/room-memory/{SQUAD_A}/{SEAT_A}"
+    first_result = {"object": "hermes.room_memory.deleted", "squad_id": SQUAD_A, "seat_id": SEAT_A,
+                    "deleted": True}
+    async with TestClient(TestServer(capabilities_app(pod.adapter)), headers=AUTH) as client:
+        await pod.run(client, request_body(), save, answer)
+        # A request key of another shape is refused, and nothing is removed.
+        for key in ("key", KEY.upper(), KEY + "0", "", f"{KEY},{KEY}"):
+            refused = await client.delete(url, headers={"Idempotency-Key": key})
+            assert (refused.status, (await refused.json())["error"]["code"]) == (400, "invalid_room_memory")
+        assert note_texts() == ["A note before the clear."]
+        # Two requests with one key at the same moment: one clears.
+        answers = await asyncio.gather(*(client.delete(url, headers={"Idempotency-Key": KEY})
+                                         for _ in range(2)))
+        bodies = [await response.json() for response in answers]
+        assert [response.status for response in answers] == [200, 200]
+        assert sorted(body["replayed"] for body in bodies) == [False, True]
+        assert all({**body, "replayed": None} == {**first_result, "replayed": None} for body in bodies)
+        assert note_texts() == []
+        # The Agent saves a note in its next reply.
+        _, wrote = await pod.run(client, request_body(), again, answer)
+        assert pod.turn(wrote) == [memory_line([]) + "\n" + ROOM_JSON]
+        assert note_texts() == ["A note after the clear."]
+        # The platform lost the answer of the clear and asks again with the same key: the pod
+        # answers the stored result, and the later note stays.
+        retry = await client.delete(url, headers={"Idempotency-Key": KEY})
+        assert (retry.status, await retry.json()) == (200, {**first_result, "replayed": True})
+        assert note_texts() == ["A note after the clear."]
+        view = await (await client.get(url)).json()
+        assert [n["text"] for n in view["notes"]] == ["A note after the clear."]
+        _, reads = await pod.run(client, request_body(), answer)
+        assert "A note after the clear." in pod.turn(reads)[0]
+        # A new key clears. The delete without a key (the seat left) removes the store.
+        new = await (await client.delete(url, headers={"Idempotency-Key": KEY_2})).json()
+        assert (new["deleted"], new["replayed"]) == (True, False)
+        assert note_texts() == [] and store_path().exists()
+        gone = await (await client.delete(url)).json()
+        assert gone == first_result and not store_path().exists()
+
+
+# --- A room session runs only with its room policy --------------------------------
+
+def session_app(adapter):
+    """The entries that continue a named session with an ordinary Agent."""
+    app = history_app(adapter)
+    app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+    app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    return app
+
+
+def test_a_session_of_a_room_and_each_session_that_continues_it_is_a_room_session(tmp_path):
+    from hermes_state import SessionDB
+    room = SESSION_PREFIX + str(uuid4())
+    assert ROOM_SESSION_FAMILY == "agent-chat-pawchat-" and room.startswith(ROOM_SESSION_FAMILY)
+    # The id alone decides without a session store.
+    for session in (room, "agent-chat-pawchat-another-form", ROOM_SESSION_FAMILY):
+        assert is_room_session(session) is True
+    for session in ("private-chat", "agent-chat-private", "x" + room, "", None, 7, ["list"]):
+        assert is_room_session(session) is False
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(room, "api_server")
+        db.create_session("fork", "api_server", parent_session_id=room)
+        db.create_session("fork-of-fork", "api_server", parent_session_id="fork")
+        db.create_session("private-chat", "api_server")
+        db.create_session("private-child", "api_server", parent_session_id="private-chat")
+        for session in (room, "fork", "fork-of-fork"):
+            assert is_room_session(session, db) is True
+        for session in ("private-chat", "private-child", "unknown-session"):
+            assert is_room_session(session, db) is False
+        # Without the store, the id of a fork says nothing.
+        assert is_room_session("fork") is False
+
+        class Broken:
+            def get_session(self, session):
+                raise RuntimeError("the store cannot answer")
+
+        with pytest.raises(RuntimeError):
+            is_room_session("fork", Broken())
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_room_session_does_not_continue_as_an_ordinary_chat(memory_room, monkeypatch):
+    pod = Pod(monkeypatch, history=True)
+    answer = model_reply(content="public reply")
+    body = request_body()
+    room = body["session_id"]
+    started = []
+
+    async def ordinary_turn(**turn):
+        started.append(turn)
+        return ({"final_response": "private reply", "session_id": turn["session_id"], "messages": []},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+    async with TestClient(TestServer(session_app(pod.adapter)), headers=AUTH) as client:
+        await pod.run(client, body, answer)
+        db = pod.adapter._ensure_session_db()
+        assert "ROOM_TEXT_SENTINEL" in json.dumps(db.get_messages_as_conversation(room))
+        # Sessions that continue the room session under another id, as a fork and a
+        # compression child do. And an ordinary session of the owner.
+        db.create_session("room-fork", "api_server", parent_session_id=room)
+        db.replace_messages("room-fork", db.get_messages(room))
+        db.create_session("room-fork-child", "api_server", parent_session_id="room-fork")
+        db.create_session("private-chat", "api_server")
+        db.append_message("private-chat", "user", "PRIVATE_HISTORY_SENTINEL")
+        monkeypatch.setattr(pod.adapter, "_run_agent", ordinary_turn)
+        sessions_before = len(db.list_sessions_rich(limit=100))
+
+        async def refused(response):
+            assert response.status == 400, await response.text()
+            assert (await response.json())["error"]["code"] == "invalid_room_policy"
+            assert "ROOM_TEXT_SENTINEL" not in await response.text()
+
+        unknown = SESSION_PREFIX + str(uuid4())
+        for session in (room, "room-fork", "room-fork-child", unknown, "agent-chat-pawchat-other"):
+            # The normal continuation and the streaming continuation.
+            await refused(await client.post(f"/api/sessions/{session}/chat",
+                                            json={"message": "What did the room say?"}))
+            await refused(await client.post(f"/api/sessions/{session}/chat/stream",
+                                            json={"message": "What did the room say?"}))
+            # The other entries that load the history of a named session, and the fork.
+            await refused(await client.post(
+                "/v1/chat/completions", headers={"X-Hermes-Session-Id": session},
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Go on."}]}))
+            await refused(await client.post(f"/api/sessions/{session}/fork", json={"id": f"copy-{uuid4()}"}))
+            await refused(await client.post("/v1/runs", json={"session_id": session, "input": "Go on."}))
+        # No ordinary Agent started, and no session was made.
+        assert started == []
+        assert len(db.list_sessions_rich(limit=100)) == sessions_before
+        assert pod.adapter._active_run_tasks == {}
+
+        # An ordinary session continues as before, on both entries.
+        normal = await client.post("/api/sessions/private-chat/chat", json={"message": "Hello."})
+        assert normal.status == 200, await normal.text()
+        assert (await normal.json())["message"]["content"] == "private reply"
+        stream = await client.post("/api/sessions/private-chat/chat/stream", json={"message": "Hello."})
+        assert stream.status == 200
+        assert "private reply" in await stream.text()
+        assert [turn["session_id"] for turn in started] == ["private-chat", "private-chat"]
+        for turn in started:
+            assert "PRIVATE_HISTORY_SENTINEL" in json.dumps(turn["conversation_history"])
+            assert "ROOM_TEXT_SENTINEL" not in json.dumps(turn["conversation_history"])
+        # A room Run of another room session is not changed by the guard.
+        status, again = await pod.run(client, request_body(), answer)
+        assert status["status"] == "completed" and pod.turn(again) == [memory_line([]) + "\n" + ROOM_JSON]
+
+        # A session store that cannot answer: the guard cannot examine the session, so
+        # each entry refuses the request and no Agent starts.
+        def broken(session_id):
+            raise RuntimeError("the store cannot answer")
+
+        monkeypatch.setattr(db, "get_session", broken)
+        started.clear()
+        for path, headers, payload in (
+                ("/api/sessions/private-chat/chat", {}, {"message": "Hello."}),
+                ("/api/sessions/private-chat/chat/stream", {}, {"message": "Hello."}),
+                ("/v1/chat/completions", {"X-Hermes-Session-Id": "private-chat"},
+                 {"model": "hermes-agent", "messages": [{"role": "user", "content": "Go on."}]}),
+                ("/api/sessions/private-chat/fork", {}, {"id": f"copy-{uuid4()}"}),
+                ("/v1/runs", {}, {"session_id": "private-chat", "input": "Go on."})):
+            unavailable = await client.post(path, headers=headers, json=payload)
+            assert unavailable.status == 503, (path, await unavailable.text())
+            assert (await unavailable.json())["error"]["code"] == "session_db_unavailable"
+        assert started == [] and pod.adapter._active_run_tasks == {}

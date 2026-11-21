@@ -26,6 +26,14 @@ reads anything. This holds when the platform's delete call never arrived.
 
 Delete fence. A delete also ends the memory of each Run that is in progress
 (`_generations`): such a Run cannot write the notes back.
+
+One clear for one request key. The owner's clear carries the request key of
+the platform (`clear_store`). The store removes the notes and records that
+key in the same write of the same file, so the two happen together or not at
+all. A second clear with that key, for that seat, finds the record: it
+answers the first result and removes nothing. This holds for two requests at
+the same moment and for a request that comes again because its answer was
+lost. The notes that the Agent saved after the first clear therefore stay.
 """
 import json
 import logging
@@ -45,6 +53,9 @@ MAX_NOTES = 50
 # UTF-8 bytes of all note texts of one squad.
 MAX_BYTES = 8192
 MAX_NOTE_CHARS = 500
+# The request keys of owner clears that one store remembers, the newest last.
+# A clear comes again within moments of the first one, so a short list is enough.
+MAX_CLEARS = 16
 # A larger file is not a store that this module wrote.
 MAX_FILE_BYTES = 65536
 # The line of the user turn that holds the notes starts with this word.
@@ -190,21 +201,63 @@ def _read(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _load(path: Path, squad_id: str, seat_id: str) -> tuple[list[dict], int, bool]:
-    """(notes, next note number, a store of another seat is on disk) for one seat."""
-    value = _read(path)
-    if value is None:
-        return [], 1, False
-    if (value.get("version") != VERSION or value.get("squadId") != squad_id
-            or value.get("seatId") != seat_id):
-        # Another squad's file under this name, or the notes of a seat that left.
-        return [], 1, True
+def _valid_clears(raw) -> list[dict]:
+    """The clear records of a stored value that are well formed, the newest last.
+
+    One record is one owner clear that this store completed: the seat that it
+    was for, its request key, and its result. Like the notes, the records are
+    checked at each read.
+    """
+    records: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw if isinstance(raw, list) else ():
+        if not isinstance(item, dict):
+            continue
+        seat_id, key, deleted = item.get("seatId"), item.get("key"), item.get("deleted")
+        if (not valid_id(seat_id) or not valid_id(key) or not isinstance(deleted, bool)
+                or (seat_id, key) in seen):
+            continue
+        seen.add((seat_id, key))
+        records.append({"seatId": seat_id, "key": key, "deleted": deleted})
+    return records
+
+
+def _store(value, squad_id: str) -> dict | None:
+    """A stored value as the store of this squad, whatever seat wrote it, or None.
+
+    None for a file of another squad under this name and for a value that is
+    no store of this module.
+    """
+    if (not isinstance(value, dict) or value.get("version") != VERSION
+            or value.get("squadId") != squad_id or not valid_id(value.get("seatId"))):
+        return None
     notes = _valid_notes(value.get("notes"))
     numbers = [int(note["id"][1:]) for note in notes]
     stored_next = value.get("nextId")
     next_id = max([stored_next if isinstance(stored_next, int) and stored_next > 0 else 1,
                    *(number + 1 for number in numbers)])
-    return notes, next_id, False
+    return {"seatId": value["seatId"], "notes": notes, "nextId": next_id,
+            "clears": _valid_clears(value.get("clears"))}
+
+
+def _load(path: Path, squad_id: str, seat_id: str) -> tuple[list[dict], int, bool, list[dict]]:
+    """(notes, next note number, a store of another seat is on disk, clear records).
+
+    The notes and the note number are those of this seat. The clear records
+    are all records of the file: a write keeps each of them, also the record
+    of another seat.
+    """
+    value = _read(path)
+    if value is None:
+        return [], 1, False, []
+    store = _store(value, squad_id)
+    if store is None:
+        # Another squad's file under this name.
+        return [], 1, True, []
+    if store["seatId"] != seat_id:
+        # The notes of a seat that left.
+        return [], 1, True, store["clears"]
+    return store["notes"], store["nextId"], False, store["clears"]
 
 
 def _unlink(path: Path) -> bool:
@@ -215,13 +268,21 @@ def _unlink(path: Path) -> bool:
         return False
 
 
-def _write(path: Path, squad_id: str, seat_id: str, notes: list[dict], next_id: int) -> None:
+def _write(path: Path, squad_id: str, seat_id: str, notes: list[dict], next_id: int,
+           clears: list[dict] | tuple = ()) -> None:
+    """Replace the store with one new file: the notes and the clear records together.
+
+    The new file is complete before it takes the place of the old one, so a
+    reader and a crash see the old store or the new store, never a part.
+    """
     directory = path.parent
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload = json.dumps(
-        {"version": VERSION, "notice": NOTICE, "squadId": squad_id, "seatId": seat_id,
-         "nextId": next_id, "notes": notes},
-        ensure_ascii=False, separators=(",", ":"))
+    stored = {"version": VERSION, "notice": NOTICE, "squadId": squad_id, "seatId": seat_id,
+              "nextId": next_id, "notes": notes}
+    if clears:
+        # The store remembers the newest keys. This is the one place that limits them.
+        stored["clears"] = list(clears)[-MAX_CLEARS:]
+    payload = json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
     fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=f".{squad_id}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -236,6 +297,15 @@ def _write(path: Path, squad_id: str, seat_id: str, notes: list[dict], next_id: 
         except OSError:
             pass
         raise
+    try:
+        # The new name is durable too. Not every file system can do this.
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass
 
 
 def _usage(notes) -> dict:
@@ -266,18 +336,25 @@ class RoomMemory:
         with _LOCK:
             self._generation = _generations.get(self._key, 0)
 
-    def _open(self) -> tuple[list[dict], int]:
-        """Notes and next note number of this seat. Call with `_LOCK` held."""
+    def _open(self) -> tuple[list[dict], int, list[dict]]:
+        """Notes, next note number and clear records of this seat's store.
+
+        Call with `_LOCK` held.
+        """
         if _generations.get(self._key, 0) != self._generation:
             raise RoomMemoryRefusal(
                 "room_memory_closed",
                 "The room memory was cleared while this reply was in progress. "
                 "Do not save notes in this reply.")
-        notes, next_id, foreign = _load(self._path, self.squad_id, self.seat_id)
+        notes, next_id, foreign, clears = _load(self._path, self.squad_id, self.seat_id)
         if foreign:
             # The seat that wrote these notes left the squad: they end here.
-            _unlink(self._path)
-        return notes, next_id
+            # A clear that this seat asked for before its first Run stays known.
+            if clears:
+                _write(self._path, self.squad_id, self.seat_id, [], 1, clears)
+            else:
+                _unlink(self._path)
+        return notes, next_id, clears
 
     def snapshot(self) -> list[dict]:
         """The notes that this Run reads. A store that cannot be read has none."""
@@ -292,9 +369,9 @@ class RoomMemory:
 
     def _change(self, apply) -> dict:
         with _LOCK:
-            notes, next_id = self._open()
+            notes, next_id, clears = self._open()
             result, notes, next_id = apply(notes, next_id)
-            _write(self._path, self.squad_id, self.seat_id, notes, next_id)
+            _write(self._path, self.squad_id, self.seat_id, notes, next_id, clears)
             return {**result, "used": _usage(notes), "limits": limits()}
 
     @staticmethod
@@ -389,6 +466,10 @@ def read_store(squad_id: str, seat_id: str, *, directory: Path | None = None) ->
 def delete_store(squad_id: str, seat_id: str, *, directory: Path | None = None) -> bool:
     """Delete the notes of one seat in one squad. True when a store was deleted.
 
+    This is the platform's delete after the seat left the squad. It carries
+    no request key: a seat that left saves no more notes, so a repeat can
+    remove nothing new. The owner's clear is `clear_store`.
+
     Safe to repeat, and safe when it arrives late: it deletes only a store
     that this seat wrote, so it never removes the notes of a later seat. A
     file that is not a readable store is deleted too. Each Run in progress
@@ -404,7 +485,57 @@ def delete_store(squad_id: str, seat_id: str, *, directory: Path | None = None) 
         if value is not None and value.get("squadId") == squad_id and valid_id(value.get("seatId")) \
                 and value["seatId"] != seat_id:
             return False
+        store = _store(value, squad_id)
+        kept = [] if store is None else [
+            record for record in store["clears"] if record["seatId"] != seat_id]
+        if kept:
+            # The notes go. The clears that other seats asked for stay known.
+            _write(path, squad_id, seat_id, [], store["nextId"], kept)
+            return True
         return _unlink(path)
+
+
+def clear_store(squad_id: str, seat_id: str, request_key: str, *,
+                directory: Path | None = None) -> dict:
+    """The owner's clear of the notes of one seat: one time for one request key.
+
+    Returns `{"deleted", "replayed"}`. `deleted` says that this request
+    removed notes of this seat. `replayed` says that the store already knew
+    the key: it then answers the first result and changes nothing.
+
+    The clear and its record are one write of one file (`_write`). After a
+    crash the store has the notes and no record, or no notes and the record.
+    All changes of a store run under one lock, so of two requests with one
+    key at the same moment, one clears and the other finds the record.
+
+    The record names the seat. A store that another seat wrote keeps its
+    notes: the record alone is added, and the clear removes nothing. A clear
+    that a new seat asked for before its first Run is therefore also known
+    when that seat has notes later.
+    """
+    path = _store_path(directory if directory is not None else store_directory(), squad_id)
+    if not valid_id(seat_id) or not valid_id(request_key):
+        raise ValueError("Invalid seat id or request key")
+    with _LOCK:
+        store = _store(_read(path), squad_id)
+        records = [] if store is None else store["clears"]
+        for record in records:
+            if record["seatId"] == seat_id and record["key"] == request_key:
+                return {"deleted": record["deleted"], "replayed": True}
+        # A first clear. Like a delete, it ends the memory of each Run in
+        # progress for this seat. A repeat above does not: the Runs that
+        # started after the first clear keep their memory.
+        key = (str(path), seat_id)
+        _generations[key] = _generations.get(key, 0) + 1
+        if store is not None and store["seatId"] != seat_id:
+            owner, notes, next_id, deleted = store["seatId"], store["notes"], store["nextId"], False
+        else:
+            # The note numbers go on: a note id is never used again in one store.
+            owner, notes, next_id = seat_id, [], 1 if store is None else store["nextId"]
+            deleted = store is not None and bool(store["notes"])
+        record = {"seatId": seat_id, "key": request_key, "deleted": deleted}
+        _write(path, squad_id, owner, notes, next_id, [*records, record])
+        return {"deleted": deleted, "replayed": False}
 
 
 def memory_line(memory: RoomMemory) -> str:
