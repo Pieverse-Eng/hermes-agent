@@ -243,6 +243,8 @@ async def test_capabilities_keep_v1_and_v2_and_declare_v3_under_a_new_key(memory
     assert compact(features["squad_room_isolation"]) == V1_DECLARATION
     assert features[ROOM_RESEARCH_FEATURE] == V2_WITH_X
     assert features[ROOM_MEMORY_FEATURE] == V3_WITH_X
+    # The run generation is a separate key: the v3 declaration never changes.
+    assert features["room_memory_generation"] == room_memory.RUN_GENERATION
     assert features["memory_write_api"] is False
     assert body["endpoints"]["room_memory"] == {
         "method": "GET", "path": "/v1/room-memory/{squad_id}/{seat_id}"}
@@ -256,6 +258,7 @@ async def test_a_pod_without_a_bearer_declares_no_room_memory(memory_room):
     async with TestClient(TestServer(capabilities_app(adapter))) as client:
         features = (await (await client.get("/v1/capabilities")).json())["features"]
         assert features[ROOM_MEMORY_FEATURE] is None
+        assert features["room_memory_generation"] is None
         for method in (client.get, client.delete):
             assert (await method(f"/v1/room-memory/{SQUAD_A}/{SEAT_A}")).status == 403
 
@@ -2103,6 +2106,24 @@ async def test_the_delete_route_reports_a_refused_clear_and_changes_nothing(memo
         left = await client.delete(url)
         assert (left.status, (await left.json())["deleted"]) == (200, True)
         assert note_texts() == [] and stored_keys() == keys
+
+
+def test_each_start_of_the_pod_process_has_a_new_run_generation():
+    """The platform sends the delete of a seat that left again for another generation."""
+    import subprocess
+    import sys
+    from uuid import UUID
+    script = "from gateway.room_memory import RUN_GENERATION as g; print(g)"
+    values = [subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                             check=True, cwd=str(Path(__file__).resolve().parents[2]),
+                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}).stdout.strip()
+              for _ in range(2)]
+    assert len({*values, room_memory.RUN_GENERATION}) == 3
+    for value in values:
+        assert str(UUID(value)) == value
+    # One process keeps one value.
+    from gateway.room_memory import RUN_GENERATION
+    assert RUN_GENERATION == room_memory.RUN_GENERATION
 
 
 # --- A room session runs only with its room policy --------------------------------

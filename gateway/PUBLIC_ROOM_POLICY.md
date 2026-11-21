@@ -286,6 +286,13 @@ after the first clear stay.
 - A key of another shape is refused (`400 invalid_room_memory`).
 - The platform's delete after a seat left carries no key. A seat that left
   saves no more notes, so that delete is safe to repeat as it is.
+- `GET /v1/capabilities` reports the pod's run generation as
+  `room_memory_generation` (`RUN_GENERATION`), outside the v3 declaration: a
+  new value for each start of the Hermes process. The platform reads it before
+  each delete for a seat that left, records it when the delete completes, and
+  sends that delete again when the pod reports another value: a new process
+  can find a disk that changed while no process ran (a restore, a rollback of
+  the image or of its volume).
 
 **The text of a note is in its store and in no other place of the pod.** A
 delete of the store therefore leaves no copy that a session route or a later

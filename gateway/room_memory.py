@@ -56,6 +56,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,15 @@ _CREDENTIAL = re.compile(
     r"seed[ _-]?phrase|recovery[ _-]?phrase|mnemonic)\b\s*(?:[:=]|is\b|are\b)"
     r"|私钥|助记词|密码\s*[:=\uff1a是为]",
     re.IGNORECASE)
+
+# The run generation of this pod: a new value for each start of this process.
+# `GET /v1/capabilities` reports it. The platform reads it before each delete
+# for a seat that left, records it when the delete completes, and sends that
+# delete again when the pod reports another value: a new process can find a
+# disk that changed while no process of this generation ran (a restore, a
+# rollback of the image or of its volume). It names no squad, no seat and no
+# note.
+RUN_GENERATION = str(uuid.uuid4())
 
 # One process serves one HERMES_HOME, and a store is a few kilobytes: one lock
 # for every store keeps a read, a write and a delete in one order.

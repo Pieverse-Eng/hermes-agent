@@ -3910,6 +3910,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 if self._expected_api_key() and self._room_policy_supported(PUBLIC_ROOM_MEMORY_POLICY)
                 else None)
 
+    def _room_memory_generation(self):
+        """The run generation of this process, or None when the routes refuse (no bearer)."""
+        if not self._expected_api_key():
+            return None
+        from gateway.room_memory import RUN_GENERATION
+        return RUN_GENERATION
+
     def _room_memory_target(self, request: "web.Request"):
         """(squad id, seat id) of a memory route, or the response that refuses the request.
 
@@ -3963,7 +3970,9 @@ class APIServerAdapter(BasePlatformAdapter):
         cannot remove the notes that the Agent saved after the first clear.
 
         The platform's delete after a seat left carries no key. A seat that
-        left saves no more notes, and that delete is safe to repeat.
+        left saves no more notes, and that delete is safe to repeat. The
+        platform sends it again when the run generation that
+        `GET /v1/capabilities` reports changes (`RUN_GENERATION`).
 
         A store keeps each clear record for `CLEAR_RETENTION_SECONDS`. When it
         holds `MAX_CLEARS` of them, a new key gets `409
@@ -4062,6 +4071,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # platforms validate it with a strict schema.
                 ROOM_RESEARCH_FEATURE: self._room_research_capability(),
                 ROOM_MEMORY_FEATURE: self._room_memory_capability(),
+                # Not part of the declaration above, which never changes: the run
+                # generation of this process (gateway/room_memory.py).
+                "room_memory_generation": self._room_memory_generation(),
                 "workflow_skill_loading": True,
                 "workflow_resource_loading": True,
                 "compact_host_tools": True,
