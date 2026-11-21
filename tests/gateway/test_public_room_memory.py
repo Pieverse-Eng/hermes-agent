@@ -39,6 +39,8 @@ from tools.execution_scope import (
     public_room_memory, public_room_policy, public_room_scope, room_memory_call_record,
 )
 from tests.gateway.test_api_server_runs import _make_adapter, _create_runs_app
+# Registers session_search in the registry itself, before a fixture copies the registry.
+import tools.session_search_tool  # noqa: F401,E402
 
 AUTH = {"Authorization": "Bearer room-fixture-key"}
 MODEL = {"model": {"provider": "openai", "api_mode": "chat_completions"}}
@@ -1051,14 +1053,16 @@ def test_a_private_conversation_cannot_read_the_store_file(memory_room):
     assert get_read_block_error(str(home / "room-memory-notes.md")) is None
 
 
-def test_a_private_conversation_can_find_and_read_a_room_session(tmp_path):
-    """The owner's private conversation may search the sessions of a shared room.
+def test_no_caller_finds_or_reads_a_room_session(tmp_path, monkeypatch):
+    """`session_search` never lists, finds or reads a room session, in any context.
 
-    The product owner decided it (2026-11-21), also for room sessions that exist
-    now. The search tool has no rule for room sessions. Another rule stays: an
-    ordinary turn does not continue a room session (the room session guard).
+    The tool is in the default toolsets of Telegram, Discord and Matrix, where a
+    group chat can call it. Hermes has no signal yet that proves the owner's
+    private chat and that a caller cannot forge, so no context lifts this rule.
+    A session that continues a room session (a compression child) is left out too.
     """
     from hermes_state import SessionDB
+    from tools.registry import registry
     from tools.session_search_tool import session_search
     db = SessionDB(tmp_path / "state.db")
     room = SESSION_PREFIX + str(uuid4())
@@ -1071,20 +1075,71 @@ def test_a_private_conversation_can_find_and_read_a_room_session(tmp_path):
         db.append_message(session, role="user", content=f"recallsentinel question of {session}")
         ids[session] = db.append_message(session, role="assistant",
                                          content="recallsentinel answer of " + session)
-    everything = {room, legacy, "private-chat"}
+    # A compression child of a room session belongs to the room too.
+    db.create_session("room-child", source="api_server", parent_session_id=room)
+    db.set_session_title("room-child", "Squad room child")
+    ids["room-child"] = db.append_message("room-child", role="assistant",
+                                          content="recallsentinel answer of room-child")
+    # The current session of each kind of caller: a Telegram group, a Matrix room,
+    # a channel DM, and an API Run without a room policy.
+    contexts = {"telegram-group": "telegram", "matrix-room": "matrix",
+                "discord-dm": "discord", "api-run": "api_server"}
+    for session, source in contexts.items():
+        db.create_session(session, source=source)
+    room_ids = (room, legacy, "room-child")
+
+    def assert_no_room_text(answer):
+        # Each message of a room session names its session after "of". An error may
+        # repeat the id that the caller sent, never a message.
+        text = json.dumps(answer)
+        for session in room_ids:
+            assert f"of {session}" not in text
+        assert not set(room_ids) & {entry.get("session_id") for entry in answer.get("results") or ()}
+
+    for current in (None, *contexts):
+        found = json.loads(session_search(query="recallsentinel", limit=10, db=db,
+                                          current_session_id=current))
+        assert [entry["session_id"] for entry in found["results"]] == ["private-chat"]
+        assert_no_room_text(found)
+        listed = json.loads(session_search(db=db, limit=10, current_session_id=current))
+        assert "private-chat" in {entry["session_id"] for entry in listed["results"]}
+        assert_no_room_text(listed)
+        for title in ("Squad room reply", "Squad room child"):
+            by_title = json.loads(session_search(query=title, db=db, current_session_id=current))
+            assert_no_room_text(by_title)
+        for session in room_ids:
+            read = json.loads(session_search(session_id=session, db=db, current_session_id=current))
+            assert read["success"] is False
+            assert_no_room_text(read)
+            scroll = json.loads(session_search(session_id=session, around_message_id=ids[session],
+                                               db=db, current_session_id=current))
+            assert scroll["success"] is False
+            assert_no_room_text(scroll)
+            # The anchor of a room message does not open under a private session id either.
+            forged = json.loads(session_search(session_id="private-chat", around_message_id=ids[session],
+                                               db=db, current_session_id=current))
+            assert_no_room_text(forged)
+    assert json.loads(session_search(session_id="private-chat", db=db))["success"] is True
+    # A tool argument cannot lift the rule: the handler takes no such field.
+    handler = registry.get_entry("session_search").handler
+    for forged_args in ({"query": "recallsentinel", "limit": 10, "include_room_sessions": True,
+                         "owner_private_chat": True},
+                        {"session_id": room, "include_room_sessions": True},
+                        {"session_id": "@session:default/" + room}):
+        assert_no_room_text(json.loads(handler(forged_args, db=db)))
+    # A store that cannot answer: the search leaves the session out.
+    real_get = db.get_session
+
+    def get_session(session_id):
+        if session_id == "private-chat":
+            raise RuntimeError("the store cannot answer")
+        return real_get(session_id)
+
+    monkeypatch.setattr(db, "get_session", get_session)
     found = json.loads(session_search(query="recallsentinel", limit=10, db=db))
-    assert {entry["session_id"] for entry in found["results"]} == everything
-    listed = json.loads(session_search(db=db, limit=10))
-    assert {entry["session_id"] for entry in listed["results"]} == everything
-    by_title = json.loads(session_search(query="Squad room reply", db=db))
-    assert room in {entry["session_id"] for entry in by_title["results"]}
-    for session in (room, legacy):
-        read = json.loads(session_search(session_id=session, db=db))
-        assert read["success"] is True and "recallsentinel answer of " + session in json.dumps(read)
-        scroll = json.loads(session_search(session_id=session, around_message_id=ids[session], db=db))
-        assert scroll["success"] is True and "recallsentinel" in json.dumps(scroll)
-    # Search and continuation are two rules. The sessions that the search finds are
-    # still room sessions for each entry that would continue one.
+    assert found["results"] == []
+    assert json.loads(session_search(session_id="private-chat", db=db))["success"] is False
+    # Search and continuation are two rules with one definition of a room session.
     assert is_room_session(room) and is_room_session(legacy) and not is_room_session("private-chat")
 
 
@@ -1530,13 +1585,12 @@ async def test_a_clear_leaves_no_text_of_a_note_in_the_session_history(memory_ro
         for session in sessions:
             history = await session_history(client, session)
             assert "HISTORY_SENTINEL" not in history and MARKER not in history
-        # The owner's private conversation may search a room session (the product owner's
-        # decision). It reads the room input and the reply there, and no text of a note.
+        # No caller of session_search finds or reads a room session.
         from tools.session_search_tool import session_search
         found = session_search(query="remember that we follow", db=db, limit=10)
-        assert set(sessions) & {entry["session_id"] for entry in json.loads(found)["results"]}
+        assert not set(sessions) & {entry["session_id"] for entry in json.loads(found)["results"]}
         read = session_search(session_id=first["session_id"], db=db)
-        assert json.loads(read)["success"] is True and "ROOM_TEXT_SENTINEL" in read
+        assert json.loads(read)["success"] is False and "ROOM_TEXT_SENTINEL" not in read
         for answer in (found, read):
             assert "HISTORY_SENTINEL" not in answer and MARKER not in answer
         # The session keeps the room input alone as each user turn, and of each memory
@@ -2018,12 +2072,13 @@ async def test_a_room_session_does_not_continue_as_an_ordinary_chat(memory_room,
         assert started == []
         assert len(db.list_sessions_rich(limit=100)) == sessions_before
         assert pod.adapter._active_run_tasks == {}
-        # Search is another rule. The owner's private conversation can find and read this
-        # room session with session_search. It cannot continue it.
+        # session_search does not find or read the room session or a session that
+        # continues it.
         from tools.session_search_tool import session_search
         found = json.loads(session_search(query="remember that we follow", db=db, limit=10))
-        assert room in {entry["session_id"] for entry in found["results"]}
-        assert "ROOM_TEXT_SENTINEL" in session_search(session_id=room, db=db)
+        assert not {room, "room-fork", "room-fork-child"} & {e["session_id"] for e in found["results"]}
+        for session in (room, "room-fork"):
+            assert "ROOM_TEXT_SENTINEL" not in session_search(session_id=session, db=db)
 
         # An ordinary session continues as before, on both entries.
         normal = await client.post("/api/sessions/private-chat/chat", json={"message": "Hello."})
@@ -2094,3 +2149,33 @@ async def test_a_run_with_its_own_history_does_not_write_into_a_room_session(mem
         assert status["status"] == "completed"
         assert "OWN_HISTORY_SENTINEL" in json.dumps(requests[0]["messages"])
         assert "ROOM_TEXT_SENTINEL" not in json.dumps(requests[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_an_api_run_without_a_room_policy_cannot_search_a_room_session(memory_room, monkeypatch):
+    """An ordinary Run calls session_search through its own tool loop: no room session."""
+    pod = Pod(monkeypatch, history=True)
+    async with TestClient(TestServer(session_app(pod.adapter)), headers=AUTH) as client:
+        body = request_body()
+        await pod.run(client, body, model_reply(content="public reply"))
+        db = pod.adapter._ensure_session_db()
+        assert "ROOM_TEXT_SENTINEL" in json.dumps(db.get_messages_as_conversation(body["session_id"]))
+        db.create_session("private-chat", "api_server")
+        db.append_message("private-chat", "user", "remember that we follow PRIVATE_SENTINEL")
+        search = model_reply(tool="session_search", arguments={
+            "query": "remember that we follow", "limit": 10,
+            # Fields that a model or a caller could forge. Nothing reads them.
+            "include_room_sessions": True, "owner_private_chat": True})
+        read = model_reply(tool="session_search", call_id="call_2",
+                           arguments={"session_id": body["session_id"]})
+        status, requests = await pod.run(
+            client, {"session_id": "agent-chat-" + str(uuid4()), "input": "What did we say?",
+                     "owner_private_chat": True},
+            search, read, model_reply(content="private reply"), path="/v1/runs")
+        assert status["status"] == "completed"
+        results = pod.turn(requests, "tool", 2)
+        assert len(results) == 2
+        assert "PRIVATE_SENTINEL" in results[0] and body["session_id"] not in results[0]
+        assert json.loads(results[1])["success"] is False
+        for result in results:
+            assert "ROOM_TEXT_SENTINEL" not in result

@@ -294,25 +294,33 @@ conversation can read.
 - File tools refuse `HERMES_HOME/room-memory`. This is defense in depth, not a
   boundary: a private conversation with a shell can read any file of the pod.
 
-**The owner's private conversation may search a room session.** The product
-owner decided it (2026-11-21), also for the room sessions that exist now:
-`session_search` has no rule for a room session, as before this policy. A
-search reads what the session store holds: the room input and the replies of
-the Agent. It reads no text of a note, because the session store holds none
-(above).
+**No caller of `session_search` finds a room session.** The tool does not
+list, find, read or scroll a room session or a session that continues one
+(`_room_session_check`, the same `is_room_session` rule as below), in every
+context. A session store that cannot answer leaves the session out. The tool
+is in the default toolsets of Telegram, Discord and Matrix, so a group chat on
+the same pod can call it.
+
+The product owner decided (2026-11-21) that the owner's private chat may
+search room sessions. That needs a signal that the caller cannot forge, and
+Hermes has none yet: the platform's Agent Chat, the AX channel (conversations
+of other people) and News all call `POST /v1/runs` with the one
+`API_SERVER_KEY`. Only fields and headers of the request, for example the
+`session_id` family, tell them apart. Until the platform sends a credential
+that only the owner's chat holds, the rule above applies to every caller. A
+search would read the room input and the replies of the Agent, and no text of
+a note: the session store holds none (above).
 
 What is not a note: the Agent's own words. A reply that restates a note is a
 message of the room, and the session history keeps it like each other reply.
 The reasoning text of a model can restate a note too, and the session history
 keeps it. A clear of the room memory does not change these.
 
-**A room session runs only with its room policy.** This rule is about the
-policy that runs a session, and not about who may read it. A room session
-holds text of other people and the Agent's replies to it. An ordinary turn on
-that session would make this history the conversation of an Agent with the
-owner's tools and private context. It would also write the owner's private
-turn into the session that the next room Run continues. A search is another
-thing: it gives a private conversation the text as the result of a tool.
+**A room session runs only with its room policy.** A room session holds text
+of other people and the Agent's replies to it. An ordinary turn on that
+session would make this history the conversation of an Agent with the owner's
+tools and private context. It would also write the owner's private turn into
+the session that the next room Run continues.
 Each entry that loads the history of a named session for an ordinary Agent
 refuses a room session with `400 invalid_room_policy`, before it reads the
 session (`_room_session_refusal`). It is the rule of `POST /v1/runs`:
