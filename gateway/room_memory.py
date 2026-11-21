@@ -724,7 +724,7 @@ def delete_store(squad_id: str, seat_id: str, *, directory: Path | None = None) 
         return _unlink(path)
 
 
-def clear_store(squad_id: str, seat_id: str, request_key: str, *,
+def clear_store(squad_id: str, seat_id: str, request_key: str, *, generation,
                 directory: Path | None = None) -> dict:
     """The owner's clear of the notes of one seat: one time for one request key.
 
@@ -747,10 +747,21 @@ def clear_store(squad_id: str, seat_id: str, request_key: str, *,
     `RoomMemoryRefusal("room_memory_clear_limit")` before any change: no
     write, no note removed, and no Run in progress ends. A repeat of a known
     key still answers its first result.
+
+    `generation` is the run generation of this pod that the platform read
+    before it sent the request (`RUN_GENERATION`). Another value, or none, is
+    refused with `RoomMemoryRefusal("room_memory_generation_mismatch")`
+    before any change. This process is then another run of the pod than the
+    one the platform asked, maybe on a restored disk that lost the record of
+    the key: the key could clear the notes written since, so it is not used.
     """
     path = _store_path(directory if directory is not None else store_directory(), squad_id)
     if not valid_id(seat_id) or not valid_id(request_key):
         raise ValueError("Invalid seat id or request key")
+    if not isinstance(generation, str) or generation != RUN_GENERATION:
+        raise RoomMemoryRefusal(
+            "room_memory_generation_mismatch",
+            "This clear was sent for another run of the pod. Nothing was cleared.")
     with _LOCK:
         store = _store(_read(path), squad_id)
         records = [] if store is None else store["clears"]

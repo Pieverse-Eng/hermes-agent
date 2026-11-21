@@ -284,6 +284,13 @@ after the first clear stay.
   the 64 KiB limit of a store file, and a write that would pass that limit is
   refused (`room_memory_full`).
 - A key of another shape is refused (`400 invalid_room_memory`).
+- A clear carries `X-Room-Memory-Generation`: the run generation that the
+  platform read from this pod before it sent the request. The store compares it
+  with its own `RUN_GENERATION` before any change. Another value, or none, gets
+  `409 room_memory_generation_mismatch` and nothing is written: a pod that a
+  restored volume replaced between the platform's read and its delete may have
+  lost the record of the key. The platform reports such a clear as not
+  confirmed and does not send it again.
 - The platform's delete after a seat left carries no key. A seat that left
   saves no more notes, so that delete is safe to repeat as it is.
 - `GET /v1/capabilities` reports the pod's run generation as
