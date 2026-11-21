@@ -405,6 +405,14 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
     keys, tokens) are masked before the value reaches tool progress
     notifications; normal typed text is left intact for debuggability.
     """
+    if tool_name == "room_memory":
+        # A note of a shared squad room stays in the room memory of this pod.
+        # Logs, progress UI and Run events say what changed and nothing else
+        # that the model wrote: one action of the tool and the id of a note.
+        # The result is never empty, so no caller falls back to the raw args.
+        # This also holds for arguments that are not an object.
+        from tools.execution_scope import room_memory_call_record
+        return room_memory_call_record(args)
     if not isinstance(args, dict):
         return args
     if tool_name == "browser_type" and isinstance(args.get("text"), str):

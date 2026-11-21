@@ -1242,6 +1242,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    inference_only_user_prefix: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1267,6 +1268,13 @@ def run_conversation(
         persist_user_display_metadata: Optional display-only metadata for a
             persisted user turn, including event details (e.g. a delegation's
             task count) or API run provenance on an ordinary user message.
+        inference_only_user_prefix: Optional line that each model request
+            of this turn sends before the current user message, and that
+            nothing else gets. It is never part of ``messages``: it is not
+            stored (neither as content nor as an ``api_content`` sidecar),
+            not returned in the transcript and not summarized. A memory room
+            sends the notes of its squad this way, so a clear of those notes
+            leaves no copy in the session history.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1646,6 +1654,15 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                # Request-only text of this turn (the notes of a memory room).
+                # It goes on the API copy after the sidecar composition above,
+                # so the ``api_content`` stamp and the stored row never hold it.
+                if (
+                    isinstance(inference_only_user_prefix, str)
+                    and inference_only_user_prefix
+                    and isinstance(api_msg.get("content"), str)
+                ):
+                    api_msg["content"] = f"{inference_only_user_prefix}\n{api_msg['content']}"
             elif (
                 isinstance(_api_content, str)
                 and _api_content

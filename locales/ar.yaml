@@ -273,6 +273,7 @@ gateway:
     matrix_blocked_other_room: "⚠️ حُجب /resume في Matrix: تلك الجلسة تخصّ غرفة Matrix مختلفة ({room}). استخدم `/resume --cross-room {name}` إن كنت تريد عمدًا استئنافها هنا."
     matrix_cross_room_success: "⚠️ استئناف عبر الغرف: استُؤنفت **{title}** داخل غرفة Matrix ‏**{room}**.\nستستخدم الرسائل المستقبلية في هذه الغرفة ذلك النص حتى `/reset` أو `/resume` آخر.{msg_part}"
     blocked_not_owner:     "⚠️ حُجب /resume: '**{name}**' تخصّ مستخدمًا أو محادثة مختلفة. يمكنك فقط استئناف جلسات هذه المحادثة."
+    room_session_blocked:  "⚠️ /resume blocked: '**{name}**' is a shared squad room session. It runs only in its room."
     no_named_sessions:     "لم يُعثر على جلسات مُسمّاة.\nاستخدم `/title My Session` لتسمية جلستك الحالية، ثم `/resume My Session` للعودة إليها لاحقًا."
     list_header:           "📋 **الجلسات المُسمّاة**\n"
     list_item:             "• **{title}**{preview_part}"

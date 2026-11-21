@@ -512,6 +512,8 @@ def _run_agent_tool_execution_middleware(
     public_room = getattr(agent, "public_room_policy", False) is True or is_public_room_scope()
     # The Agent's own policy id restores its allowlist without ambient context.
     room_policy = getattr(agent, "public_room_policy_id", None) if public_room else None
+    # The same for the room memory of its Run: the Agent's own store or none.
+    room_memory = getattr(agent, "public_room_memory", None) if public_room else None
     with public_room_scope(public_room, policy=room_policy):
         blocked = execution_scope_error(function_name) if public_room else None
     if public_room and not blocked:
@@ -670,13 +672,14 @@ def _run_agent_tool_execution_middleware(
         )
 
     def execute_pipeline(relay_args):
-        with public_room_scope(public_room, policy=room_policy):
+        with public_room_scope(public_room, policy=room_policy, memory=room_memory):
             return _hermes_pipeline(relay_args)
     if worker_scope is not None:
         def execute_pipeline(relay_args):
             # Relay may invoke Hermes on another callback thread. Batched
             # clarify policy waits must receive this agent's interrupt there.
-            with worker_scope(), public_room_scope(public_room, policy=room_policy):
+            with worker_scope(), public_room_scope(public_room, policy=room_policy,
+                                                   memory=room_memory):
                 return _hermes_pipeline(relay_args)
 
     result, _relay_args = relay_tools.execute(
