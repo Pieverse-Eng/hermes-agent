@@ -1328,6 +1328,30 @@ class GatewaySlashCommandsMixin:
         # use the admin --all override. (CWE-639: IDOR on session routing.)
         return False
 
+    async def _continues_room_session(self, session_id: str) -> bool:
+        """Whether *session_id* is a shared squad room session, or continues one.
+
+        A room session holds text of other people. It runs only with its room
+        policy, on the API server's room route (``gateway/public_room.py``).
+        A channel must never attach it: the next turn would give that text to
+        an ordinary Agent with the owner's tools and private context. No admin
+        override and no ``--cross-room`` changes this.
+
+        A fork and a compression child continue a room session under another
+        id, so the parent chain is examined in the session store. A store that
+        cannot answer counts as a room session, and the caller refuses.
+        """
+        from gateway.public_room import is_room_session
+
+        store = getattr(self._session_db, "_db", self._session_db)
+        try:
+            return await platform_to_thread(is_room_session, session_id, store)
+        except Exception:
+            logger.warning(
+                "Room session check failed for %s; refusing it", session_id, exc_info=True
+            )
+            return True
+
     async def _resume_row_visible(
         self, source: SessionSource, row: dict, allow_all: bool
     ) -> bool:
@@ -1336,9 +1360,12 @@ class GatewaySlashCommandsMixin:
         Prevents cross-origin enumeration of session ids/previews via the
         numbered /resume list. Preserves the existing Matrix room-scoping
         semantics; scopes every other platform to the caller's own sessions
-        unless an admin passes ``--all``.
+        unless an admin passes ``--all``. A shared room session is never
+        visible, also not to an admin: its title and preview are room text.
         """
         sid = str(row.get("id") or "")
+        if await self._continues_room_session(sid):
+            return False
         if source.platform == Platform.MATRIX:
             # Cross-room enumeration is cross-ORIGIN data access: gate the
             # ``--all`` short-circuit behind a real configured admin, exactly
@@ -4797,6 +4824,11 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
+        # Before the Matrix and owner checks, so `--cross-room` and an admin
+        # `--all` cannot attach a shared room session to this channel.
+        if await self._continues_room_session(target_id):
+            return t("gateway.resume.room_session_blocked", name=name)
+
         if source.platform == Platform.MATRIX:
             target_origin = self._gateway_session_origin_for_id(target_id)
             if not self._same_matrix_room(source, target_origin) and not allow_cross_room:
@@ -4917,9 +4949,17 @@ class GatewaySlashCommandsMixin:
             limit=50 if search_query else 10,
             exclude_sources=["tool"],
         )
-        if not cross_origin:
+        if cross_origin:
+            # An admin listing shows other origins, but never a shared room
+            # session: its title and preview are room text.
+            rows = [
+                row for row in rows
+                if not await self._continues_room_session(str(row.get("id") or ""))
+            ]
+        else:
             # Scope the listing to the caller's own origin on every adapter so
             # session ids/previews from other users/rooms aren't enumerable.
+            # This also hides every shared room session.
             rows = [
                 row for row in rows
                 if await self._resume_row_visible(source, row, allow_all=False)

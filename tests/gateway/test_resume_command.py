@@ -768,3 +768,118 @@ class TestSameMatrixRoomThreadScoping:
         assert runner._same_matrix_room(caller, victim_origin) is False
 
 
+
+
+class TestResumeRefusesSharedRoomSessions:
+    """A shared squad room session holds text of other people. It runs only
+    with its room policy (gateway/public_room.py). No channel may attach it:
+    not with Matrix ``--cross-room``, not with an admin ``--all``, and not
+    through a fork or a compression child that continues it under another id.
+    """
+
+    ROOM = "agent-chat-pawchat-isolated-v1-0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f"
+
+    def _room_db(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(self.ROOM, "api_server")
+        db.set_session_title(self.ROOM, "Squad Room")
+        db.append_message(self.ROOM, "user", "ROOM_TEXT_SENTINEL from a teammate")
+        return db
+
+    @staticmethod
+    def _matrix_event(text):
+        return _make_event(text=text, platform=Platform.MATRIX,
+                           user_id="@alice:hs", chat_id="!room-a:hs")
+
+    @pytest.mark.asyncio
+    async def test_matrix_cross_room_cannot_attach_a_room_session(self, tmp_path):
+        db = self._room_db(tmp_path)
+        for text in ("/resume --cross-room Squad Room", f"/resume --cross-room {self.ROOM}"):
+            event = self._matrix_event(text)
+            runner = _make_runner(session_db=db, event=event)
+            result = await runner._handle_resume_command(event)
+            assert "shared squad room session" in result
+            assert "ROOM_TEXT_SENTINEL" not in result
+            runner.session_store.switch_session.assert_not_called()
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_admin_all_cannot_attach_a_room_session_or_its_child(self, tmp_path):
+        db = self._room_db(tmp_path)
+        # A compression child continues the room under another id.
+        db.end_session(self.ROOM, "compression")
+        db.create_session("room_child", "api_server", parent_session_id=self.ROOM)
+        db.append_message("room_child", "user", "ROOM_TEXT_SENTINEL after compression")
+        for text in ("/resume --all Squad Room", f"/resume --all {self.ROOM}",
+                     "/resume --all room_child"):
+            event = _make_event(text=text)
+            runner = _make_runner(session_db=db, event=event)
+            runner._resume_caller_is_admin = lambda _source: True
+            result = await runner._handle_resume_command(event)
+            assert "shared squad room session" in result, text
+            runner.session_store.switch_session.assert_not_called()
+        # A Matrix cross-room resume of the child is refused the same way.
+        event = self._matrix_event("/resume --cross-room room_child")
+        runner = _make_runner(session_db=db, event=event)
+        assert "shared squad room session" in await runner._handle_resume_command(event)
+        runner.session_store.switch_session.assert_not_called()
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_admin_listings_show_no_room_session(self, tmp_path):
+        db = self._room_db(tmp_path)
+        db.create_session("room_child", "api_server", parent_session_id=self.ROOM)
+        db.set_session_title("room_child", "Squad Room Child")
+        db.create_session(
+            "discord_named", "discord",
+            session_key="agent:main:discord:dm:other", user_id="other-user", chat_id="other",
+        )
+        db.set_session_title("discord_named", "Discord Work")
+        event = _make_event(text="/sessions all")
+        runner = _make_runner(session_db=db, event=event)
+        runner._resume_caller_is_admin = lambda _source: True
+        result = await runner._handle_sessions_command(event)
+        # The admin listing still crosses origins, but shows no room session.
+        assert "Discord Work" in result
+        assert "Squad Room" not in result
+        assert self.ROOM not in result and "room_child" not in result
+        assert "ROOM_TEXT_SENTINEL" not in result
+        # The numbered list and the numeric choice use the same rule, also for --all.
+        source = SessionSource(platform=Platform.TELEGRAM, user_id="12345", chat_id="67890")
+        for row in ({"id": self.ROOM}, {"id": "room_child"}):
+            assert await runner._resume_row_visible(source, row, allow_all=True) is False
+        assert await runner._resume_row_visible(source, {"id": "discord_named"}, allow_all=True) is True
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_store_that_cannot_answer_refuses(self, tmp_path, monkeypatch):
+        db = self._room_db(tmp_path)
+        db.create_session("ordinary", "telegram", user_id="other-user", chat_id="other")
+        db.set_session_title("ordinary", "Ordinary Work")
+
+        def broken(session_id, store=None):
+            raise RuntimeError("the store cannot answer")
+
+        monkeypatch.setattr("gateway.public_room.is_room_session", broken)
+        event = _make_event(text="/resume --all Ordinary Work")
+        runner = _make_runner(session_db=db, event=event)
+        runner._resume_caller_is_admin = lambda _source: True
+        result = await runner._handle_resume_command(event)
+        assert "shared squad room session" in result
+        runner.session_store.switch_session.assert_not_called()
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_admin_all_still_resumes_an_ordinary_session(self, tmp_path):
+        db = self._room_db(tmp_path)
+        db.create_session("ordinary", "telegram", user_id="other-user", chat_id="other")
+        db.set_session_title("ordinary", "Ordinary Work")
+        event = _make_event(text="/resume --all Ordinary Work")
+        runner = _make_runner(session_db=db, event=event)
+        runner._resume_caller_is_admin = lambda _source: True
+        result = await runner._handle_resume_command(event)
+        assert "Resumed" in result
+        assert runner.session_store.switch_session.call_args[0][1] == "ordinary"
+        db.close()

@@ -322,7 +322,14 @@ session (`_room_session_refusal`). It is the rule of `POST /v1/runs`:
 - `POST /api/sessions/{id}/fork`: a fork would keep the history under an
   ordinary id;
 - `POST /v1/runs` for a named session without a room policy: the id in each
-  case, and the chain of the session when the Run loads its stored history.
+  case, and the chain of the session when the Run loads its stored history;
+- `/resume` in a channel (Telegram, Discord, Matrix and the others). The
+  command refuses a room session before the Matrix room check and the owner
+  check, so Matrix `--cross-room` and an admin `--all` cannot attach it
+  (`_continues_room_session`, message `gateway.resume.room_session_blocked`).
+  No `/resume` list and no `/sessions` list shows a room session, also not to
+  an admin: its title and preview are room text. When the session store cannot
+  answer, `/resume` refuses.
 
 A room session is a session whose id starts with `agent-chat-pawchat-`, and
 each session whose chain of `parent_session_id` reaches such a session
