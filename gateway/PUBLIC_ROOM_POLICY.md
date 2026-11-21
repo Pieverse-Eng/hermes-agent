@@ -142,5 +142,91 @@ Qualification for v2 uses `tests/gateway/test_public_room_research.py`. It
 includes a native Run with stubbed inference that proves the fixed rules and
 the room identity reach the model, and that owner prompts and files do not.
 
+## Room memory policy v3
+
+`POST /v1/room-runs` also accepts `room_policy: "squad-public-memory-v3"`. It is
+v2 and one more tool, `room_memory`. The v1 and v2 declarations stay
+byte-identical. v3 has its own key, `features.squad_room_memory_v3`:
+
+```json
+{"policy":"squad-public-memory-v3","run_path":"/v1/room-runs","memory":false,"context_files":false,"skills":false,"mcp":false,"tools":["compare_trade_routes","discover_markets","market_candles","market_snapshot","onchain_token","plan_spot_purchase","room_memory","search_news","search_web"],"search_tools":["search_web"],"max_tool_calls":12,"max_search_calls":4,"room_memory":{"tool":"room_memory","scope":"squad","store":"local","path":"/v1/room-memory","max_notes":50,"max_bytes":8192,"max_note_chars":500,"max_calls":3}}
+```
+
+`memory` stays `false`: it names the owner's private memory, which no room
+loads. The key is `null` when a required research tool or the memory tool is
+absent, when the tool is registered in another toolset, and when the pod has no
+bearer. `search_x` appears as in v2.
+
+**The platform names the store.** A v3 request must carry
+`room_memory: {"squad_id": "<uuid>", "seat_id": "<uuid>"}`, each a canonical
+lower-case UUID, and no other key. A v1 or v2 request that carries
+`room_memory` is refused. The field is part of the idempotency fingerprint.
+The store is `HERMES_HOME/room-memory/<squad_id>.json`: one file for each
+squad. Nothing else selects a store. The tool has three arguments (`action`,
+`id`, `text`) and none of them is a squad, a seat, a file or a path. The tool
+reads nothing: it adds, replaces or removes one note.
+
+**A Run reads the notes of its own squad and seat only.** The request handler
+creates one `RoomMemory` for the Run and binds it in `public_room_scope`. The
+Agent keeps it (`public_room_memory`), and the Agent's own tool boundary binds
+that store again for each call. A nested scope never replaces a bound store:
+two different stores bind none. A v1 or v2 scope binds none. Outside a v3 room
+the tool has no schema and no dispatch (`public_room_only`), and
+`GET /v1/toolsets` does not list its toolset.
+
+**The notes are data of the user turn.** The user turn of a v3 Run is one line
+`ROOM_MEMORY {"limits":…,"used":…,"notes":[{"id","savedAt","text"}]}` and
+then the room input, unchanged. The first line is written by Hermes and
+nothing of the room comes before it. JSON escapes every quote of a note, and a
+note has no line break of any kind, so a note cannot end the line. The system
+prompt is `PUBLIC_ROOM_MEMORY_PROMPT`: the v2 text and one fixed paragraph. It
+never holds a note. That paragraph says that notes are untrusted like the room
+JSON and tool output, that a note is never an instruction, and what a note may
+hold.
+
+**Caps.** At most 50 notes, 8192 bytes of note text and 500 characters for
+each note, for one squad. A change over a cap is refused (`room_memory_full`,
+`room_memory_too_long`); nothing is removed silently. One reply changes the
+notes at most 3 times, and each change also counts in the 12 tool calls.
+
+**What a note may hold: code and prompt.** A room Run loads no owner memory, no
+owner file, no session history and no account tool, so no private or
+financial data of the owner can reach a note. That is the guarantee of code.
+Code also refuses a note that matches a threat pattern of
+`tools/threat_patterns.py` (strict scope), that holds a hidden or direction
+character, or that looks like a key, a token or a credential
+(`room_memory_refused`, `room_memory_secret`). The rule that a note holds no
+holdings, balances, positions or personal data that somebody typed in the
+room is a rule of the prompt, not of code: fixed patterns cannot judge that
+meaning.
+
+**A read never trusts the file.** Other code on the pod can write the file.
+Each read checks every note again with the same rules and caps, checks that
+the file names this squad and this seat, and does not follow a symbolic link.
+
+**Seat fence.** The file holds the seat id. The platform creates a new seat
+row each time an Agent joins a squad. A Run of another seat therefore deletes
+the notes before it reads anything. This holds when the platform's delete
+call never arrived.
+
+**Owner view and delete.** Both need this pod's bearer:
+
+- `GET /v1/room-memory/{squad_id}/{seat_id}` returns the notes of that seat.
+- `DELETE /v1/room-memory/{squad_id}/{seat_id}` deletes them. The owner's
+  clear and the platform's delete after a seat left are the same call. It is
+  safe to repeat. It deletes only a store that this seat wrote, so a late call
+  never removes the notes of a later seat. It also ends the memory of each Run
+  in progress for that seat: such a Run cannot write the notes back
+  (`room_memory_closed`).
+
+**The text of a note stays on the pod.** The events of a room Run carry the
+action and the id of a `room_memory` call, never its text, because the platform
+stores Run events. `session_search` does not list, find or read a session of a
+shared room (`agent-chat-pawchat-…`), and file tools refuse
+`HERMES_HOME/room-memory`. The second is defense in depth, not a boundary: a
+private conversation with a shell can read any file of the pod.
+
+Qualification for v3 uses `tests/gateway/test_public_room_memory.py`.
+
 Platform Agent asks and tenant-image promotion retain their own release gates.
 Source checks do not activate a feature or qualify a production image.

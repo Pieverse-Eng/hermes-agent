@@ -194,11 +194,13 @@ _BLOCKED_PROJECT_ENV_BASENAMES: set[str] = {
 def get_read_block_error(path: str) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
 
-    Three categories are blocked:
+    Four categories are blocked:
 
       * Internal Hermes cache files under ``HERMES_HOME/skills/.hub`` —
         readable metadata that an attacker could use as a prompt-injection
         carrier.
+      * The room memory under ``HERMES_HOME/room-memory`` — notes of shared
+        squad rooms, written under untrusted input, for the same reason.
       * Credential / secret stores under HERMES_HOME and the global Hermes
         root: ``auth.json``, ``auth.lock``, ``.anthropic_oauth.json``,
         ``.env``, ``webhook_subscriptions.json``, ``auth/google_oauth.json``,
@@ -268,6 +270,22 @@ def get_read_block_error(path: str) -> Optional[str]:
                 "and cannot be read directly to prevent prompt injection. "
                 "Use the skills_list or skill_view tools instead."
             )
+
+    # Room memory (gateway/room_memory.py): notes that a shared squad room
+    # Agent wrote while it read text of other people. They are a
+    # prompt-injection carrier for a private conversation, like the hub cache.
+    for hd in hermes_dirs:
+        try:
+            resolved.relative_to(hd / "room-memory")
+        except ValueError:
+            continue
+        return (
+            f"Access denied: {path} is the room memory of a shared squad room "
+            "and cannot be read directly to prevent prompt injection. It holds "
+            "untrusted notes that belong to that room only. "
+            "(Defense-in-depth — not a security boundary; the terminal tool "
+            "can still bypass.)"
+        )
 
     # Credential / secret stores. Exact-file matches under either
     # HERMES_HOME or <root>.

@@ -2105,6 +2105,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
             ("POST", "/v1/room-runs", self._handle_room_runs),
+            ("GET", "/v1/room-memory/{squad_id}/{seat_id}", self._handle_room_memory_read),
+            ("DELETE", "/v1/room-memory/{squad_id}/{seat_id}", self._handle_room_memory_delete),
             ("POST", "/v1/runs/lookup", self._handle_run_lookup),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -2633,6 +2635,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_disclosure: str = 'full',
         public_room: bool = False,
         room_policy: Optional[str] = None,
+        room_memory: Any = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2905,11 +2908,15 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         from tools.execution_scope import (
-            PUBLIC_ROOM_MAX_ITERATIONS, PUBLIC_ROOM_POLICIES, PUBLIC_ROOM_POLICY,
-            PUBLIC_ROOM_TOOL_TOOLSETS,
+            PUBLIC_ROOM_MAX_ITERATIONS, PUBLIC_ROOM_MEMORY_POLICY, PUBLIC_ROOM_POLICIES,
+            PUBLIC_ROOM_POLICY, PUBLIC_ROOM_TOOL_TOOLSETS,
         )
         if room_policy is not None and (not public_room or room_policy not in PUBLIC_ROOM_POLICIES):
             raise ValueError("Unknown public room policy")
+        # The memory policy runs with the store that its request named, and no
+        # other policy runs with one.
+        if (room_memory is not None) != (room_policy == PUBLIC_ROOM_MEMORY_POLICY):
+            raise ValueError("Room memory belongs to the memory policy only")
         if public_room:
             # A room without a policy id runs the narrowest policy.
             room_policy = room_policy or PUBLIC_ROOM_POLICY
@@ -2985,7 +2992,7 @@ class APIServerAdapter(BasePlatformAdapter):
                    | set(host_tool_names)) if proposal_only else None
         from tools.execution_scope import host_tool_scope
         from tools.execution_scope import public_room_scope
-        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed), public_room_scope(public_room, policy=room_policy):
+        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed), public_room_scope(public_room, policy=room_policy, memory=room_memory):
             agent = AIAgent(**agent_kwargs)
         if public_room:
             require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
@@ -3895,6 +3902,76 @@ class APIServerAdapter(BasePlatformAdapter):
         return (room_research_capability()
                 if self._room_policy_supported(PUBLIC_ROOM_RESEARCH_POLICY) else None)
 
+    def _room_memory_capability(self):
+        """The v3 declaration. It needs a bearer: the two memory routes refuse without one."""
+        from gateway.public_room import room_memory_capability
+        from tools.execution_scope import PUBLIC_ROOM_MEMORY_POLICY
+        return (room_memory_capability()
+                if self._expected_api_key() and self._room_policy_supported(PUBLIC_ROOM_MEMORY_POLICY)
+                else None)
+
+    def _room_memory_target(self, request: "web.Request"):
+        """(squad id, seat id) of a memory route, or the response that refuses the request.
+
+        The caller is the platform, with this pod's bearer. It names the squad
+        and the seat; the pod holds the notes of its own Agent only.
+        """
+        if not self._expected_api_key():
+            return web.json_response(_openai_error(
+                "Room memory needs an authenticated caller", code="room_memory_unavailable"), status=403)
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+        from gateway.room_memory import valid_id
+        squad_id, seat_id = request.match_info.get("squad_id"), request.match_info.get("seat_id")
+        if not valid_id(squad_id) or not valid_id(seat_id):
+            return web.json_response(_openai_error(
+                "Invalid room memory id", code="invalid_room_memory"), status=400)
+        return squad_id, seat_id
+
+    async def _handle_room_memory_read(self, request: "web.Request") -> "web.Response":
+        """GET /v1/room-memory/{squad_id}/{seat_id}: the notes of one seat, for its owner."""
+        target = self._room_memory_target(request)
+        if isinstance(target, web.Response):
+            return target
+        from gateway.room_memory import read_store
+        try:
+            stored = await asyncio.to_thread(read_store, *target)
+        except Exception:
+            logger.exception("Room memory read failed")
+            return web.json_response(_openai_error(
+                "Room memory is unavailable", code="room_memory_unavailable",
+                err_type="server_error"), status=503)
+        return web.json_response({
+            "object": "hermes.room_memory",
+            "squad_id": target[0], "seat_id": target[1],
+            "notes": [{"id": note["id"], "text": note["text"], "saved_at": note["savedAt"]}
+                      for note in stored["notes"]],
+            "used": stored["used"],
+            "limits": {"notes": stored["limits"]["notes"], "bytes": stored["limits"]["bytes"],
+                       "note_chars": stored["limits"]["noteChars"]},
+        })
+
+    async def _handle_room_memory_delete(self, request: "web.Request") -> "web.Response":
+        """DELETE /v1/room-memory/{squad_id}/{seat_id}: forget the notes of one seat.
+
+        The owner's clear and the platform's delete after a seat left are the
+        same call. It is safe to repeat.
+        """
+        target = self._room_memory_target(request)
+        if isinstance(target, web.Response):
+            return target
+        from gateway.room_memory import delete_store
+        try:
+            deleted = await asyncio.to_thread(delete_store, *target)
+        except Exception:
+            logger.exception("Room memory delete failed")
+            return web.json_response(_openai_error(
+                "Room memory is unavailable", code="room_memory_unavailable",
+                err_type="server_error"), status=503)
+        return web.json_response({"object": "hermes.room_memory.deleted",
+                                  "squad_id": target[0], "seat_id": target[1], "deleted": deleted})
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -3909,7 +3986,7 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.plugins import get_plugin_manager
         plugin_capabilities = get_plugin_manager().api_capabilities(set(self._available_host_tools()))
 
-        from gateway.public_room import ROOM_RESEARCH_FEATURE, room_capability
+        from gateway.public_room import ROOM_MEMORY_FEATURE, ROOM_RESEARCH_FEATURE, room_capability
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3956,6 +4033,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # A later policy never changes the declaration above: deployed
                 # platforms validate it with a strict schema.
                 ROOM_RESEARCH_FEATURE: self._room_research_capability(),
+                ROOM_MEMORY_FEATURE: self._room_memory_capability(),
                 "workflow_skill_loading": True,
                 "workflow_resource_loading": True,
                 "compact_host_tools": True,
@@ -3988,6 +4066,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "room_runs": {"method": "POST", "path": "/v1/room-runs"},
+                "room_memory": {"method": "GET", "path": "/v1/room-memory/{squad_id}/{seat_id}"},
+                "room_memory_delete": {"method": "DELETE",
+                                       "path": "/v1/room-memory/{squad_id}/{seat_id}"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
@@ -4069,10 +4150,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             features = get_nous_subscription_features(config)
             data: List[Dict[str, Any]] = []
-            from tools.execution_scope import PUBLIC_ROOM_ONLY_TOOLSET
+            from tools.execution_scope import PUBLIC_ROOM_ONLY_TOOLSETS
             for name, label, desc in _get_effective_configurable_toolsets():
-                # Room research tools never reach the agent this catalog describes.
-                if name == PUBLIC_ROOM_ONLY_TOOLSET:
+                # Room-only tools never reach the agent this catalog describes.
+                if name in PUBLIC_ROOM_ONLY_TOOLSETS:
                     continue
                 try:
                     tools = sorted(set(resolve_toolset(name)))
@@ -7466,6 +7547,11 @@ class APIServerAdapter(BasePlatformAdapter):
             if not self._room_policy_supported(room_policy):
                 return web.json_response(_openai_error("Room runtime is unsupported",
                                                       code="invalid_room_policy"), status=400)
+        # The squad and the seat of a memory room. The platform names them in
+        # the request body, so they are part of the idempotency fingerprint.
+        # Nothing of the model or of the room input selects a store.
+        from gateway.public_room import room_memory_binding
+        room_memory_ids = room_memory_binding(body) if public_room else None
         from gateway.interactive_messages import InteractionContext, current_message_scope, is_proposal_context
         interaction_context = None
         if body.get("interaction_context") is not None:
@@ -7725,6 +7811,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             platform_activity_lease = None
             host_broker = None
+            room_memory = None
             try:
                 platform_activity_lease = await begin_platform_activity()
                 self._set_run_status(run_id, "running")
@@ -7741,10 +7828,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     return
                 with self._profile_scope(request_profile):
+                    if room_memory_ids is not None:
+                        from gateway.room_memory import RoomMemory
+                        room_memory = RoomMemory(*room_memory_ids)
                     agent = self._create_agent(
                         interactive_messages=True,
                         public_room=public_room,
                         room_policy=room_policy,
+                        room_memory=room_memory,
                         host_tool_names=host_tool_names,
                         proposal_only=is_proposal_context(interaction_context),
                         bound_business_tools=(interaction_context or {}).get("version") == 2,
@@ -7901,7 +7992,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     with self._profile_scope(request_profile), current_message_scope(
                         deliver_current, interaction_context,
                         available_tools=getattr(agent, "valid_tool_names", None)
-                    ), host_tool_scope(host_broker), public_room_scope(public_room, policy=room_policy):
+                    ), host_tool_scope(host_broker), public_room_scope(
+                        public_room, policy=room_policy, memory=room_memory):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
@@ -7933,8 +8025,14 @@ class APIServerAdapter(BasePlatformAdapter):
                                 previous_notes = getattr(agent, '_gateway_turn_context_notes', '') or ''
                                 agent._gateway_turn_context_notes = '\n\n'.join(
                                     note for note in (previous_notes, workflow_notes) if note)
+                            turn_message = user_message
+                            if room_memory is not None:
+                                # The notes of this squad, as data of the user
+                                # turn. The system prompt stays the fixed text.
+                                from gateway.room_memory import frame_room_input
+                                turn_message = frame_room_input(user_message, room_memory)
                             r = agent.run_conversation(
-                                user_message=user_message,
+                                user_message=turn_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
                                 **({"persist_user_display_metadata": {"api_run": {
