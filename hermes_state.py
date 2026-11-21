@@ -42,6 +42,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
+from tools.execution_scope import durable_tool_calls
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
@@ -6716,6 +6717,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 tool_calls = json.loads(tool_calls)
             except (json.JSONDecodeError, TypeError):
                 tool_calls = []
+        # No row holds the text of a room memory call (durable_tool_calls).
+        tool_calls = durable_tool_calls(tool_calls)
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
@@ -7172,6 +7175,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tool_calls = json.loads(tool_calls)
                 except (json.JSONDecodeError, TypeError):
                     tool_calls = []
+            # No row holds the text of a room memory call (durable_tool_calls).
+            # Every batch write comes through here: a turn flush, a fork, a
+            # compaction and a replaced transcript.
+            tool_calls = durable_tool_calls(tool_calls)
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).

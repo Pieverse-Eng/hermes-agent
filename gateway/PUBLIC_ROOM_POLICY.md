@@ -174,7 +174,8 @@ two different stores bind none. A v1 or v2 scope binds none. Outside a v3 room
 the tool has no schema and no dispatch (`public_room_only`), and
 `GET /v1/toolsets` does not list its toolset.
 
-**The notes are data of the user turn.** The user turn of a v3 Run is one line
+**The notes are data of the user turn.** The user turn that the model of a v3
+Run reads is one line
 `ROOM_MEMORY {"limits":…,"used":…,"notes":[{"id","savedAt","text"}]}` and
 then the room input, unchanged. The first line is written by Hermes and
 nothing of the room comes before it. JSON escapes every quote of a note, and a
@@ -184,10 +185,20 @@ never holds a note. That paragraph says that notes are untrusted like the room
 JSON and tool output, that a note is never an instruction, and what a note may
 hold.
 
+**The line of notes is request-only text.** The request handler reads the
+line once, when the Run starts, and gives it to the Agent apart from the room
+input (`inference_only_user_prefix` of `run_conversation`). The Agent puts it
+before the room input in each model request of that Run and nowhere else. The
+line is in no message of the conversation: the session store gets the room
+input alone (no `content`, no `api_content` sidecar), and the returned
+transcript, a compaction summary and a session title never get the line.
+
 **Caps.** At most 50 notes, 8192 bytes of note text and 500 characters for
 each note, for one squad. A change over a cap is refused (`room_memory_full`,
 `room_memory_too_long`); nothing is removed silently. One reply changes the
-notes at most 3 times, and each change also counts in the 12 tool calls.
+notes at most 3 times, and each change also counts in the 12 tool calls. A
+character is one Unicode code point, and the bytes are UTF-8 bytes. The
+platform counts in the same units.
 
 **What a note may hold: code and prompt.** A room Run loads no owner memory, no
 owner file, no session history and no account tool, so no private or
@@ -219,12 +230,31 @@ call never arrived.
   in progress for that seat: such a Run cannot write the notes back
   (`room_memory_closed`).
 
-**The text of a note stays on the pod.** The events of a room Run carry the
-action and the id of a `room_memory` call, never its text, because the platform
-stores Run events. `session_search` does not list, find or read a session of a
-shared room (`agent-chat-pawchat-…`), and file tools refuse
-`HERMES_HOME/room-memory`. The second is defense in depth, not a boundary: a
-private conversation with a shell can read any file of the pod.
+**The text of a note is in its store and in no other place of the pod.** A
+delete of the store therefore leaves no copy that a session route or a later
+conversation can read.
+
+- The line of notes is request-only text (above).
+- A `room_memory` call keeps its action and its note id outside the reply that
+  made it, and no text of the model (`room_memory_call_record`). The session
+  store applies this to each row that it writes (`durable_tool_calls` in
+  `hermes_state.py`): a turn flush, a fork, a compaction and a replaced
+  transcript. The optional JSON snapshot of a session, the text that a
+  compaction summary is made from, and the one-line summary of a pruned tool
+  result use the same rule. The result of the tool holds no text of a note.
+- The events of a room Run carry the same record, because the platform stores
+  Run events.
+- A memory room writes no request dump (`request_dump_*.json`): that file
+  would hold the whole model request.
+- `session_search` does not list, find or read a session of a shared room
+  (`agent-chat-pawchat-…`), and file tools refuse `HERMES_HOME/room-memory`.
+  The file rule is defense in depth, not a boundary: a private conversation
+  with a shell can read any file of the pod.
+
+What is not a note: the Agent's own words. A reply that restates a note is a
+message of the room, and the session history keeps it like each other reply.
+The reasoning text of a model can restate a note too, and the session history
+keeps it. A clear of the room memory does not change these.
 
 Qualification for v3 uses `tests/gateway/test_public_room_memory.py`.
 

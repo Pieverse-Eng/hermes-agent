@@ -8025,16 +8025,21 @@ class APIServerAdapter(BasePlatformAdapter):
                                 previous_notes = getattr(agent, '_gateway_turn_context_notes', '') or ''
                                 agent._gateway_turn_context_notes = '\n\n'.join(
                                     note for note in (previous_notes, workflow_notes) if note)
-                            turn_message = user_message
+                            memory_turn = {}
                             if room_memory is not None:
                                 # The notes of this squad, as data of the user
-                                # turn. The system prompt stays the fixed text.
-                                from gateway.room_memory import frame_room_input
-                                turn_message = frame_room_input(user_message, room_memory)
+                                # turn of each model request of this Run. The
+                                # Agent stores the room input alone: the line
+                                # of notes enters no session row, so a clear of
+                                # the room memory leaves no copy in the history.
+                                # The system prompt stays the fixed text.
+                                from gateway.room_memory import memory_line
+                                memory_turn["inference_only_user_prefix"] = memory_line(room_memory)
                             r = agent.run_conversation(
-                                user_message=turn_message,
+                                user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
+                                **memory_turn,
                                 **({"persist_user_display_metadata": {"api_run": {
                                     "id": run_id, "idempotency_key": idempotency_key,
                                 }}} if idempotency_key else {}),

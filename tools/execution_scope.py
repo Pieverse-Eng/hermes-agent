@@ -7,6 +7,7 @@ belongs to the host's independently authenticated human-confirmation path.
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
+import re
 import threading
 from types import MappingProxyType
 
@@ -189,6 +190,64 @@ def public_room_memory_tools():
     if research is None or _registered_toolset(PUBLIC_ROOM_MEMORY_TOOL) != PUBLIC_ROOM_MEMORY_TOOLSET:
         return None
     return research | {PUBLIC_ROOM_MEMORY_TOOL}
+
+
+_ROOM_MEMORY_ACTIONS = ("add", "replace", "remove")
+_ROOM_MEMORY_NOTE_ID = re.compile(r"m[0-9]{1,9}")
+
+
+def room_memory_call_record(arguments) -> dict:
+    """What a `room_memory` call may show outside the model request that made it.
+
+    One action of the tool and the id of a note, and no other text of the
+    model. The text of a note stays in the room memory of its squad: a clear
+    of that memory must leave no copy in a log, an event, a session row or a
+    summary. The result is never empty, so no caller falls back to the raw
+    arguments.
+    """
+    arguments = arguments if isinstance(arguments, dict) else {}
+    action, note_id = arguments.get("action"), arguments.get("id")
+    record = {"action": action if action in _ROOM_MEMORY_ACTIONS else "invalid"}
+    if isinstance(note_id, str) and _ROOM_MEMORY_NOTE_ID.fullmatch(note_id):
+        record["id"] = note_id
+    return record
+
+
+def durable_tool_calls(tool_calls):
+    """The tool calls of an assistant message as they may be stored or summarized.
+
+    Each `room_memory` call keeps its action and its note id only
+    (`room_memory_call_record`). Every other call, and a list without such a
+    call, comes back unchanged. The session store applies this to each row
+    that it writes, so no write path can store the text of a note.
+
+    The live message of a reply in progress keeps its own arguments: the
+    model reads them in the same reply.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    stored = None
+    for index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        holder = function if isinstance(function, dict) else call
+        if holder.get("name") != PUBLIC_ROOM_MEMORY_TOOL or "arguments" not in holder:
+            continue
+        arguments = holder["arguments"]
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except ValueError:
+                parsed = None
+            record = json.dumps(room_memory_call_record(parsed), separators=(",", ":"))
+        else:
+            record = room_memory_call_record(arguments)
+        if stored is None:
+            stored = list(tool_calls)
+        changed = {**holder, "arguments": record}
+        stored[index] = {**call, "function": changed} if holder is function else changed
+    return tool_calls if stored is None else stored
 
 
 class PublicRoomModelBudgetExceeded(Exception):

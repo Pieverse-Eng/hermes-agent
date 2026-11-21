@@ -1837,6 +1837,11 @@ def dump_api_request_debug(
     like timeout). Intended for debugging provider-side 4xx failures where
     retries are not useful.
     """
+    from tools.execution_scope import PUBLIC_ROOM_MEMORY_POLICY
+    if getattr(agent, "public_room_policy_id", None) == PUBLIC_ROOM_MEMORY_POLICY:
+        # The request of a memory room holds the notes of its squad. They stay
+        # in the room memory: no file gets a copy that a clear cannot remove.
+        return None
     try:
         body = copy.deepcopy(api_kwargs)
         body.pop("timeout", None)

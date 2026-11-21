@@ -12,6 +12,13 @@ never in the system prompt, and only in a Run of the same squad and seat.
 The file is also a place that other code on this pod can write to, so every
 read checks each note again (`_valid_notes`) and never trusts the file.
 
+One place. The text of a note is in this store and in the model requests of
+a reply that reads or writes it, and nowhere else on the pod. The line of
+notes is part of each model request of a Run and of no stored message
+(`memory_line`). A stored tool call of the memory tool keeps its action and
+its note id only (`tools.execution_scope.durable_tool_calls`). So a delete of
+the store leaves no copy in the session history.
+
 Seat fence. The file holds the id of the seat that wrote it. The platform
 creates a new seat row each time an Agent joins a squad, so a Run of another
 seat proves that the old seat left: the old notes are deleted before the Run
@@ -400,18 +407,32 @@ def delete_store(squad_id: str, seat_id: str, *, directory: Path | None = None) 
         return _unlink(path)
 
 
-def frame_room_input(room_input: str, memory: RoomMemory) -> str:
-    """The user turn of a memory room: one line of notes, then the room input.
+def memory_line(memory: RoomMemory) -> str:
+    """The line of notes that a memory room sends with each model request of one Run.
 
-    The notes are one JSON object on the first line, after `MARKER`. The
-    first line is written here and nothing of the room comes before it, so
-    room text cannot take its place. JSON escapes every quote and backslash
-    of a note, and a note holds no line break of any kind, so a note cannot
-    end the line or start another one. The room input follows unchanged.
+    The notes are one JSON object after `MARKER`. JSON escapes every quote
+    and backslash of a note, and a note holds no line break of any kind, so a
+    note cannot end the line or start another one.
+
+    The line is read once, when the Run starts, and it is the same in each
+    model request of that Run. It is request-only text: the request handler
+    gives it to the Agent apart from the room input
+    (`inference_only_user_prefix`), so it is in no stored message, in no
+    returned transcript and in no summary.
     """
     notes = memory.snapshot()
-    # The notes come last in the object: a log line that shows the start of a
-    # user turn then shows the limits and no text of a note.
+    # The fixed fields come first and the notes come last in the object.
     block = json.dumps({"limits": limits(), "used": _usage(notes), "notes": notes},
                        ensure_ascii=False, separators=(",", ":"))
-    return f"{MARKER} {block}\n{room_input}"
+    return f"{MARKER} {block}"
+
+
+def frame_room_input(room_input: str, memory: RoomMemory) -> str:
+    """The user turn that the model of a memory room reads.
+
+    One line of notes (`memory_line`), then the room input unchanged. The
+    first line is written by this pod and nothing of the room comes before
+    it, so room text cannot take its place. The Agent puts the two parts
+    together in the same way for each model request.
+    """
+    return f"{memory_line(memory)}\n{room_input}"
