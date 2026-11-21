@@ -40,6 +40,7 @@ from agent.model_metadata import (
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from tools.execution_scope import durable_tool_calls
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -2816,10 +2817,12 @@ class ContextCompressor(ContextEngine):
         pruned = 0
 
         # Build index: tool_call_id -> (tool_name, arguments_json)
+        # The one-line summary of a pruned result is stored: like a summary,
+        # it gets no text of a room memory call.
         call_id_to_tool: Dict[str, tuple] = {}
         for msg in result:
             if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
+                for tc in durable_tool_calls(msg.get("tool_calls") or []):
                     if isinstance(tc, dict):
                         cid = tc.get("id", "")
                         fn = tc.get("function", {})
@@ -3266,7 +3269,8 @@ class ContextCompressor(ContextEngine):
             if role == "assistant":
                 if len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                tool_calls = msg.get("tool_calls", [])
+                # A summary is stored: it gets no text of a room memory call.
+                tool_calls = durable_tool_calls(msg.get("tool_calls", []))
                 if tool_calls:
                     tc_parts = []
                     for tc in tool_calls:

@@ -151,6 +151,36 @@ def _resolve_lineage(db, session_id: str) -> str:
     return _resolve_to_parent(db, session_id)[0]
 
 
+def _room_session_check(db):
+    """A check for one search: whether a session is a shared squad room session.
+
+    A room session (gateway/public_room.py) holds untrusted text of other
+    people, and a session that continues one (a fork, a compression child)
+    holds it too. The tool is in the default toolsets of channels with group
+    chats, so it never lists, finds or reads such a session, in any context.
+
+    Each answer is kept for the rest of the search. A store that cannot
+    answer counts as a room session: the search leaves the session out.
+    """
+    from gateway.public_room import is_room_session
+
+    known: Dict[str, bool] = {}
+
+    def check(session_id) -> bool:
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        if session_id not in known:
+            try:
+                known[session_id] = is_room_session(session_id, db)
+            except Exception:
+                logging.warning("Room session check failed for %s; leaving it out",
+                                session_id, exc_info=True)
+                known[session_id] = True
+        return known[session_id]
+
+    return check
+
+
 def _is_compression_ended(db, session_id: str) -> bool:
     """Return True if *session_id* itself ended with ``end_reason='compression'``.
 
@@ -397,6 +427,8 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     except Exception as e:
         logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
         meta = {}
+    if meta and _room_session_check(db)(session_id):
+        meta = {}
     if not meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
@@ -444,6 +476,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
         )  # fetch extra so we can skip current
 
         current_root = _resolve_lineage(db, current_session_id) if current_session_id else None
+        room_session = _room_session_check(db)
 
         results = []
         for s in sessions:
@@ -452,6 +485,8 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
                 continue
             # Skip child / delegation sessions
             if s.get("parent_session_id"):
+                continue
+            if room_session(sid):
                 continue
             results.append({
                 "session_id": sid,
@@ -517,6 +552,11 @@ def _scroll(
     owning_session_id = (
         anchor_state.get("session_id") if anchor_state is not None else None
     )
+    # The named session and the session that owns the anchor: a message of a
+    # room session does not open under the id of another session either.
+    room_session = _room_session_check(db)
+    if room_session(session_id) or room_session(owning_session_id):
+        return tool_error(f"session_id not found: {session_id}", success=False)
 
     if current_session_id:
         anchor_session_id = owning_session_id or session_id
@@ -641,6 +681,8 @@ def _title_match_result(
     lineage_root = _resolve_lineage(db, session_id)
     if current_lineage_root and lineage_root == current_lineage_root:
         return None
+    if _room_session_check(db)(session_id):
+        return None
 
     try:
         session_meta = db.get_session(lineage_root) or db.get_session(session_id) or {}
@@ -740,6 +782,7 @@ def _discover(
     # window. parent_session_id is exposed separately when different.
     seen_sessions = {}
     results = []
+    room_session = _room_session_check(db)
 
     if title_result:
         title_lineage = title_result.pop("_lineage_root", None)
@@ -752,6 +795,8 @@ def _discover(
             break
         raw_sid = r["session_id"]
         resolved_sid, _ = _resolve_to_parent(db, raw_sid)
+        if room_session(raw_sid):
+            continue
         # Skip the current session lineage — UNLESS the content has been
         # compression-summarised out of the live context (memory black hole
         # after compression). Two sub-cases:

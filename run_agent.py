@@ -2995,6 +2995,14 @@ class AIAgent:
                 if "content" in msg:
                     msg = dict(msg)
                     msg["content"] = self._redact_message_content(msg.get("content"))
+                # Mirror the SQLite rows: a snapshot holds no text of a room
+                # memory call (durable_tool_calls).
+                if isinstance(msg.get("tool_calls"), list):
+                    from tools.execution_scope import durable_tool_calls
+                    stored_calls = durable_tool_calls(msg["tool_calls"])
+                    if stored_calls is not msg["tool_calls"]:
+                        msg = dict(msg)
+                        msg["tool_calls"] = stored_calls
                 cleaned.append(msg)
 
             # Guard: never overwrite a larger session log with fewer messages.
@@ -7788,6 +7796,7 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
         reload_session_history: bool = False,
+        inference_only_user_prefix: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -8151,6 +8160,10 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        # Only a memory room passes this line. Every other
+                        # turn calls the loop as before.
+                        **({"inference_only_user_prefix": inference_only_user_prefix}
+                           if inference_only_user_prefix is not None else {}),
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but
