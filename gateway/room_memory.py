@@ -12,6 +12,12 @@ never in the system prompt, and only in a Run of the same squad and seat.
 The file is also a place that other code on this pod can write to, so every
 read checks each note again (`_valid_notes`) and never trusts the file.
 
+Personal data. A note is made from what people typed in the room. Code
+refuses a note that holds the address of a wallet, an email address, a phone
+number, or an amount of what somebody has or trades (`personal_data`). The
+note is refused as a whole and not changed, and a read applies the rule again.
+The patterns are fixed: what they do not find stays a rule of the room prompt.
+
 One place. The text of a note is in this store and in the model requests of
 a reply that reads or writes it, and nowhere else on the pod. The line of
 notes is part of each model request of a Run and of no stored message
@@ -73,7 +79,7 @@ _RAW_KEY = re.compile(r"(?<![0-9A-Za-z])(?:0x)?[0-9a-fA-F]{64}(?![0-9A-Za-z])")
 _CREDENTIAL = re.compile(
     r"\b(?:password|passwd|passphrase|api[ _-]?key|secret[ _-]?key|private[ _-]?key|"
     r"seed[ _-]?phrase|recovery[ _-]?phrase|mnemonic)\b\s*(?:[:=]|is\b|are\b)"
-    r"|\u79c1\u94a5|\u52a9\u8bb0\u8bcd|\u5bc6\u7801\s*[:=\uff1a\u662f\u4e3a]",
+    r"|私钥|助记词|密码\s*[:=\uff1a是为]",
     re.IGNORECASE)
 
 # One process serves one HERMES_HOME, and a store is a few kilobytes: one lock
@@ -126,6 +132,153 @@ def clean_note(text) -> str | None:
     return cleaned or None
 
 
+# --- Personal data -------------------------------------------------------------
+#
+# A room holds text of other people, and a note is made from it. Code refuses a
+# note that holds the data below. It does not remove the data and keep the
+# rest: a changed note is a text that the Agent did not write, and what stays
+# can still point at the person. The Agent gets the reason and saves the fact
+# without the data.
+#
+# The patterns are fixed. They find the usual written forms and do not judge
+# meaning. What they do not find stays a rule of the room prompt.
+
+# The address of an account on a chain: 0x and 40 hexadecimal digits (EVM), 32
+# to 44 base58 characters (Solana, and the 34 characters of a Bitcoin or Tron
+# address), or a bech32 address (bc1..., inj1..., cosmos1...). A contract has
+# an address of the same form: a note names an asset by its name or symbol.
+_ADDRESS = re.compile(
+    r"(?<![0-9A-Za-z])(?:"
+    r"0[xX][0-9a-fA-F]{40}"
+    r"|[1-9A-HJ-NP-Za-km-z]{32,44}"
+    r"|[a-z]{1,16}1[02-9ac-hj-np-z]{38,87}"
+    r")(?![0-9A-Za-z])")
+# name@host.tld, also with a full-width sign and with [at] or (at). The last
+# label has letters only, so "BTC@97.5k" is not an email address.
+_EMAIL = re.compile(
+    r"[\w.+%-]+\s?(?:[@\uff20]|\[at\]|\(at\))\s?"
+    r"(?:[\w-]+(?:\.|\s?(?:\[dot\]|\(dot\))\s?))+[^\W\d_]{2,}",
+    re.IGNORECASE)
+# A phone number in a usual written form. The first form starts with "+".
+# The other forms have no "+": an area code in brackets, three or more groups
+# of two to four digits with one separator, or a group that starts with 0 and
+# one long group. A form without "+" is a phone number from 9 digits.
+_PHONE_PLUS = re.compile(r"(?<![\w+])\+(?:[ ().\-]{0,2}\d){8,15}(?!\d)")
+_PHONE_FORMS = re.compile(
+    r"\(\d{2,5}\)[ .\-]?\d{2,5}(?:[ .\-]\d{2,5}){1,3}(?!\d)"
+    r"|(?<![\w.,+\-])\d{2,4}(?P<sep>[ .\-])\d{2,4}(?:(?P=sep)\d{2,4}){1,3}(?![\w]|[.,]\d)"
+    r"|(?<![\w.,+\-])0\d{1,4}[ .\-]\d{6,9}(?![\w]|[.,]\d)")
+_PHONE_DIGITS = 9
+# 9 or more digits in one run: a phone number without separators, or the id of
+# an account. The digits after a decimal point are no such run (0.000000001234),
+# and digits in a longer word are for the secret check.
+_LONG_NUMBER = re.compile(r"(?<![0-9A-Za-z])(?<!\d[.,])\d{9,}(?![0-9A-Za-z])")
+
+# An amount of what somebody has or trades. A date and a percentage are not
+# amounts.
+_NOT_AN_AMOUNT = re.compile(r"\d{4}-\d{2}-\d{2}|\d[\d,.]*\s?[%\uff05]")
+# Dollar, euro, pound, yen or yuan, bitcoin, tether, and the full-width yen sign.
+_CURRENCY_SIGN = "$\u20ac\u00a3\u00a5\u20bf\u20ae\uffe5"
+_NUMBER = r"\d[\d,.]*"
+# After a number: thousand, million, billion. A lower-case "m" is minutes.
+_MAGNITUDE = (r"(?:[kK]|M|MM|mm|B|bn|[wW]|万|萬|亿|億|千"
+              r"|(?i:thousand|million|billion|trillion|grand))(?![A-Za-z])")
+# The name of an asset or a currency after a number: a symbol in upper case, a
+# cashtag, or a word. A time zone and a usual short word of a market room are
+# not assets.
+_NOT_A_UNIT = (r"(?:AM|PM|UTC|GMT|EST|EDT|CST|CDT|PST|PDT|CET|CEST|BST|IST|JST|KST|HKT|SGT"
+               r"|AI|NFTS?|DEX|CEX|AMA|API|ETFS?|DAO|KYC|TVL|APY|APR|ATH|ATL|OTC|IPO|ICO|IDO"
+               r"|RSI|EMA|SMA|MA|MACD|TA|FA|USA|UK|EU|CEO|FAQ|PDF|URL|ID|OK|TV|PC|VIP)")
+_UNIT = (rf"(?:(?!{_NOT_A_UNIT}(?![A-Za-z]))[A-Z]{{2,10}}(?![A-Za-z])|\$[A-Za-z]{{2,10}}"
+         r"|(?i:usd[tc]?|dollars?|bucks|eur|euros?|gbp|pounds?|jpy|yen|cny|rmb|yuan|btc|bitcoins?"
+         r"|eth|ether|sol|bnb|sats?)(?![A-Za-z])"
+         r"|美元|美金|刀|元|块|塊|币|幣)")
+# An amount of an asset: a currency sign and a number, or a number and the name
+# of the asset. "250 tokens" and "5,000 coins" count from three digits, so "3
+# tokens on the watch list" is a count and no amount.
+_ASSET_AMOUNT = (rf"[+\-~\u2248]?(?:[{_CURRENCY_SIGN}]\s?{_NUMBER}"
+                 rf"|{_NUMBER}\s?(?:{_MAGNITUDE})?\s?(?:(?:in|of|worth of)\s)?{_UNIT}"
+                 rf"|\d[\d,.]{{2,}}\s?(?:{_MAGNITUDE})?\s?(?i:coins?|tokens?|shares?)(?![A-Za-z]))")
+# The word before an amount that makes it a price and not a quantity.
+_NOT_A_PRICE = r"(?<!\sat\s)(?<!\sto\s)(?<!\snear\s)(?<!\sabove\s)(?<!\sbelow\s)(?<!\sper\s)"
+# Rule 1. A word of having or trading comes at most three words before an
+# amount of an asset: "has about 5 BTC", "bought 1000 SOL", "sent $500", "is
+# long 2 ETH".
+_HAVING = (
+    r"has|have|had|having|got|gets|owns?|owned|owning|holds?|held|holding|hodls?|hodling"
+    r"|keeps?|kept|bought|buys?|buying|sold|sells?|selling|staked?|stakes|staking"
+    r"|deposit(?:s|ed|ing)?|withdr(?:aw|aws|ew|awn|awing)|invest(?:s|ed|ing)?"
+    r"|received?|receives|receiving|sent|sends?|sending|transfer(?:s|red|ring)?"
+    r"|earn(?:s|ed|ing)?|made|makes?|lost|loses?|losing|won|wins?|borrow(?:s|ed|ing)?"
+    r"|lent|lends?|owes?|owed|paid|pays?|paying|spent|spends?|spending|gave|gives?|giving"
+    r"|tipped|claimed|claims?|long(?:s|ed|ing)?|short(?:s|ed|ing)?")
+# Rule 2. The amount of an asset belongs to somebody: "Bob's 5 BTC", "her
+# margin is 500 USDT", "my 2 ETH".
+_OWNER = r"(?:['\u2019]s|(?<![A-Za-z])(?i:my|his|her|their|our|your))(?![A-Za-z])"
+# Rules 1 and 2 in Chinese: the verb, then the amount at once.
+_HAVING_ZH = (r"(?:持有|买了|買了|买入|買入|卖了"
+              r"|賣了|卖出|賣出|赚了|賺了|亏了"
+              r"|虧了|转了|轉了|收到|充了|提了|有)")
+_HAS_AMOUNT = re.compile(
+    rf"(?<![A-Za-z])(?i:{_HAVING})(?![A-Za-z])(?:\s+\S+){{0,3}}?\s+{_NOT_A_PRICE}{_ASSET_AMOUNT}"
+    rf"|{_OWNER}(?:\s+\S+){{0,2}}?\s+{_NOT_A_PRICE}{_ASSET_AMOUNT}"
+    rf"|{_HAVING_ZH}\s?(?:大约|大約|大概|约|約)?\s?"
+    rf"[{_CURRENCY_SIGN}]?\s?{_NUMBER}\s?(?:{_MAGNITUDE})?\s?(?:个|個|枚|颗|顆)?"
+    rf"\s?(?:{_UNIT}|[uU](?![A-Za-z]))")
+# Rule 3. The note names holdings and has an amount of money, or a number
+# from three digits, or a number with a decimal part.
+_HOLDING_NOUN = re.compile(
+    r"(?<![A-Za-z])(?:holdings?|balances?|portfolios?|positions?|wallets?|bags?|funds|savings|"
+    r"net[ -]?worth)(?![A-Za-z])"
+    r"|持仓|持倉|仓位|倉位|余额|餘額"
+    r"|持有|钱包|錢包|资产|資產|持币"
+    r"|持幣|本金|账户|賬戶|帳戶|帐户",
+    re.IGNORECASE)
+_MONEY = re.compile(
+    rf"[{_CURRENCY_SIGN}]\s?\d"
+    rf"|(?<![A-Za-z0-9_.]){_NUMBER}\s?"
+    rf"(?:{_MAGNITUDE}|(?:{_MAGNITUDE})?\s?(?:{_UNIT}|[uU](?![A-Za-z])|(?i:coins?|tokens?|shares?)(?![A-Za-z])))")
+_PLAIN_NUMBER = re.compile(r"(?<![A-Za-z0-9_.,])\d[\d,.]*(?![A-Za-z0-9_])")
+_DECIMAL = re.compile(r"\d[.,]\d")
+
+PERSONAL_DATA_KINDS = ("address", "email", "phone", "amount")
+
+
+def _holding_amount(text: str) -> bool:
+    plain = _NOT_AN_AMOUNT.sub(" ", text)
+    if _HAS_AMOUNT.search(plain):
+        return True
+    if not _HOLDING_NOUN.search(plain):
+        return False
+    if _MONEY.search(plain):
+        return True
+    for match in _PLAIN_NUMBER.finditer(plain):
+        number = match.group().rstrip(".,")
+        if sum(ch.isdigit() for ch in number) >= 3 or _DECIMAL.search(number):
+            return True
+    return False
+
+
+def personal_data(text: str) -> str | None:
+    """The kind of personal data that this text holds, or None.
+
+    `address`: the address of an account on a chain. `email`: an email
+    address. `phone`: a phone number, or 9 or more digits in one run.
+    `amount`: an amount of what somebody has or trades.
+    """
+    if _ADDRESS.search(text):
+        return "address"
+    if _EMAIL.search(text):
+        return "email"
+    if (_PHONE_PLUS.search(text) or _LONG_NUMBER.search(text)
+            or any(sum(ch.isdigit() for ch in match.group()) >= _PHONE_DIGITS
+                   for match in _PHONE_FORMS.finditer(text))):
+        return "phone"
+    if _holding_amount(text):
+        return "amount"
+    return None
+
+
 def note_refusal(text: str) -> str | None:
     """Why this text is not stored, as an error type; None when it may be stored.
 
@@ -135,11 +288,16 @@ def note_refusal(text: str) -> str | None:
     from tools.threat_patterns import scan_for_threats
     if scan_for_threats(text, scope="strict"):
         return "room_memory_refused"
+    if _RAW_KEY.search(text) or _CREDENTIAL.search(text):
+        return "room_memory_secret"
+    # Before the general secret check: that check also finds some phone numbers
+    # and would give the Agent the reason of a credential.
+    if personal_data(text) is not None:
+        return "room_memory_personal"
     from agent.redact import redact_sensitive_text
     # `code_file` skips the patterns that read "token: PEPE" as a secret.
-    if (_RAW_KEY.search(text) or _CREDENTIAL.search(text)
-            or redact_sensitive_text(text, force=True, code_file=True,
-                                     redact_url_credentials=True) != text):
+    if redact_sensitive_text(text, force=True, code_file=True,
+                             redact_url_credentials=True) != text:
         return "room_memory_secret"
     return None
 
@@ -320,6 +478,20 @@ class RoomMemoryRefusal(Exception):
         self.error_type, self.details = error_type, details
 
 
+# What the Agent reads when a note is refused for personal data. Each text is
+# fixed: it never repeats what the model wrote.
+_PERSONAL_REFUSAL = {
+    "address": "This note holds the address of a wallet or a contract. The room memory does "
+               "not store an address. Name the asset or the person without it.",
+    "email": "This note holds an email address. The room memory does not store it. "
+             "Save the fact without the address.",
+    "phone": "This note holds a phone number or another long number. The room memory does "
+             "not store it. Save the fact without the number.",
+    "amount": "This note states an amount of a holding, a balance, a position or a trade of "
+              "somebody. The room memory does not store it. Save the fact without the amount.",
+}
+
+
 class RoomMemory:
     """The notes of one squad, for one seat, during one room Run.
 
@@ -386,6 +558,9 @@ class RoomMemory:
             raise RoomMemoryRefusal(
                 refusal, "This note looks like a key, a token or a credential. "
                          "The room memory does not store it.")
+        if refusal == "room_memory_personal":
+            kind = personal_data(text) or personal_data(cleaned or "")
+            raise RoomMemoryRefusal(refusal, _PERSONAL_REFUSAL[kind], kind=kind)
         if refusal is not None or cleaned is None:
             raise RoomMemoryRefusal(
                 "room_memory_refused",

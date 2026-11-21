@@ -206,10 +206,36 @@ financial data of the owner can reach a note. That is the guarantee of code.
 Code also refuses a note that matches a threat pattern of
 `tools/threat_patterns.py` (strict scope), that holds a hidden or direction
 character, or that looks like a key, a token or a credential
-(`room_memory_refused`, `room_memory_secret`). The rule that a note holds no
-holdings, balances, positions or personal data that somebody typed in the
-room is a rule of the prompt, not of code: fixed patterns cannot judge that
-meaning.
+(`room_memory_refused`, `room_memory_secret`).
+
+**Personal data that somebody typed in the room.** Code refuses a note that
+holds one of four kinds of data (`room_memory_personal`, with the `kind`;
+`personal_data` in `gateway/room_memory.py`). The store is the one place that
+writes a note, so the rule applies to each caller. A read applies it again.
+
+| Kind | What the code finds |
+| --- | --- |
+| `address` | `0x` and 40 hexadecimal digits; 32 to 44 base58 characters (Solana, Bitcoin, Tron); a bech32 address (`bc1…`, `inj1…`, `cosmos1…`). The address of a contract has the same form and is refused too |
+| `email` | `name@host.tld`, also with a full-width sign, `[at]`, `(at)`, `[dot]` |
+| `phone` | `+` and 8 to 15 digits with usual separators; an area code in brackets; three or more groups of two to four digits with one separator; a group that starts with 0 and one long group; 9 or more digits in one run |
+| `amount` | An amount of what somebody has or trades. Three rules: a word of having or trading at most three words before an amount of an asset (`holds 5 BTC`, `bought 1000 SOL`, `is long 2 ETH`); an amount of an asset that belongs to somebody (`Bob's 5 BTC`, `her margin is 500 USDT`); a word for holdings (`balance`, `portfolio`, `position`, `wallet`, …) with an amount of money, a number from three digits, or a number with a decimal part. English and Chinese words |
+
+- **The note is refused, not changed.** A changed note is a text that the Agent
+  did not write, and what stays can still point at the person (`Alice's wallet
+  is […]`). The Agent gets a fixed reason for the kind and can save the fact
+  without the data.
+- **What is not an amount:** a price (`BTC is near 97,500`, `rejected at 100,000
+  USD`), a percentage, a date, a count (`3 members`, `3 tokens on the watch
+  list`), a time zone or a usual short word after a number (`20:00 UTC`,
+  `3 AI agents`).
+- **Limits.** The patterns are fixed and do not judge meaning. They do not
+  find: an amount in words (`five BTC`), an amount without a word of having
+  (`Alice: 5 BTC`), a phone number of fewer than 9 digits without `+`, an
+  address that is cut by spaces, a name, a street address, and an amount in a
+  language other than English and Chinese. These stay a rule of the room
+  prompt. The patterns also refuse some public facts of the same form
+  (`The fund holds 500,000 BTC`): the Agent then writes the fact in another
+  way.
 
 **A read never trusts the file.** Other code on the pod can write the file.
 Each read checks every note again with the same rules and caps, checks that
@@ -265,19 +291,28 @@ conversation can read.
   Run events.
 - A memory room writes no request dump (`request_dump_*.json`): that file
   would hold the whole model request.
-- `session_search` does not list, find or read a session of a shared room
-  (`agent-chat-pawchat-…`), and file tools refuse `HERMES_HOME/room-memory`.
-  The file rule is defense in depth, not a boundary: a private conversation
-  with a shell can read any file of the pod.
+- File tools refuse `HERMES_HOME/room-memory`. This is defense in depth, not a
+  boundary: a private conversation with a shell can read any file of the pod.
+
+**The owner's private conversation may search a room session.** The product
+owner decided it (2026-11-21), also for the room sessions that exist now:
+`session_search` has no rule for a room session, as before this policy. A
+search reads what the session store holds: the room input and the replies of
+the Agent. It reads no text of a note, because the session store holds none
+(above).
 
 What is not a note: the Agent's own words. A reply that restates a note is a
 message of the room, and the session history keeps it like each other reply.
 The reasoning text of a model can restate a note too, and the session history
 keeps it. A clear of the room memory does not change these.
 
-**A room session runs only with its room policy.** A room session holds text
-of other people and the Agent's replies to it. An ordinary turn on that session
-would give this history to an Agent with the owner's tools and private context.
+**A room session runs only with its room policy.** This rule is about the
+policy that runs a session, and not about who may read it. A room session
+holds text of other people and the Agent's replies to it. An ordinary turn on
+that session would make this history the conversation of an Agent with the
+owner's tools and private context. It would also write the owner's private
+turn into the session that the next room Run continues. A search is another
+thing: it gives a private conversation the text as the result of a tool.
 Each entry that loads the history of a named session for an ordinary Agent
 refuses a room session with `400 invalid_room_policy`, before it reads the
 session (`_room_session_refusal`). It is the rule of `POST /v1/runs`:

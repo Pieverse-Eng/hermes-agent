@@ -25,8 +25,9 @@ from gateway.public_room import (
     room_research_capability,
 )
 from gateway.room_memory import (
-    MARKER, MAX_BYTES, MAX_CLEARS, MAX_NOTE_CHARS, MAX_NOTES, RoomMemory, RoomMemoryRefusal,
-    clear_store, delete_store, frame_room_input, read_store,
+    MARKER, MAX_BYTES, MAX_CLEARS, MAX_NOTE_CHARS, MAX_NOTES, PERSONAL_DATA_KINDS, RoomMemory,
+    RoomMemoryRefusal, clear_store, delete_store, frame_room_input, note_refusal, personal_data,
+    read_store,
 )
 from gateway.room_memory import memory_line as stored_memory_line
 from tools.execution_scope import (
@@ -548,6 +549,212 @@ def test_a_note_that_reads_as_an_instruction_or_a_secret_is_not_stored(memory_ro
     assert [n["text"] for n in read_store(SQUAD_A, SEAT_A)["notes"]] == ["The squad follows SOL."]
 
 
+EVM = "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae"
+SOLANA = "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtVx"
+# One example for each written form that the code finds. The key is the kind.
+PERSONAL = {
+    "address": [
+        f"Alice's wallet is {EVM}.",
+        "Send tips to 0X52908400098527886E0F7030069857D2E4169EE7 please",
+        "The token contract is 0x6982508145454Ce325dDbE47a25d4ec3d2311933",
+        f"Bob uses {SOLANA} on Solana",
+        "The system program is 11111111111111111111111111111111",
+        "BTC address 1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+        "tron TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE",
+        "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        "inj1hkhdaj2a2clmq5jq6mspsggqs32vynpk228q3r is her address",
+        f"https://etherscan.io/address/{EVM}",
+    ],
+    "email": [
+        "Contact alice@example.com for the sheet",
+        "bob.smith+squad@mail.example.co.uk",
+        "write to carol＠example.org",
+        "dave [at] example [dot] com",
+        "erin(at)example.com",
+        "邮箱是 xiaoming@qq.com",
+    ],
+    "phone": [
+        "Call Alice at +1 415 555 2671",
+        "Bob: +49 30 123456",
+        "+8613800138000",
+        "his number: (415) 555-2671",
+        "415-555-2671",
+        "415.555.2671 is the desk",
+        "138 0013 8000",
+        "06 12 34 56 78",
+        "600 700 800",
+        "010-12345678",
+        "07911 123456",
+        "手机号 13800138000",
+        "Telegram id 123456789",
+        "１３８００１３８０００",
+    ],
+    "amount": [
+        # A word of having or trading, then the amount of an asset.
+        "Alice holds 5 BTC",
+        "Bob has about 12,300 USDT",
+        "Carol bought another 1000 SOL",
+        "Dan sent $500 to Erin",
+        "Heidi sold 3 ETH yesterday",
+        "Ivan staked 32 ETH",
+        "Judy owes 200 usdt to Mallory",
+        "Alice got 5 ETH from the airdrop",
+        "The owner keeps 40 ETH in cold storage",
+        "Mallory made 2,000 USD on the trade",
+        "Carol transferred to Dan 250 USDC",
+        "Bob has 5000 tokens of the new project",
+        "The fund holds 500,000 BTC",
+        "Frank is long 2 ETH",
+        "Grace shorted 10k PEPE",
+        # The amount of an asset belongs to somebody.
+        "Bob's 5 BTC are in cold storage",
+        "her margin is 500 USDT",
+        "my 2 ETH stay staked",
+        "Bob's PnL is +$4,500 this week",
+        "Bob’s 5 SOL are in his cold storage",
+        "Erin has ~5 BTC",
+        # The same in Chinese.
+        "小明持有5个BTC",
+        "他有 100 U",
+        "小红买了 1000 USDT 的 SOL",
+        # The note names holdings and has an amount of money or a number.
+        "holdings: 5 BTC and 2 ETH",
+        "bags: 2M PEPE",
+        "net worth around 250k",
+        "The portfolio is worth $50k",
+        "仓位 0.5 BTC",
+        "账户里有10万",
+        "The balance is 12300",
+        "balance 950 now",
+        "balance 1,000.50",
+        "position size 0.5",
+        "她的余额是12300",
+    ],
+}
+# Notes that a market room saves. Each one has something that is near a pattern.
+USUAL_NOTES = [
+    "The squad follows SOL.",
+    "The squad wants short answers with one source.",
+    "BTC is near 97,500 and the squad watches 100000.",
+    "ETH target is 4,000 USD by the end of the year.",
+    "The squad meets at 20:00 UTC on Fridays.",
+    "Answer in 3 bullet points, in English.",
+    "Funding above 0.05% is the squad's warning sign.",
+    "The squad uses 4h candles and the 200 day average.",
+    "PEPE trades near 0.000000001234.",
+    "The squad agreed on 2026-11-21 to track $PEPE and SOL.",
+    "BTC dominance above 55% means risk off for this squad.",
+    "The squad calls BTC corn.",
+    "Use the 5m and 15m charts for positions.",
+    "SOL had a 12% move this week.",
+    "The squad compares 3 venues before it plans a purchase.",
+    "Top 10 coins by market cap are the squad's universe.",
+    "The squad does not discuss holdings or balances.",
+    "The squad reviews positions every 2 weeks.",
+    "The squad reviews positions on 2026-11-28.",
+    "A balance change of 12.5% is the squad's alert.",
+    "Portfolio talk is off topic here.",
+    "Market cap of SOL is about 120 billion.",
+    "Supply of BTC is 21 million.",
+    "Supply is 97 500 000.",
+    "BTC@97.5k was the squad's alert level.",
+    "这个小队关注 SOL 和 BTC。",
+    "BTC 目标 100000，止损 95000。",
+    "小队每周五 20:00 开会。",
+    "The squad has 3 members who trade.",
+    "The squad has 3 AI agents in the room.",
+    "The squad has 3 tokens on the watch list.",
+    "The squad has 5 DEX pairs on the list.",
+    "ETH made a new high this month.",
+    "ETH made a new high at 4,000 USD.",
+    "BTC got rejected at 100,000 USD two times.",
+    "The squad holds a call at 20:00 UTC each Friday.",
+    "The squad keeps 2 rules: sources first, short answers.",
+    "Binance has 40% of the BTC volume.",
+    "This squad's 3 rules are in the pinned message.",
+    "Today's range is 95,000 to 100,000 USD.",
+    "Gas on BSC is about 1 gwei.",
+    "Range for BTC this week: 95000-100000.",
+    "Levels: 95000, 96000, 97000.",
+    "The squad wants answers under 100 words.",
+    "Volume was 1,234,567 on the day.",
+    "Use version 2 of the template, section 3.1.",
+    "The squad follows the 2024-2025 cycle thesis.",
+    "The squad's stop loss rule is 5% below entry.",
+    "Take profit at 100k is the squad's joke.",
+    "Do your own research: 3 sources at least.",
+    "The squad follows CZ and 4 other voices.",
+    "The squad wants a long answer for 2 topics and a short one for the rest.",
+    "x" * 60,
+]
+
+
+@pytest.mark.parametrize("kind,text", [(kind, text) for kind, texts in PERSONAL.items()
+                                       for text in texts])
+def test_a_note_with_personal_data_is_not_stored(memory_room, kind, text):
+    assert personal_data(text) == kind and note_refusal(text) == "room_memory_personal"
+    store = RoomMemory(SQUAD_A, SEAT_A)
+    store.add("The squad follows SOL.")
+    for change in (lambda: store.add(text), lambda: store.replace("m1", text),
+                   lambda: store.add(f"  {text}\n")):
+        with pytest.raises(RoomMemoryRefusal) as refused:
+            change()
+        assert (refused.value.error_type, refused.value.details) == (
+            "room_memory_personal", {"kind": kind})
+        # The reason is a fixed sentence for the kind: it never repeats the text of the model.
+        assert text not in str(refused.value) and str(refused.value) == str(
+            room_memory._PERSONAL_REFUSAL[kind])
+    # The note is refused as a whole. No part of it is stored.
+    assert [n["text"] for n in read_store(SQUAD_A, SEAT_A)["notes"]] == ["The squad follows SOL."]
+
+
+def test_each_kind_of_personal_data_has_its_own_reason():
+    assert tuple(PERSONAL) == PERSONAL_DATA_KINDS == tuple(room_memory._PERSONAL_REFUSAL)
+    reasons = list(room_memory._PERSONAL_REFUSAL.values())
+    assert len(set(reasons)) == 4 and all("does not store" in reason for reason in reasons)
+
+
+def test_a_usual_note_of_a_market_room_is_stored(memory_room):
+    for text in USUAL_NOTES:
+        assert personal_data(text) is None, text
+        assert note_refusal(text) is None, text
+    store = RoomMemory(SQUAD_A, SEAT_A)
+    for text in USUAL_NOTES[:MAX_NOTES]:
+        store.add(text)
+    assert [n["text"] for n in read_store(SQUAD_A, SEAT_A)["notes"]] == USUAL_NOTES[:MAX_NOTES]
+
+
+def test_a_stored_note_with_personal_data_is_not_read(memory_room):
+    good = note(1, "The squad follows SOL.")
+    write_store(SQUAD_A, SEAT_A, [
+        good, *(note(number, texts[0]) for number, texts in enumerate(PERSONAL.values(), start=2)),
+        note(9, "The squad wants sources with times.")])
+    expected = [good, note(9, "The squad wants sources with times.")]
+    assert RoomMemory(SQUAD_A, SEAT_A).snapshot() == expected
+    assert read_store(SQUAD_A, SEAT_A)["notes"] == expected
+    line = stored_memory_line(RoomMemory(SQUAD_A, SEAT_A))
+    assert line == memory_line(expected)
+    assert EVM not in line and "alice@example.com" not in line and "415 555" not in line
+
+
+def test_the_tool_tells_the_model_why_a_note_is_refused(memory_room):
+    agent = room_agent(memory=RoomMemory(SQUAD_A, SEAT_A))
+    answers = [json.loads(call(agent, {"action": "add", "text": text}).result) for text in (
+        "Alice's email is alice@example.com", f"Bob pays from {EVM}", "Carol holds 5 BTC")]
+    assert [(answer["error_type"], answer["kind"]) for answer in answers] == [
+        ("room_memory_personal", "email"), ("room_memory_personal", "address"),
+        ("room_memory_personal", "amount")]
+    assert answers[0] == {
+        "error": "This note holds an email address. The room memory does not store it. "
+                 "Save the fact without the address.",
+        "error_type": "room_memory_personal", "kind": "email"}
+    assert not store_path().exists()
+    # The same fact without the data is a note.
+    other = room_agent(memory=RoomMemory(SQUAD_A, SEAT_A))
+    assert json.loads(call(other, {"action": "add", "text": "Alice keeps the squad's sheet."})
+                      .result)["id"] == "m1"
+
+
 def test_a_stored_note_is_one_line_of_plain_text(memory_room):
     store = RoomMemory(SQUAD_A, SEAT_A)
     store.add("  The squad\nfollows\tSOL  and  BTC.\r\n\x0b\x0c\x1c\x85 ")
@@ -844,7 +1051,13 @@ def test_a_private_conversation_cannot_read_the_store_file(memory_room):
     assert get_read_block_error(str(home / "room-memory-notes.md")) is None
 
 
-def test_a_private_conversation_cannot_find_or_read_a_room_session(tmp_path):
+def test_a_private_conversation_can_find_and_read_a_room_session(tmp_path):
+    """The owner's private conversation may search the sessions of a shared room.
+
+    The product owner decided it (2026-11-21), also for room sessions that exist
+    now. The search tool has no rule for room sessions. Another rule stays: an
+    ordinary turn does not continue a room session (the room session guard).
+    """
     from hermes_state import SessionDB
     from tools.session_search_tool import session_search
     db = SessionDB(tmp_path / "state.db")
@@ -855,29 +1068,24 @@ def test_a_private_conversation_cannot_find_or_read_a_room_session(tmp_path):
         db.create_session(session, source="api_server")
         if title:
             db.set_session_title(session, title)
-        db.append_message(session, role="user", content=f"{MARKER} recallsentinel note of {session}")
+        db.append_message(session, role="user", content=f"recallsentinel question of {session}")
         ids[session] = db.append_message(session, role="assistant",
                                          content="recallsentinel answer of " + session)
-    # A compression child of a room session belongs to the room too.
-    db.create_session("room-child", source="api_server", parent_session_id=room)
-    ids["room-child"] = db.append_message("room-child", role="assistant",
-                                          content="recallsentinel answer of room-child")
+    everything = {room, legacy, "private-chat"}
     found = json.loads(session_search(query="recallsentinel", limit=10, db=db))
-    assert [entry["session_id"] for entry in found["results"]] == ["private-chat"]
-    assert room not in json.dumps(found) and "room-child" not in json.dumps(found)
+    assert {entry["session_id"] for entry in found["results"]} == everything
     listed = json.loads(session_search(db=db, limit=10))
-    assert [entry["session_id"] for entry in listed["results"]] == ["private-chat"]
-    assert json.loads(session_search(query="Squad room reply", db=db))["count"] == 0
-    for session in (room, legacy, "room-child"):
+    assert {entry["session_id"] for entry in listed["results"]} == everything
+    by_title = json.loads(session_search(query="Squad room reply", db=db))
+    assert room in {entry["session_id"] for entry in by_title["results"]}
+    for session in (room, legacy):
         read = json.loads(session_search(session_id=session, db=db))
-        assert read["success"] is False and "recallsentinel" not in json.dumps(read)
+        assert read["success"] is True and "recallsentinel answer of " + session in json.dumps(read)
         scroll = json.loads(session_search(session_id=session, around_message_id=ids[session], db=db))
-        assert scroll["success"] is False and "recallsentinel" not in json.dumps(scroll)
-        # The anchor of a room message does not open under a private session id either.
-        forged = json.loads(session_search(session_id="private-chat",
-                                           around_message_id=ids[session], db=db))
-        assert "of " + session not in json.dumps(forged)
-    assert json.loads(session_search(session_id="private-chat", db=db))["success"] is True
+        assert scroll["success"] is True and "recallsentinel" in json.dumps(scroll)
+    # Search and continuation are two rules. The sessions that the search finds are
+    # still room sessions for each entry that would continue one.
+    assert is_room_session(room) and is_room_session(legacy) and not is_room_session("private-chat")
 
 
 # --- Invariant 1 over HTTP: squad A's notes reach squad A's room and nothing else --
@@ -1322,6 +1530,15 @@ async def test_a_clear_leaves_no_text_of_a_note_in_the_session_history(memory_ro
         for session in sessions:
             history = await session_history(client, session)
             assert "HISTORY_SENTINEL" not in history and MARKER not in history
+        # The owner's private conversation may search a room session (the product owner's
+        # decision). It reads the room input and the reply there, and no text of a note.
+        from tools.session_search_tool import session_search
+        found = session_search(query="remember that we follow", db=db, limit=10)
+        assert set(sessions) & {entry["session_id"] for entry in json.loads(found)["results"]}
+        read = session_search(session_id=first["session_id"], db=db)
+        assert json.loads(read)["success"] is True and "ROOM_TEXT_SENTINEL" in read
+        for answer in (found, read):
+            assert "HISTORY_SENTINEL" not in answer and MARKER not in answer
         # The session keeps the room input alone as each user turn, and of each memory
         # call its action and its note id.
         rows = db.get_messages(first["session_id"])
@@ -1801,6 +2018,12 @@ async def test_a_room_session_does_not_continue_as_an_ordinary_chat(memory_room,
         assert started == []
         assert len(db.list_sessions_rich(limit=100)) == sessions_before
         assert pod.adapter._active_run_tasks == {}
+        # Search is another rule. The owner's private conversation can find and read this
+        # room session with session_search. It cannot continue it.
+        from tools.session_search_tool import session_search
+        found = json.loads(session_search(query="remember that we follow", db=db, limit=10))
+        assert room in {entry["session_id"] for entry in found["results"]}
+        assert "ROOM_TEXT_SENTINEL" in session_search(session_id=room, db=db)
 
         # An ordinary session continues as before, on both entries.
         normal = await client.post("/api/sessions/private-chat/chat", json={"message": "Hello."})
