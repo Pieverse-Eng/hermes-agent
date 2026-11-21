@@ -48,6 +48,8 @@ SQUAD_A, SQUAD_B = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8
 SEAT_A, SEAT_B = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 SEAT_A2 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 SAVED_AT = "2026-11-20T04:00:00Z"
+# The pod's time of the clear records in these tests, in whole seconds.
+NOW = 1_763_611_200
 LIMITS = {"notes": 50, "bytes": 8192, "noteChars": 500}
 # The exact bytes that deployed platforms accept today. This PR changes neither.
 V1_DECLARATION = ('{"policy":"squad-public-market-v1","run_path":"/v1/room-runs","memory":false,'
@@ -112,6 +114,7 @@ def memory_room(monkeypatch):
                           schema=tool.ROOM_MEMORY_SCHEMA, handler=tool.room_memory_tool)
     monkeypatch.setattr("gateway.run._load_gateway_config", lambda: MODEL)
     monkeypatch.setattr(room_memory, "_now", lambda: SAVED_AT)
+    monkeypatch.setattr(room_memory, "_epoch", lambda: NOW)
     monkeypatch.setattr(room_memory, "_generations", {})
     handlers = {}
     for name in sorted(PUBLIC_ROOM_RESEARCH_TOOL_NAMES):
@@ -1780,7 +1783,7 @@ def test_a_clear_with_a_request_key_runs_one_time_and_keeps_the_later_notes(memo
     # One file holds both: no note, and the record of the key.
     stored = stored_file()
     assert stored["notes"] == []
-    assert stored["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    assert stored["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True, "at": NOW}]
     # The Agent saves a note after the clear, in a new Run. The note numbers go on.
     later = RoomMemory(SQUAD_A, SEAT_A)
     assert later.add("A note after the clear.")["id"] == "m2"
@@ -1790,7 +1793,7 @@ def test_a_clear_with_a_request_key_runs_one_time_and_keeps_the_later_notes(memo
     assert note_texts() == ["A note after the clear."]
     # A repeat does not end the memory of the Run that started after the first clear.
     assert later.add("One more note.")["id"] == "m3"
-    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True, "at": NOW}]
     # Another key is another clear. It ends the memory of that Run.
     assert clear_store(SQUAD_A, SEAT_A, KEY_2) == {"deleted": True, "replayed": False}
     assert note_texts() == []
@@ -1822,7 +1825,7 @@ def test_two_clears_with_one_key_at_the_same_moment_remove_one_time(memory_room)
     # One request cleared. Each other request found its record and got the same result.
     assert sorted(result["replayed"] for result in results) == [False] + [True] * 7
     assert all(result["deleted"] for result in results)
-    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY, "deleted": True, "at": NOW}]
     # A request of that group that reaches the pod late, after the Agent saved a new note.
     RoomMemory(SQUAD_A, SEAT_A).add("A note after the first clear.")
     assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": True}
@@ -1849,7 +1852,7 @@ def test_a_clear_and_its_record_are_one_write(memory_room, monkeypatch):
     assert len(writes) == 1
     wanted = json.loads(writes[0])
     assert wanted["notes"] == [] and wanted["clears"] == [
-        {"seatId": SEAT_A, "key": KEY, "deleted": True}]
+        {"seatId": SEAT_A, "key": KEY, "deleted": True, "at": NOW}]
     monkeypatch.setattr(room_memory.os, "replace", replace)
     # So the same key clears when it comes again.
     assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": False}
@@ -1904,23 +1907,123 @@ def test_the_delete_for_a_seat_that_left_keeps_the_clear_records_of_another_seat
     assert delete_store(SQUAD_A, SEAT_A2) is False
 
 
-def test_a_store_remembers_a_fixed_number_of_request_keys_and_trusts_no_stored_record(memory_room):
-    keys = [f"{number:08x}-0000-4000-8000-000000000000" for number in range(1, MAX_CLEARS + 2)]
-    for key in keys:
+def keys_from(first, count):
+    return [f"{number:08x}-0000-4000-8000-000000000000" for number in range(first, first + count)]
+
+
+def records(keys, seat=SEAT_A2, at=NOW):
+    """Clear records as a store writes them: the clears of another seat keep the notes."""
+    return [{"seatId": seat, "key": key, "deleted": False, "at": at} for key in keys]
+
+
+def stored_keys():
+    return [record["key"] for record in stored_file()["clears"]]
+
+
+def test_a_repeat_after_many_newer_clears_finds_its_record_and_keeps_the_later_notes(
+        memory_room, monkeypatch):
+    """A record stays for the retention time, not for a count of newer keys."""
+    RoomMemory(SQUAD_A, SEAT_A).add("A note before the first clear.")
+    assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": False}
+    # 40 newer clears an hour later. A store that kept the newest 16 keys forgot KEY here.
+    monkeypatch.setattr(room_memory, "_epoch", lambda: NOW + 3600)
+    for key in keys_from(1, 40):
         assert clear_store(SQUAD_A, SEAT_A, key)["replayed"] is False
-    assert MAX_CLEARS == 16
-    assert [record["key"] for record in stored_file()["clears"]] == keys[1:]
     RoomMemory(SQUAD_A, SEAT_A).add("A note after the clears.")
-    for key in keys[1:]:
-        assert clear_store(SQUAD_A, SEAT_A, key) == {"deleted": False, "replayed": True}
+    # The platform repeats the first clear inside its retry window (24 hours).
+    monkeypatch.setattr(room_memory, "_epoch", lambda: NOW + 23 * 3600)
+    assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": True}
     assert note_texts() == ["A note after the clears."]
+    assert stored_keys() == [KEY, *keys_from(1, 40)]
+
+
+def test_a_write_removes_only_the_records_older_than_the_retention_time(memory_room, monkeypatch):
+    retention = room_memory.CLEAR_RETENTION_SECONDS
+    assert retention == 30 * 24 * 3600
+    assert clear_store(SQUAD_A, SEAT_A, KEY)["replayed"] is False
+    monkeypatch.setattr(room_memory, "_epoch", lambda: NOW + 3600)
+    assert clear_store(SQUAD_A, SEAT_A, KEY_2)["replayed"] is False
+    # At the retention time the first record is still there.
+    monkeypatch.setattr(room_memory, "_epoch", lambda: NOW + retention)
+    RoomMemory(SQUAD_A, SEAT_A).add("A note.")
+    assert stored_keys() == [KEY, KEY_2]
+    # One second later, the next write removes it and keeps the newer one.
+    monkeypatch.setattr(room_memory, "_epoch", lambda: NOW + retention + 1)
+    RoomMemory(SQUAD_A, SEAT_A).add("Another note.")
+    assert stored_keys() == [KEY_2]
+    # The newer key still answers its first result and removes nothing.
+    assert clear_store(SQUAD_A, SEAT_A, KEY_2) == {"deleted": False, "replayed": True}
+    assert note_texts() == ["A note.", "Another note."]
+
+
+def test_a_store_with_the_most_records_refuses_a_new_clear_without_a_write(memory_room, monkeypatch):
+    run = RoomMemory(SQUAD_A, SEAT_A)
+    run.add("A note that stays.")
+    keys = keys_from(1, MAX_CLEARS)
+    assert MAX_CLEARS == 256
+    # The records of the last 30 days, one each second.
+    room_memory._write(store_path(), SQUAD_A, SEAT_A, read_store(SQUAD_A, SEAT_A)["notes"], 2,
+                       [{**record, "at": NOW + index} for index, record in enumerate(records(keys))])
+    monkeypatch.setattr(room_memory, "_epoch", lambda: NOW + 24 * 3600)
+    before, generations = store_path().read_bytes(), dict(room_memory._generations)
+    for seat, key in ((SEAT_A, KEY), (SEAT_A2, KEY), (SEAT_B, KEY_2)):
+        with pytest.raises(RoomMemoryRefusal) as refused:
+            clear_store(SQUAD_A, seat, key)
+        assert refused.value.error_type == "room_memory_clear_limit"
+    # No write, no note removed, and the Run in progress keeps its memory.
+    assert store_path().read_bytes() == before
+    assert room_memory._generations == generations
+    assert note_texts() == ["A note that stays."]
+    # A repeat of a known key still answers its first result.
+    assert clear_store(SQUAD_A, SEAT_A2, keys[0]) == {"deleted": False, "replayed": True}
+    # Each write keeps every record inside the retention time.
+    run.add("A note of the same Run.")
+    run.replace("m1", "The first note, changed.")
+    assert stored_keys() == keys
+    assert note_texts() == ["The first note, changed.", "A note of the same Run."]
+    # When the oldest record passes the retention time, one new clear fits again.
+    monkeypatch.setattr(room_memory, "_epoch", lambda: NOW + room_memory.CLEAR_RETENTION_SECONDS + 1)
+    assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": False}
+    assert stored_keys() == [*keys[1:], KEY]
+    with pytest.raises(RoomMemoryRefusal):
+        clear_store(SQUAD_A, SEAT_A, KEY_2)
+
+
+def test_the_largest_store_stays_under_the_file_limit(memory_room):
+    run = RoomMemory(SQUAD_A, SEAT_A)
+    # 50 notes of quotes: JSON writes each quote with two bytes.
+    lengths = range(139, 189)
+    for length in lengths:
+        run.add('"' * length)
+    assert len(note_texts()) == MAX_NOTES and sum(lengths) <= MAX_BYTES
+    # The most records, of the longest form.
+    room_memory._write(store_path(), SQUAD_A, SEAT_A, read_store(SQUAD_A, SEAT_A)["notes"], 999_999_999,
+                       records(keys_from(1, MAX_CLEARS), at=9_999_999_999))
+    size = store_path().stat().st_size
+    assert size <= room_memory.MAX_FILE_BYTES
+    assert len(note_texts()) == MAX_NOTES and len(stored_file()["clears"]) == MAX_CLEARS
+    with pytest.raises(RoomMemoryRefusal):
+        clear_store(SQUAD_A, SEAT_A2, KEY)
+    assert store_path().stat().st_size == size
+    # A store that would pass the limit is never written: a read takes it for no store.
+    with pytest.raises(RoomMemoryRefusal) as refused:
+        room_memory._write(store_path(), SQUAD_A, SEAT_A, read_store(SQUAD_A, SEAT_A)["notes"], 51,
+                           records(keys_from(1, 3 * MAX_CLEARS)))
+    assert refused.value.error_type == "room_memory_full"
+    assert store_path().stat().st_size == size and len(note_texts()) == MAX_NOTES
+
+
+def test_a_store_trusts_no_stored_clear_record(memory_room):
+    assert clear_store(SQUAD_A, SEAT_A, KEY_3)["replayed"] is False
+    RoomMemory(SQUAD_A, SEAT_A).add("A note after the clears.")
     # A file that other code of the pod wrote: only a whole record of the right shape counts.
     value = stored_file()
     value["clears"] = [
         {"seatId": SEAT_A, "key": KEY, "deleted": "yes"}, {"seatId": "seat", "key": KEY, "deleted": True},
         {"seatId": SEAT_A, "key": "key", "deleted": True}, {"seatId": SEAT_A, "key": KEY_3},
         "a text", None, 7,
-        {"seatId": SEAT_A, "key": KEY_2, "deleted": False, "notes": ["IGNORED"]},
+        # A record without a usable time counts. It gets the time of its next write.
+        {"seatId": SEAT_A, "key": KEY_2, "deleted": False, "at": "yesterday", "notes": ["IGNORED"]},
         {"seatId": SEAT_A, "key": KEY_2, "deleted": True},
     ]
     store_path().write_text(json.dumps(value), encoding="utf-8")
@@ -1928,8 +2031,8 @@ def test_a_store_remembers_a_fixed_number_of_request_keys_and_trusts_no_stored_r
     assert note_texts() == ["A note after the clears."]
     # The key of a record that does not count clears as a first request.
     assert clear_store(SQUAD_A, SEAT_A, KEY) == {"deleted": True, "replayed": False}
-    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY_2, "deleted": False},
-                                       {"seatId": SEAT_A, "key": KEY, "deleted": True}]
+    assert stored_file()["clears"] == [{"seatId": SEAT_A, "key": KEY_2, "deleted": False, "at": NOW},
+                                       {"seatId": SEAT_A, "key": KEY, "deleted": True, "at": NOW}]
     # A clear record is no note: a Run reads the notes alone.
     assert "clears" not in stored_memory_line(RoomMemory(SQUAD_A, SEAT_A))
 
@@ -1977,6 +2080,29 @@ async def test_the_delete_route_clears_one_time_for_one_request_key(memory_room,
         assert note_texts() == [] and store_path().exists()
         gone = await (await client.delete(url)).json()
         assert gone == first_result and not store_path().exists()
+
+
+@pytest.mark.asyncio
+async def test_the_delete_route_reports_a_refused_clear_and_changes_nothing(memory_room, monkeypatch):
+    pod = Pod(monkeypatch)
+    RoomMemory(SQUAD_A, SEAT_A).add("A note that stays.")
+    keys = keys_from(1, MAX_CLEARS)
+    room_memory._write(store_path(), SQUAD_A, SEAT_A, read_store(SQUAD_A, SEAT_A)["notes"], 2,
+                       records(keys))
+    before = store_path().read_bytes()
+    url = f"/v1/room-memory/{SQUAD_A}/{SEAT_A}"
+    async with TestClient(TestServer(capabilities_app(pod.adapter)), headers=AUTH) as client:
+        refused = await client.delete(url, headers={"Idempotency-Key": KEY})
+        assert refused.status == 409
+        assert (await refused.json())["error"]["code"] == "room_memory_clear_limit"
+        assert store_path().read_bytes() == before and note_texts() == ["A note that stays."]
+        # A known key still answers, and the delete after a seat left is not limited.
+        known = await client.delete(f"/v1/room-memory/{SQUAD_A}/{SEAT_A2}",
+                                    headers={"Idempotency-Key": keys[0]})
+        assert (known.status, (await known.json())["replayed"]) == (200, True)
+        left = await client.delete(url)
+        assert (left.status, (await left.json())["deleted"]) == (200, True)
+        assert note_texts() == [] and stored_keys() == keys
 
 
 # --- A room session runs only with its room policy --------------------------------

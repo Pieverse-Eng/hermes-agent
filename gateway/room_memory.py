@@ -40,6 +40,13 @@ all. A second clear with that key, for that seat, finds the record: it
 answers the first result and removes nothing. This holds for two requests at
 the same moment and for a request that comes again because its answer was
 lost. The notes that the Agent saved after the first clear therefore stay.
+
+A record stays for a fixed time (`CLEAR_RETENTION_SECONDS`), much longer
+than the platform's retry window of a clear, and a write removes only the
+records older than that. No count drops a record: when the store holds the
+most records (`MAX_CLEARS`), a new clear is refused before any write
+(`room_memory_clear_limit`). So each repeat that the platform sends finds
+its record, and the file stays under `MAX_FILE_BYTES`.
 """
 import json
 import logging
@@ -59,9 +66,22 @@ MAX_NOTES = 50
 # UTF-8 bytes of all note texts of one squad.
 MAX_BYTES = 8192
 MAX_NOTE_CHARS = 500
-# The request keys of owner clears that one store remembers, the newest last.
-# A clear comes again within moments of the first one, so a short list is enough.
-MAX_CLEARS = 16
+# How long a store keeps the record of an owner's clear (R), in seconds.
+#
+# The platform sends a clear again with its request key only inside its retry
+# window W (24 hours, `CLEAR_RETRY_WINDOW_MS` in the platform's
+# packages/platform-pawchat/src/room-memory.ts), and never after it. The first
+# attempt of a request reaches the pod after the platform made the request, so
+# each repeat that the pod receives comes less than W after the first clear
+# ran here. Each side measures only its own interval: the clocks of the
+# platform and of the pod need not agree. The assumption is that the pod's
+# clock does not jump forward by more than R - W between two attempts.
+CLEAR_RETENTION_SECONDS = 30 * 24 * 3600
+# The most records of clears inside that time that one store holds. A new
+# clear is refused when the store holds this many, and no record inside the
+# time is dropped to make room. With the caps on notes, the largest store is
+# well under MAX_FILE_BYTES (about 52 KB).
+MAX_CLEARS = 256
 # A larger file is not a store that this module wrote.
 MAX_FILE_BYTES = 65536
 # The line of the user turn that holds the notes starts with this word.
@@ -363,8 +383,10 @@ def _valid_clears(raw) -> list[dict]:
     """The clear records of a stored value that are well formed, the newest last.
 
     One record is one owner clear that this store completed: the seat that it
-    was for, its request key, and its result. Like the notes, the records are
-    checked at each read.
+    was for, its request key, its result, and the time of the pod when it ran
+    (`at`, whole seconds). Like the notes, the records are checked at each
+    read. A record without a usable time gets the time of its next write: a
+    record is never removed sooner than it would be with its time.
     """
     records: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -375,9 +397,17 @@ def _valid_clears(raw) -> list[dict]:
         if (not valid_id(seat_id) or not valid_id(key) or not isinstance(deleted, bool)
                 or (seat_id, key) in seen):
             continue
+        at = item.get("at")
+        if not isinstance(at, int) or isinstance(at, bool) or at < 0:
+            at = None
         seen.add((seat_id, key))
-        records.append({"seatId": seat_id, "key": key, "deleted": deleted})
+        records.append({"seatId": seat_id, "key": key, "deleted": deleted, "at": at})
     return records
+
+
+def _recent(record: dict, now: int) -> bool:
+    """Whether a clear record is inside the retention time. A time after now counts."""
+    return record["at"] is None or now - record["at"] <= CLEAR_RETENTION_SECONDS
 
 
 def _store(value, squad_id: str) -> dict | None:
@@ -437,10 +467,19 @@ def _write(path: Path, squad_id: str, seat_id: str, notes: list[dict], next_id: 
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     stored = {"version": VERSION, "notice": NOTICE, "squadId": squad_id, "seatId": seat_id,
               "nextId": next_id, "notes": notes}
-    if clears:
-        # The store remembers the newest keys. This is the one place that limits them.
-        stored["clears"] = list(clears)[-MAX_CLEARS:]
+    # This is the one place that removes a clear record: only when it is older
+    # than the retention time. A record without a time gets the time of now.
+    now = _epoch()
+    kept = [{**record, "at": now if record["at"] is None else record["at"]}
+            for record in clears if _recent(record, now)]
+    if kept:
+        stored["clears"] = kept
     payload = json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
+    if len(payload.encode("utf-8")) > MAX_FILE_BYTES:
+        # A read takes a larger file for no store, so it is never written. The
+        # caps keep each store below this size: this only stops a bad state.
+        raise RoomMemoryRefusal("room_memory_full", "The room memory store is full.",
+                                limit=MAX_FILE_BYTES)
     fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=f".{squad_id}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -628,6 +667,11 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _epoch() -> int:
+    """The time of the pod in whole seconds: the time of a clear record."""
+    return int(time.time())
+
+
 def read_store(squad_id: str, seat_id: str, *, directory: Path | None = None) -> dict:
     """What the owner of this Agent sees: the notes of one seat in one squad."""
     path = _store_path(directory if directory is not None else store_directory(), squad_id)
@@ -687,6 +731,12 @@ def clear_store(squad_id: str, seat_id: str, request_key: str, *,
     notes: the record alone is added, and the clear removes nothing. A clear
     that a new seat asked for before its first Run is therefore also known
     when that seat has notes later.
+
+    A record stays for `CLEAR_RETENTION_SECONDS`. When the store holds
+    `MAX_CLEARS` records of that time, a new key is refused with
+    `RoomMemoryRefusal("room_memory_clear_limit")` before any change: no
+    write, no note removed, and no Run in progress ends. A repeat of a known
+    key still answers its first result.
     """
     path = _store_path(directory if directory is not None else store_directory(), squad_id)
     if not valid_id(seat_id) or not valid_id(request_key):
@@ -697,6 +747,16 @@ def clear_store(squad_id: str, seat_id: str, request_key: str, *,
         for record in records:
             if record["seatId"] == seat_id and record["key"] == request_key:
                 return {"deleted": record["deleted"], "replayed": True}
+        now = _epoch()
+        records = [record for record in records if _recent(record, now)]
+        if len(records) >= MAX_CLEARS:
+            # Before any change. A record inside the retention time is never
+            # dropped to make room: a repeat of its key must still find it.
+            raise RoomMemoryRefusal(
+                "room_memory_clear_limit",
+                f"The notes of this squad were cleared {MAX_CLEARS} times in the last "
+                f"{CLEAR_RETENTION_SECONDS // 86400} days. Clear them again later.",
+                limit=MAX_CLEARS)
         # A first clear. Like a delete, it ends the memory of each Run in
         # progress for this seat. A repeat above does not: the Runs that
         # started after the first clear keep their memory.
@@ -708,7 +768,7 @@ def clear_store(squad_id: str, seat_id: str, request_key: str, *,
             # The note numbers go on: a note id is never used again in one store.
             owner, notes, next_id = seat_id, [], 1 if store is None else store["nextId"]
             deleted = store is not None and bool(store["notes"])
-        record = {"seatId": seat_id, "key": request_key, "deleted": deleted}
+        record = {"seatId": seat_id, "key": request_key, "deleted": deleted, "at": now}
         _write(path, squad_id, owner, notes, next_id, [*records, record])
         return {"deleted": deleted, "replayed": False}
 

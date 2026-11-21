@@ -3964,11 +3964,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         The platform's delete after a seat left carries no key. A seat that
         left saves no more notes, and that delete is safe to repeat.
+
+        A store keeps each clear record for `CLEAR_RETENTION_SECONDS`. When it
+        holds `MAX_CLEARS` of them, a new key gets `409
+        room_memory_clear_limit` and the store changes nothing.
         """
         target = self._room_memory_target(request)
         if isinstance(target, web.Response):
             return target
-        from gateway.room_memory import clear_store, delete_store, valid_id
+        from gateway.room_memory import RoomMemoryRefusal, clear_store, delete_store, valid_id
         request_key = request.headers.get("Idempotency-Key")
         if request_key is not None and not valid_id(request_key):
             return web.json_response(_openai_error(
@@ -3978,6 +3982,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 result = {"deleted": await asyncio.to_thread(delete_store, *target)}
             else:
                 result = await asyncio.to_thread(clear_store, *target, request_key)
+        except RoomMemoryRefusal as refusal:
+            if refusal.error_type != "room_memory_clear_limit":
+                logger.error("Room memory delete refused: %s", refusal.error_type)
+                return web.json_response(_openai_error(
+                    "Room memory is unavailable", code="room_memory_unavailable",
+                    err_type="server_error"), status=503)
+            # The store changed nothing. The platform reports that the clear
+            # did not take place.
+            return web.json_response(_openai_error(
+                str(refusal), code="room_memory_clear_limit"), status=409)
         except Exception:
             logger.exception("Room memory delete failed")
             return web.json_response(_openai_error(

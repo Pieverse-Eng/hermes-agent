@@ -269,8 +269,20 @@ after the first clear stay.
   the record alone is added. A clear that a new seat asked for before its first
   Run is therefore also known when that seat has notes later. The seat fence
   and the delete below keep the records of other seats.
-- A store remembers the last 16 keys. A clear comes again within moments of
-  the first one.
+- A record stays for 30 days (`CLEAR_RETENTION_SECONDS`, R), and a write
+  removes only the records older than that. No count of newer keys removes a
+  record. The platform sends a clear again with its key only inside its retry
+  window W of 24 hours, and never after it: after W it reports the clear as
+  not confirmed. Because W is much shorter than R, each repeat that reaches
+  the pod finds its record. Each side measures only its own interval, so the
+  two clocks need not agree; the pod's clock must not jump forward by more
+  than R - W between two attempts.
+- A store holds at most 256 records of that time (`MAX_CLEARS`). When it holds
+  that many, a new key is refused with `409 room_memory_clear_limit` before any
+  change: no write, no note removed, no Run ended. A repeat of a known key
+  still answers. With the caps on notes, the largest store is about 52 KB, under
+  the 64 KiB limit of a store file, and a write that would pass that limit is
+  refused (`room_memory_full`).
 - A key of another shape is refused (`400 invalid_room_memory`).
 - The platform's delete after a seat left carries no key. A seat that left
   saves no more notes, so that delete is safe to repeat as it is.
