@@ -390,8 +390,10 @@ holds, with the platform plugin's `room_history` tool (platform #100). The
 platform decides per Run: it sends `room_history: {grant, path}` in the Run's
 body only to a pod whose v2 or v3 declaration lists the tool, and only while
 the room job can read history. `grant` is 43 base64url characters and `path`
-is `/v1/instances/<this instance>/room-history`; any other shape, or the key
-on a v1 Run, refuses the Run (`room_history_binding`). The body is part of the
+is exactly `/v1/instances/<INSTANCE_ID of this pod>/room-history`; any other
+shape, another instance's route, a pod without an instance id, or the key on a
+v1 or private Run refuses the Run before an Agent exists
+(`room_history_binding`, `validate_room_request`). The body is part of the
 idempotency fingerprint, which holds only its hash; nothing logs the grant.
 
 The grant follows the rules of the room memory binding

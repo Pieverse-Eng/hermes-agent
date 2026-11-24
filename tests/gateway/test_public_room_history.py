@@ -30,7 +30,8 @@ from tests.gateway.test_api_server_runs import _make_adapter, _create_runs_app
 AUTH = {"Authorization": "Bearer room-fixture-key"}
 MODEL = {"model": {"provider": "openai", "api_mode": "chat_completions"}}
 GRANT = "Ab0_-" * 8 + "xyz"
-PATH = "/v1/instances/0f9fd9c4-0da1-40e7-be10-7d13dce8acf6/room-history"
+INSTANCE = "0f9fd9c4-0da1-40e7-be10-7d13dce8acf6"
+PATH = f"/v1/instances/{INSTANCE}/room-history"
 BINDING = {"grant": GRANT, "path": PATH}
 OTHER = {"grant": "Z" * 43, "path": PATH}
 
@@ -38,6 +39,12 @@ OTHER = {"grant": "Z" * 43, "path": PATH}
 def request_body(policy=PUBLIC_ROOM_RESEARCH_POLICY, **extra):
     return {"session_id": SESSION_PREFIX + str(uuid4()), "input": "public room JSON",
             "room_policy": policy, **extra}
+
+
+@pytest.fixture(autouse=True)
+def own_instance(monkeypatch):
+    """The pod's own instance id: a grant's route must be this instance's."""
+    monkeypatch.setenv("INSTANCE_ID", INSTANCE)
 
 
 def register(name, toolset, handler):
@@ -98,6 +105,8 @@ def test_a_research_or_memory_run_binds_the_exact_grant_of_its_body(policy):
     {**BINDING, "grant": GRANT + "\n"}, {**BINDING, "grant": GRANT[:-1] + "="},
     {**BINDING, "path": PATH + "/"}, {**BINDING, "path": "/v1/instances/other/room-history"},
     {**BINDING, "path": PATH.replace("room-history", "room-memory")}, {**BINDING, "grant": 7},
+    {**BINDING, "path": "/v1/instances/11111111-1111-4111-8111-111111111111/room-history"},
+    {**BINDING, "path": PATH.upper()},
     [GRANT, PATH], GRANT, None,
 ])
 def test_any_other_shape_of_the_binding_refuses_the_run(binding):
@@ -106,6 +115,26 @@ def test_any_other_shape_of_the_binding_refuses_the_run(binding):
         room_history_binding(body)
     with pytest.raises(ValueError):
         validate_room_request(body, authenticated=True)
+
+
+def test_a_pod_without_an_instance_id_binds_no_grant(monkeypatch):
+    body = request_body(room_history=dict(BINDING))
+    for instance in (None, "", "not-a-uuid", INSTANCE.upper()):
+        if instance is None:
+            monkeypatch.delenv("INSTANCE_ID", raising=False)
+        else:
+            monkeypatch.setenv("INSTANCE_ID", instance)
+        with pytest.raises(ValueError):
+            room_history_binding(body)
+
+
+def test_a_private_run_with_a_grant_is_refused():
+    body = {"session_id": "private-" + str(uuid4()), "input": "hello",
+            "room_history": dict(BINDING)}
+    with pytest.raises(ValueError):
+        validate_room_request(body, authenticated=True)
+    del body["room_history"]
+    assert validate_room_request(body, authenticated=True) is False
 
 
 def test_a_v1_run_never_binds_a_grant():

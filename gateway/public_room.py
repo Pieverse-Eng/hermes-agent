@@ -7,6 +7,7 @@ from tools.execution_scope import (
     PUBLIC_ROOM_TOOL_NAMES, public_room_history_tool_registered, public_room_memory_tools,
     public_room_research_tools,
 )
+import os
 import re
 from uuid import UUID
 
@@ -204,8 +205,16 @@ def room_config_supported(config):
 # bytes, base64url without padding, and the route of this pod's own instance
 # that reads with it.
 ROOM_HISTORY_GRANT = re.compile(r"[A-Za-z0-9_-]{43}")
-ROOM_HISTORY_PATH = re.compile(
-    r"/v1/instances/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/room-history")
+_CANONICAL_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def own_room_history_path():
+    """The room history route of this pod's own instance (`INSTANCE_ID`), or None.
+
+    A pod without a canonical instance id has no route, so it binds no grant.
+    """
+    instance = os.environ.get("INSTANCE_ID", "")
+    return f"/v1/instances/{instance}/room-history" if _CANONICAL_UUID.fullmatch(instance) else None
 
 
 def _with_history(tools):
@@ -298,9 +307,11 @@ def room_history_binding(body):
     """The room history grant of a Run, `(grant, path)`, or None for a Run without one.
 
     The platform sends `room_history: {grant, path}` with a research or memory
-    Run to a pod that declares the tool. It is optional: a Run without it reads
+    Run to a pod that declares the tool; `path` is the route of this pod's own
+    instance (`own_room_history_path`). It is optional: a Run without it reads
     no history. Nothing of the model or of the room input supplies it. Raises
-    ValueError for every other shape and for any other policy.
+    ValueError for every other shape, another instance's route, a pod without
+    an instance id, and any other policy.
     """
     if "room_history" not in body:
         return None
@@ -309,9 +320,11 @@ def room_history_binding(body):
     binding = body["room_history"]
     if (not isinstance(binding, dict) or set(binding) != {"grant", "path"}
             or not isinstance(binding["grant"], str) or not isinstance(binding["path"], str)
-            or not ROOM_HISTORY_GRANT.fullmatch(binding["grant"])
-            or not ROOM_HISTORY_PATH.fullmatch(binding["path"])):
+            or not ROOM_HISTORY_GRANT.fullmatch(binding["grant"])):
         raise ValueError("Invalid room history binding")
+    own = own_room_history_path()
+    if own is None or binding["path"] != own:
+        raise ValueError("The room history route is not this instance's")
     return binding["grant"], binding["path"]
 
 
@@ -343,6 +356,9 @@ def is_room_session(session_id, db=None) -> bool:
 def validate_room_request(body, *, authenticated):
     policy = body.get("room_policy")
     if "room_policy" not in body:
+        # A private Run never binds a room history grant.
+        if "room_history" in body:
+            raise ValueError("Only a room Run binds a room history")
         if is_room_session(body.get("session_id")):
             raise ValueError("Room sessions require their isolated policy")
         return False
