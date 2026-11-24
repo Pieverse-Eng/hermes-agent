@@ -1,10 +1,13 @@
 """Immutable API policy for public room turns; no owner context is loaded."""
 from tools.execution_scope import (
+    PUBLIC_ROOM_HISTORY_POLICIES, PUBLIC_ROOM_HISTORY_TOOL,
     PUBLIC_ROOM_MAX_MEMORY_CALLS, PUBLIC_ROOM_MAX_SEARCH_CALLS, PUBLIC_ROOM_MAX_TOOL_CALLS,
     PUBLIC_ROOM_MEMORY_POLICY, PUBLIC_ROOM_MEMORY_TOOL, PUBLIC_ROOM_POLICIES,
     PUBLIC_ROOM_POLICY, PUBLIC_ROOM_RESEARCH_POLICY, PUBLIC_ROOM_SEARCH_TOOL_NAMES,
-    PUBLIC_ROOM_TOOL_NAMES, public_room_memory_tools, public_room_research_tools,
+    PUBLIC_ROOM_TOOL_NAMES, public_room_history_tool_registered, public_room_memory_tools,
+    public_room_research_tools,
 )
+import re
 from uuid import UUID
 
 SESSION_PREFIX = "agent-chat-pawchat-isolated-v1-"
@@ -197,6 +200,25 @@ def room_config_supported(config):
                                        base_url=model.get("base_url")))
 
 
+# The room history grant of a Run (platform `RoomHistoryGrant`): 32 random
+# bytes, base64url without padding, and the route of this pod's own instance
+# that reads with it.
+ROOM_HISTORY_GRANT = re.compile(r"[A-Za-z0-9_-]{43}")
+ROOM_HISTORY_PATH = re.compile(
+    r"/v1/instances/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/room-history")
+
+
+def _with_history(tools):
+    """A research or memory tool set, with `room_history` when this pod runs it.
+
+    The platform plugin registers the tool only on a Hermes that binds a Run's
+    grant (`public_room_history`). The tool is optional like `search_x`: a
+    platform sends a grant only to a pod whose declaration lists it, and the
+    declaration of a pod without it does not change.
+    """
+    return tools | {PUBLIC_ROOM_HISTORY_TOOL} if public_room_history_tool_registered() else tools
+
+
 def room_capability():
     return {"policy": PUBLIC_ROOM_POLICY, "run_path": ROOM_RUN_PATH,
             "memory": False, "context_files": False,
@@ -213,6 +235,7 @@ def room_research_capability():
     tools = public_room_research_tools()
     if tools is None:
         return None
+    tools = _with_history(tools)
     return {"policy": PUBLIC_ROOM_RESEARCH_POLICY, "run_path": ROOM_RUN_PATH,
             "memory": False, "context_files": False, "skills": False, "mcp": False,
             "tools": sorted(tools),
@@ -232,6 +255,7 @@ def room_memory_capability():
     tools = public_room_memory_tools()
     if tools is None:
         return None
+    tools = _with_history(tools)
     return {"policy": PUBLIC_ROOM_MEMORY_POLICY, "run_path": ROOM_RUN_PATH,
             "memory": False, "context_files": False, "skills": False, "mcp": False,
             "tools": sorted(tools),
@@ -268,6 +292,27 @@ def room_memory_binding(body):
             or not valid_id(binding["squad_id"]) or not valid_id(binding["seat_id"])):
         raise ValueError("The memory policy needs the squad and the seat of the room")
     return binding["squad_id"], binding["seat_id"]
+
+
+def room_history_binding(body):
+    """The room history grant of a Run, `(grant, path)`, or None for a Run without one.
+
+    The platform sends `room_history: {grant, path}` with a research or memory
+    Run to a pod that declares the tool. It is optional: a Run without it reads
+    no history. Nothing of the model or of the room input supplies it. Raises
+    ValueError for every other shape and for any other policy.
+    """
+    if "room_history" not in body:
+        return None
+    if body.get("room_policy") not in PUBLIC_ROOM_HISTORY_POLICIES:
+        raise ValueError("Only the research and memory policies bind a room history")
+    binding = body["room_history"]
+    if (not isinstance(binding, dict) or set(binding) != {"grant", "path"}
+            or not isinstance(binding["grant"], str) or not isinstance(binding["path"], str)
+            or not ROOM_HISTORY_GRANT.fullmatch(binding["grant"])
+            or not ROOM_HISTORY_PATH.fullmatch(binding["path"])):
+        raise ValueError("Invalid room history binding")
+    return binding["grant"], binding["path"]
 
 
 def is_room_session(session_id, db=None) -> bool:
@@ -311,4 +356,5 @@ def validate_room_request(body, *, authenticated):
     if any(key in body for key in ("interaction_context", "conversation_history", "previous_response_id")):
         raise ValueError("Room policy cannot inherit history or financial contexts")
     room_memory_binding(body)
+    room_history_binding(body)
     return True

@@ -382,3 +382,34 @@ Qualification for v3 uses `tests/gateway/test_public_room_memory.py`.
 
 Platform Agent asks and tenant-image promotion retain their own release gates.
 Source checks do not activate a feature or qualify a production image.
+
+## Room history (optional tool of v2 and v3)
+
+A research or memory Run may read more of its own room than the room JSON
+holds, with the platform plugin's `room_history` tool (platform #100). The
+platform decides per Run: it sends `room_history: {grant, path}` in the Run's
+body only to a pod whose v2 or v3 declaration lists the tool, and only while
+the room job can read history. `grant` is 43 base64url characters and `path`
+is `/v1/instances/<this instance>/room-history`; any other shape, or the key
+on a v1 Run, refuses the Run (`room_history_binding`). The body is part of the
+idempotency fingerprint, which holds only its hash; nothing logs the grant.
+
+The grant follows the rules of the room memory binding
+(`public_room_scope(..., history=)`): only the request handler and the Agent's
+own tool boundary pass it, a nested scope keeps it, two different grants bind
+none, an Agent without one gets none even inside a Run that has one, and a v1
+scope binds none. `public_room_history()` returns it to the plugin's handler,
+which sends it to the platform beside the model's arguments; no argument of a
+model call supplies or selects it.
+
+`room_history` lives in `pieverse-room-research`, but no policy allowlist
+names it: `public_room_tool_names()` of the active Run lists it only while a
+grant is bound. A Run without a grant therefore has neither its schema nor its
+dispatch (`public_room_isolation`), and outside a room it is room-only like
+the other research tools. Each call counts as one of the 12 tool calls; it is
+not a paid search.
+
+The v2 and v3 declarations list `room_history` only while the plugin
+registered it in that toolset, like `search_x`. A platform that validates the
+declarations with the schema from before #100 refuses a declaration that lists
+it, so the platform change ships before a tenant image with this plugin.

@@ -44,9 +44,17 @@ _RESEARCH_TOOL_TOOLSETS = {
     "search_web": PUBLIC_ROOM_ONLY_TOOLSET,
     "search_x": PUBLIC_ROOM_ONLY_TOOLSET,
 }
+# Reads of the room's own public history (platform #100). The platform plugin
+# registers it in the room research toolset. A Run gets it only with the
+# history grant that the platform sent in the Run's body
+# (gateway/public_room.py `room_history_binding`): the allowlist of a research
+# or memory room lists it only while that grant is bound (`public_room_scope`),
+# so a Run without one has neither its schema nor its dispatch.
+PUBLIC_ROOM_HISTORY_TOOL = "room_history"
 # A room admits a name only from the fixed toolset that owns it.
 PUBLIC_ROOM_TOOL_TOOLSETS = MappingProxyType({
     **_RESEARCH_TOOL_TOOLSETS, PUBLIC_ROOM_MEMORY_TOOL: PUBLIC_ROOM_MEMORY_TOOLSET,
+    PUBLIC_ROOM_HISTORY_TOOL: PUBLIC_ROOM_ONLY_TOOLSET,
 })
 PUBLIC_ROOM_RESEARCH_TOOL_NAMES = frozenset(_RESEARCH_TOOL_TOOLSETS)
 PUBLIC_ROOM_MEMORY_TOOL_NAMES = PUBLIC_ROOM_RESEARCH_TOOL_NAMES | {PUBLIC_ROOM_MEMORY_TOOL}
@@ -75,12 +83,18 @@ PUBLIC_ROOM_POLICIES = MappingProxyType({
     PUBLIC_ROOM_RESEARCH_POLICY: PUBLIC_ROOM_RESEARCH_TOOL_NAMES,
     PUBLIC_ROOM_MEMORY_POLICY: PUBLIC_ROOM_MEMORY_TOOL_NAMES,
 })
+# The policies whose Runs may hold a history grant: the ones with the research tools.
+PUBLIC_ROOM_HISTORY_POLICIES = frozenset({PUBLIC_ROOM_RESEARCH_POLICY, PUBLIC_ROOM_MEMORY_POLICY})
 # The active room policy id; None outside a room.
 _public_room = ContextVar("public_room_execution_policy", default=None)
 # The room memory of the active room Run (gateway.room_memory.RoomMemory): the
 # store of the squad that the platform named for this Run. None outside a
 # room, and in a room whose policy has no memory.
 _public_room_memory = ContextVar("public_room_memory_binding", default=None)
+# The room history grant of the active room Run: `(grant, path)` exactly as the
+# platform sent it in the Run's body. None outside a room, in a v1 room and in
+# a Run without one.
+_public_room_history = ContextVar("public_room_history_binding", default=None)
 
 
 def _narrower(current: str, requested: str) -> str:
@@ -91,12 +105,29 @@ def _narrower(current: str, requested: str) -> str:
     return PUBLIC_ROOM_POLICY
 
 
-# The default of `memory`: keep what the enclosing scope bound.
+# The default of `memory` and `history`: keep what the enclosing scope bound.
 _KEEP_MEMORY = object()
 
 
+def _history_value(history):
+    """A history binding as stored: None, or a `(grant, path)` pair of strings.
+
+    The Agent keeps the `{"grant", "path"}` form of `public_room_history()`;
+    both forms bind the same grant.
+    """
+    if history is None or history is _KEEP_MEMORY:
+        return history
+    if isinstance(history, dict) and set(history) == {"grant", "path"}:
+        history = (history["grant"], history["path"])
+    if (isinstance(history, tuple) and len(history) == 2
+            and all(isinstance(part, str) and part for part in history)):
+        return history
+    raise ValueError("Invalid room history binding")
+
+
 @contextmanager
-def public_room_scope(enabled: bool, *, policy: str | None = None, memory=_KEEP_MEMORY):
+def public_room_scope(enabled: bool, *, policy: str | None = None, memory=_KEEP_MEMORY,
+                      history=_KEEP_MEMORY):
     # Keep this independent of proposal scope: nested scopes cannot restore
     # private tools, including in a copied executor-thread context. A nested
     # scope can narrow the room policy and can never widen it; a room entered
@@ -109,10 +140,18 @@ def public_room_scope(enabled: bool, *, policy: str | None = None, memory=_KEEP_
     # keeps the store of the enclosing scope. A nested scope never replaces a
     # bound store with another one: two different stores bind none. A scope
     # whose policy has no memory tool binds none.
+    #
+    # `history` is the room history grant of this Run, `(grant, path)`, under
+    # the same rules: only the code that admits or restores a Run passes it, a
+    # scope that does not pass it keeps the enclosing one, two different grants
+    # bind none, and a scope whose policy is neither the research nor the
+    # memory policy binds none.
     if policy is not None and policy not in PUBLIC_ROOM_POLICIES:
         raise ValueError("Unknown public room policy")
+    history = _history_value(history)
     current = _public_room.get()
     outer = _public_room_memory.get()
+    outer_history = _public_room_history.get()
     if current is not None:
         active = current if policy is None else _narrower(current, policy)
         if memory is _KEEP_MEMORY:
@@ -121,16 +160,27 @@ def public_room_scope(enabled: bool, *, policy: str | None = None, memory=_KEEP_
             bound = memory
         else:
             bound = None
+        if history is _KEEP_MEMORY:
+            granted = outer_history
+        elif outer_history is None or outer_history == history:
+            granted = history
+        else:
+            granted = None
     else:
         active = (policy or PUBLIC_ROOM_POLICY) if enabled else None
         bound = None if memory is _KEEP_MEMORY else memory
+        granted = None if history is _KEEP_MEMORY else history
     if active is None or PUBLIC_ROOM_MEMORY_TOOL not in PUBLIC_ROOM_POLICIES[active]:
         bound = None
+    if active not in PUBLIC_ROOM_HISTORY_POLICIES:
+        granted = None
     token = _public_room.set(active)
     memory_token = _public_room_memory.set(bound)
+    history_token = _public_room_history.set(granted)
     try:
         yield
     finally:
+        _public_room_history.reset(history_token)
         _public_room_memory.reset(memory_token)
         _public_room.reset(token)
 
@@ -149,10 +199,31 @@ def public_room_memory():
     return _public_room_memory.get()
 
 
+def public_room_history():
+    """The room history grant bound to the active room Run, or None.
+
+    `{"grant", "path"}` exactly as the platform sent it in the Run's body; the
+    platform plugin's `room_history` reads with it. Nothing of a model call
+    selects or supplies it.
+    """
+    binding = _public_room_history.get()
+    return None if binding is None else {"grant": binding[0], "path": binding[1]}
+
+
 def public_room_tool_names(policy: str | None = None):
-    """The allowlist of a room policy (default: the active one); None outside a room."""
-    policy = _public_room.get() if policy is None else policy
-    return None if policy is None else PUBLIC_ROOM_POLICIES[policy]
+    """The allowlist of a room policy (default: the active one); None outside a room.
+
+    The allowlist of the active Run also lists `room_history` while a history
+    grant is bound to it.
+    """
+    active = _public_room.get()
+    policy = active if policy is None else policy
+    if policy is None:
+        return None
+    names = PUBLIC_ROOM_POLICIES[policy]
+    if policy == active and _public_room_history.get() is not None:
+        names = names | {PUBLIC_ROOM_HISTORY_TOOL}
+    return names
 
 
 def _registered_toolset(name: str):
@@ -177,6 +248,11 @@ def public_room_research_tools():
         if _registered_toolset(name) == toolset)
     required = PUBLIC_ROOM_RESEARCH_TOOL_NAMES - PUBLIC_ROOM_OPTIONAL_TOOL_NAMES
     return registered if required <= registered else None
+
+
+def public_room_history_tool_registered() -> bool:
+    """Whether the platform plugin registered `room_history` in the toolset that owns it."""
+    return _registered_toolset(PUBLIC_ROOM_HISTORY_TOOL) == PUBLIC_ROOM_ONLY_TOOLSET
 
 
 def public_room_memory_tools():

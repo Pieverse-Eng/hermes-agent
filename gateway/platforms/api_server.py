@@ -2636,6 +2636,7 @@ class APIServerAdapter(BasePlatformAdapter):
         public_room: bool = False,
         room_policy: Optional[str] = None,
         room_memory: Any = None,
+        room_history: Any = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2908,8 +2909,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         from tools.execution_scope import (
-            PUBLIC_ROOM_MAX_ITERATIONS, PUBLIC_ROOM_MEMORY_POLICY, PUBLIC_ROOM_POLICIES,
-            PUBLIC_ROOM_POLICY, PUBLIC_ROOM_TOOL_TOOLSETS,
+            PUBLIC_ROOM_HISTORY_POLICIES, PUBLIC_ROOM_HISTORY_TOOL, PUBLIC_ROOM_MAX_ITERATIONS,
+            PUBLIC_ROOM_MEMORY_POLICY, PUBLIC_ROOM_POLICIES, PUBLIC_ROOM_POLICY,
+            PUBLIC_ROOM_TOOL_TOOLSETS,
         )
         if room_policy is not None and (not public_room or room_policy not in PUBLIC_ROOM_POLICIES):
             raise ValueError("Unknown public room policy")
@@ -2917,6 +2919,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # other policy runs with one.
         if (room_memory is not None) != (room_policy == PUBLIC_ROOM_MEMORY_POLICY):
             raise ValueError("Room memory belongs to the memory policy only")
+        # A history grant belongs to a research or memory Run that the platform
+        # sent one with; no other Agent gets one.
+        if room_history is not None and (not public_room
+                                         or room_policy not in PUBLIC_ROOM_HISTORY_POLICIES):
+            raise ValueError("Room history belongs to a research or memory room only")
         if public_room:
             # A room without a policy id runs the narrowest policy.
             room_policy = room_policy or PUBLIC_ROOM_POLICY
@@ -2992,15 +2999,17 @@ class APIServerAdapter(BasePlatformAdapter):
                    | set(host_tool_names)) if proposal_only else None
         from tools.execution_scope import host_tool_scope
         from tools.execution_scope import public_room_scope
-        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed), public_room_scope(public_room, policy=room_policy, memory=room_memory):
+        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed), public_room_scope(public_room, policy=room_policy, memory=room_memory, history=room_history):
             agent = AIAgent(**agent_kwargs)
         if public_room:
             require_room_runtime(agent.api_mode, provider=agent.provider, base_url=agent.base_url)
             from model_tools import get_tool_definitions
-            with public_room_scope(True, policy=room_policy):
+            with public_room_scope(True, policy=room_policy, history=room_history):
                 raw_tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True,
                                                  skip_tool_search_assembly=True)
-            room_tools = PUBLIC_ROOM_POLICIES[room_policy]
+            # `room_history` only for a Run that holds a grant.
+            room_tools = PUBLIC_ROOM_POLICIES[room_policy] | (
+                {PUBLIC_ROOM_HISTORY_TOOL} if room_history is not None else frozenset())
             agent.tools = [tool for tool in raw_tools if tool["function"]["name"] in room_tools]
             agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
             agent._skip_mcp_refresh = True
@@ -7647,8 +7656,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # The squad and the seat of a memory room. The platform names them in
         # the request body, so they are part of the idempotency fingerprint.
         # Nothing of the model or of the room input selects a store.
-        from gateway.public_room import room_memory_binding
+        from gateway.public_room import room_history_binding, room_memory_binding
         room_memory_ids = room_memory_binding(body) if public_room else None
+        # The history grant of this Run, `(grant, path)`, or None: also from the
+        # body only. The fingerprint holds it as a hash; nothing logs it.
+        room_history = room_history_binding(body) if public_room else None
         from gateway.interactive_messages import InteractionContext, current_message_scope, is_proposal_context
         interaction_context = None
         if body.get("interaction_context") is not None:
@@ -7951,6 +7963,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         public_room=public_room,
                         room_policy=room_policy,
                         room_memory=room_memory,
+                        room_history=room_history,
                         host_tool_names=host_tool_names,
                         proposal_only=is_proposal_context(interaction_context),
                         bound_business_tools=(interaction_context or {}).get("version") == 2,
@@ -8108,7 +8121,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         deliver_current, interaction_context,
                         available_tools=getattr(agent, "valid_tool_names", None)
                     ), host_tool_scope(host_broker), public_room_scope(
-                        public_room, policy=room_policy, memory=room_memory):
+                        public_room, policy=room_policy, memory=room_memory,
+                        history=room_history):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process

@@ -608,7 +608,9 @@ def init_agent(
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
-    from tools.execution_scope import is_public_room_scope, public_room_memory, public_room_policy
+    from tools.execution_scope import (
+        is_public_room_scope, public_room_history, public_room_memory, public_room_policy,
+    )
     agent.public_room_policy = is_public_room_scope()
     # The Agent keeps its policy id, so its own tool boundary restores the same
     # allowlist when ambient context is lost. `public_room_policy` stays a bool.
@@ -616,6 +618,8 @@ def init_agent(
     # The room memory that the request handler bound to this Run, or None. The
     # Agent keeps it for the same reason, and never gets another one.
     agent.public_room_memory = public_room_memory()
+    # The room history grant of its Run, or None: kept for the same reason.
+    agent.public_room_history = public_room_history()
     agent.public_room_budget = None
     if agent.public_room_policy:
         from tools.execution_scope import (
