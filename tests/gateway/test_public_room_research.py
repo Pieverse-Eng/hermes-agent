@@ -526,8 +526,11 @@ def test_v2_refuses_external_runtimes_like_v1(mode, provider, base):
 def test_room_research_tools_have_no_schema_and_no_dispatch_outside_a_room(research_tools):
     from model_tools import get_tool_definitions, handle_function_call
     from tools.registry import registry
+    # `room_history` is room-only too, and a Run gets it only with a history grant
+    # (test_public_room_history.py).
+    assert PUBLIC_ROOM_TOOL_TOOLSETS["room_history"] == PUBLIC_ROOM_ONLY_TOOLSET
     room_only = {name for name, toolset in PUBLIC_ROOM_TOOL_TOOLSETS.items()
-                 if toolset == PUBLIC_ROOM_ONLY_TOOLSET}
+                 if toolset == PUBLIC_ROOM_ONLY_TOOLSET} - {"room_history"}
     assert room_only == {"market_snapshot", "market_candles", "onchain_token", "search_news",
                          "search_web", "search_x"}
     owner_enabled = [PUBLIC_ROOM_TOOLSET, PUBLIC_ROOM_ONLY_TOOLSET]
